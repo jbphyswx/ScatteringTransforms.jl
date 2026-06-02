@@ -1,0 +1,46 @@
+name = "ScatteringTransforms"
+uuid = "68b593e8-16bb-4169-afcb-087dab360691"
+version = "0.1.0"
+authors = ["Jordan Benjamin"]
+
+[deps]
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+
+[weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
+
+[extensions]
+ScatteringTransformsCUDAExt = "CUDA"
+ScatteringTransformsCairoMakieExt = "CairoMakie"
+ScatteringTransformsJLD2Ext = "JLD2"
+ScatteringTransformsKernelAbstractionsExt = "KernelAbstractions"
+ScatteringTransformsNUFSHTExt = "NUFSHT"
+
+[compat]
+Aqua = "0.8"
+CUDA = "5"
+CairoMakie = "0.12"
+FFTW = "1"
+JLD2 = "0.5"
+KernelAbstractions = "0.9"
+LinearAlgebra = "1"
+NUFSHT = "0.1"
+Statistics = "1"
+Test = "1"
+julia = "1.9"
+
+[extras]
+Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Aqua", "Statistics", "Test"]
+
+[workspace]
+projects = ["test"]
