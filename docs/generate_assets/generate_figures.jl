@@ -40,7 +40,7 @@ end
 
 signal = pink_noise(N) .+ 0.5 .* Base.sin.(5*t)  # Pink noise + low freq oscillation
 
-st = ScatteringTransform1D(N, 6; Q=1, max_order=2)
+st = ScatteringTransforms.ScatteringTransform1D(N, 6; Q=1, max_order=2)
 coeffs = st(signal)
 
 # Check we have meaningful values
@@ -59,7 +59,7 @@ S1_display = coeffs.S1 .+ 1e-10  # Add small offset for log scale
 p2 = Plots.bar(1:Base.length(coeffs.S1), S1_display, 
          title="(b) S₁: First-Order Scattering (Log Scale)",
          xlabel="Scale Index (j)", ylabel="Energy (log scale)",
-         color=Base.range(0.3, 0.9, length=Base.length(coeffs.S1)),
+         color=Plots.cgrad(:viridis, Base.length(coeffs.S1), categorical=true),
          yscale=:log10,
          titlefontsize=11, guidefontsize=10, tickfontsize=9)
 
@@ -132,7 +132,7 @@ image = image ./ Statistics.maximum(Base.abs.(image))
 # Add pink noise
 image .+= 0.3 .* Base.randn(M, M)
 
-st2d = ScatteringTransform2D((M, M), 3; L=6, max_order=2)
+st2d = ScatteringTransforms.ScatteringTransform2D((M, M), 3; L=6, max_order=2)
 coeffs_2d = st2d(image)
 
 Base.println("  2D S1 range: [$(Statistics.minimum(coeffs_2d.S1)), $(Statistics.maximum(coeffs_2d.S1))]")
@@ -180,7 +180,8 @@ naive_times = Float64[]
 zero_alloc_times = Float64[]
 
 for N in sizes
-    st = ScatteringTransform1D(N, 6; Q=1, max_order=2)
+    local st, signal, coeffs
+    st = ScatteringTransforms.ScatteringTransform1D(N, 6; Q=1, max_order=2)
     signal = Base.randn(N)
     
     # Naive: allocate every time
@@ -188,8 +189,8 @@ for N in sizes
     Base.push!(naive_times, t1 * 100)  # Convert to per-call ms
     
     # Zero-allocation: pre-allocated
-    coeffs = ScatteringCoefficients1D(Base.length(st.filter_bank.wavelets), Float64; compute_S2=true)
-    t2 = Base.@elapsed for _ in 1:10 scattering_transform!(coeffs, st, signal) end
+    coeffs = ScatteringTransforms.ScatteringCoefficients1D(Base.length(st.filter_bank.wavelets), Float64; compute_S2=true)
+    t2 = Base.@elapsed for _ in 1:10 ScatteringTransforms.scattering_transform!(coeffs, st, signal) end
     Base.push!(zero_alloc_times, t2 * 100)
 end
 

@@ -49,7 +49,7 @@ end
 function ScatteringCoefficients1D(n::Int, ::Type{T}=Float64; 
                                     compute_S2::Bool=true) where T
     S1 = Vector{T}(undef, n)
-    S2 = compute_S2 ? Matrix{T}(undef, n, n) : Matrix{T}(undef, 0, 0)
+    S2 = compute_S2 ? zeros(T, n, n) : Matrix{T}(undef, 0, 0)
     return ScatteringCoefficients1D(S1, S2; S0=zero(T))
 end
 
@@ -128,7 +128,7 @@ function ScatteringCoefficients2D(n_scales::Int, n_orientations::Int, ::Type{T}=
                                  compute_S2::Bool=true) where T
     n = n_scales * n_orientations
     S1 = Vector{T}(undef, n)
-    S2 = compute_S2 ? Matrix{T}(undef, n, n) : Matrix{T}(undef, 0, 0)
+    S2 = compute_S2 ? zeros(T, n, n) : Matrix{T}(undef, 0, 0)
     return ScatteringCoefficients2D(S1, S2; S0=zero(T), n_scales=n_scales, n_orientations=n_orientations)
 end
 

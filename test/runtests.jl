@@ -83,6 +83,52 @@ Test.@testset "1D Filter Bank Tests" begin
     Test.@test length(bank.averaging) == N
 end
 
+Test.@testset "1D Filter Bank with Q > 1 Fractional Center Frequencies" begin
+    N = 256
+    J = 3
+    Q = 4
+    bank = ScatteringTransforms.build_filter_bank1d(N, J; Q=Q)
+    
+    Test.@test bank.J == J
+    Test.@test bank.Q == Q
+    Test.@test length(bank.wavelets) == J * Q
+    
+    # Verify that center frequencies are strictly unique and decreasing
+    center_freqs = [m.center_freq for m in bank.meta]
+    Test.@test all(center_freqs[i] > center_freqs[i+1] for i in 1:length(center_freqs)-1)
+    
+    # Verify that fractional frequency spacing matches math formula:
+    # center_freq = 0.5 * 2^(-j_eff)
+    for (i, m) in enumerate(bank.meta)
+        expected_freq = 0.5 / (2.0^m.j_eff)
+        Test.@test isapprox(m.center_freq, expected_freq, rtol=1e-10)
+    end
+end
+
+Test.@testset "2D S2 Coefficients Zero-Initialization Verification" begin
+    Ny, Nx = 64, 64
+    J = 3
+    L = 4
+    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
+    image = randn(Ny, Nx)
+    coeffs = st(image)
+    S2 = ScatteringTransforms.second_order(coeffs)
+    
+    # Verify diagonal and lower triangle are exactly zero (due to zeros allocation fix)
+    n = size(S2, 1)
+    for j1 in 1:n
+        for j2 in 1:j1
+            Test.@test S2[j1, j2] == 0.0
+        end
+    end
+    
+    # Verify upper triangle has positive values (meaningful computed second-order scattering)
+    upper_vals = [S2[j1, j2] for j1 in 1:n for j2 in (j1+1):n]
+    Test.@test all(upper_vals .>= 0.0)
+    Test.@test any(upper_vals .> 0.0)
+end
+
+
 Test.@testset "1D Scattering Transform Tests" begin
     N = 256
     J = 4

@@ -67,7 +67,7 @@ function build_filter_bank1d(N::Int, J::Int; Q::Int=1, T::Type=Float64)
         for q in 0:Q-1
             effective_j = j + q / Q
             
-            morlet = Filters.Morlet1D{T}(N, floor(Int, effective_j); Q=Q)
+            morlet = Filters.Morlet1D{T}(N, j * Q + q; Q=Q)
             ψ = Filters.frequency_response(morlet)
             
             push!(wavelets, ψ)

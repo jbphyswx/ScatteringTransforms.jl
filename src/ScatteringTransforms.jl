@@ -69,6 +69,7 @@ const first_order = Coefficients.first_order
 const second_order = Coefficients.second_order
 const flatten1d = Coefficients.flatten1d
 const flatten2d = Coefficients.flatten2d
+const scattering_transform! = Scattering1D.scattering_transform!
 
 export ScatteringTransform1D, ScatteringTransform2D
 export FilterBank1D, FilterBank2D
@@ -78,6 +79,7 @@ export zeroth_order, first_order, second_order
 export flatten1d, flatten2d
 export frequency_response
 export build_filter_bank1d, build_filter_bank2d
+export scattering_transform!
 
 # Precompilation setup for faster first use
 # (optional - can be added later)

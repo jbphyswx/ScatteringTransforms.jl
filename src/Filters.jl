@@ -40,7 +40,7 @@ struct Morlet1D{T<:Real}
     beta::T
     N::Int
     
-    function Morlet1D{T}(N::Int, j::Int; Q::Int=1, r::T=T(sqrt(0.5))) where T<:Real
+    function Morlet1D{T}(N::Int, j::Real; Q::Int=1, r::T=T(sqrt(0.5))) where T<:Real
         # Center frequency: xi = 0.5 * 2^(-j/Q) in normalized frequency [0, 1]
         xi = T(0.5) / (T(2.0)^(j / Q))
         
@@ -60,7 +60,7 @@ struct Morlet1D{T<:Real}
 end
 
 # Convenience constructor - defaults to Float64 for backward compatibility
-Morlet1D(N::Int, j::Int; kwargs...) = Morlet1D{Float64}(N, j; kwargs...)
+Morlet1D(N::Int, j::Real; kwargs...) = Morlet1D{Float64}(N, j; kwargs...)
 
 """
     frequency_response(m::Morlet1D{T}) -> Vector{Complex{T}}

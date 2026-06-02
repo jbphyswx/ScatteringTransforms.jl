@@ -32,6 +32,30 @@ st2d = ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
 coeffs_2d = st2d(image)
 ```
 
+## Wavelet & Scattering Visualizations
+
+Here are the generated figures showcasing the 1D/2D wavelet tiling and scattering transform outputs:
+
+### 1. 1D Wavelet Scattering
+Decomposition of a 1D pink noise signal with a low-frequency oscillation, showing first-order ($S_1$) and second-order ($S_2$) coefficients:
+
+![1D Scattering Example](docs/src/assets/1d_scattering_example.png)
+
+### 2. Frequency Tiling (Morlet Filter Bank)
+The frequency response of the 1D Morlet filter bank showing optimal overlapping frequency coverage across multiple scales:
+
+![Morlet Filter Bank](docs/src/assets/filter_bank.png)
+
+### 3. 2D Wavelet Scattering
+Applying a 2D scattering transform to a multi-scale fractal texture, showing the orientation-scale decomposition and second-order coefficients:
+
+![2D Scattering Example](docs/src/assets/2d_scattering_example.png)
+
+### 4. Zero-Allocation Streaming Benchmarks
+Comparing the execution time of the zero-allocation API against the standard allocating API across different signal sizes:
+
+![Performance Comparison](docs/src/assets/performance_comparison.png)
+
 ## Documentation
 
 - [Documentation](https://jbphyswx.github.io/ScatteringTransforms.jl/dev/)
