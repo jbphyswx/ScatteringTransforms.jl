@@ -1,0 +1,5 @@
+module ScatteringTransformsKernelAbstractionsExt
+
+using KernelAbstractions
+
+end
