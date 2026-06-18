@@ -7,7 +7,6 @@ Creates complete filter bank structures with wavelets at multiple scales
 and orientations (for 2D), plus averaging (scaling) filters.
 """
 
-using FFTW: FFTW
 using LinearAlgebra: LinearAlgebra
 
 # Import Filters submodule
@@ -16,6 +15,10 @@ using ..Filters: Filters
 export FilterBank1D, FilterBank2D
 export build_filter_bank1d, build_filter_bank2d
 export averaging_filter
+
+# Inline fftfreq for a single 0-indexed bin — no allocation.
+# Mirrors FFTW.fftfreq(N)[k+1].
+@inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
 
 """
     FilterBank1D{T,V<:AbstractVector{Complex{T}}}
@@ -54,7 +57,7 @@ Build a 1D Morlet filter bank with dyadic scales.
 # Returns
 - `FilterBank1D`: Complete filter bank with J scales
 """
-function build_filter_bank1d(N::Int, J::Int; Q::Int=1, T::Type=Float64)
+function build_filter_bank1d(N::Int, J::Int; Q::Int=1, T::Type{<:Real}=Float64)
     # Create first wavelet to get the array type
     morlet = Filters.Morlet1D{T}(N, 0; Q=Q)
     ψ_sample = Filters.frequency_response(morlet)
@@ -88,17 +91,18 @@ end
 Build low-pass averaging filter (father wavelet / scaling function).
 Element type T allows Float32/Float64.
 """
-function averaging_filter(N::Int, J::Int, ::Type{T}=Float64) where T<:Real
-    ω = FFTW.fftfreq(N) .* T(2π) .* N
+function averaging_filter(N::Int, J::Int, ::Type{T}=Float64) where {T<:Real}
+    xi_J  = T(0.5) / T(2.0)^(J - 1)
+    sigma = xi_J * T(0.8)
+    inv2  = inv(T(2))
+    inv_s = inv(sigma)
     
-    # Cutoff at scale 2^(J-1)
-    scale = T(2.0)^(J-1)
-    sigma = T(0.8) * scale
-    
-    # Gaussian lowpass
-    ϕ = exp.(-(ω .* sigma).^2 ./ T(2))
-    
-    return complex.(ϕ)
+    ϕ = Vector{Complex{T}}(undef, N)
+    @inbounds for i in 1:N
+        ω = T(_fftfreq(N, i - 1))
+        ϕ[i] = Complex{T}(exp(-(ω * inv_s)^2 * inv2))
+    end
+    return ϕ
 end
 
 """
@@ -138,7 +142,7 @@ Build a 2D oriented Morlet filter bank.
 # Returns
 - `FilterBank2D`: Complete 2D filter bank
 """
-function build_filter_bank2d(N::NTuple{2,Int}, J::Int; L::Int=8, T::Type=Float64)
+function build_filter_bank2d(N::NTuple{2,Int}, J::Int; L::Int=8, T::Type{<:Real}=Float64)
     # Create sample wavelet to get matrix type
     morlet = Filters.Morlet2D{T}(N, 0, 0.0; L=L)
     ψ_sample = Filters.frequency_response(morlet)
@@ -171,27 +175,23 @@ end
 
 Build 2D low-pass averaging filter.
 """
-function averaging_filter2d(N::NTuple{2,Int}, J::Int, ::Type{T}=Float64) where T<:Real
+function averaging_filter2d(N::NTuple{2,Int}, J::Int, ::Type{T}=Float64) where {T<:Real}
     Ny, Nx = N
+    xi_J  = T(0.5) / T(2.0)^(J - 1)
+    sigma = xi_J * T(0.8)
+    inv2  = inv(T(2))
+    inv_s = inv(sigma)
     
-    kx = FFTW.fftfreq(Nx) .* T(2π) .* Nx
-    ky = FFTW.fftfreq(Ny) .* T(2π) .* Ny
-    
-    # Meshgrid
-    KX = [kx[j] for i in 1:Ny, j in 1:Nx]
-    KY = [ky[i] for i in 1:Ny, j in 1:Nx]
-    
-    # Radial frequency
-    K = sqrt.(KX.^2 .+ KY.^2)
-    
-    # Cutoff at largest scale
-    scale = T(2.0)^(J-1)
-    sigma = T(0.8) * scale
-    
-    # Gaussian lowpass
-    ϕ = exp.(-(K .* sigma).^2 ./ T(2))
-    
-    return complex.(ϕ)
+    ϕ = Matrix{Complex{T}}(undef, Ny, Nx)
+    @inbounds for ix in 1:Nx
+        kx = T(_fftfreq(Nx, ix - 1))
+        for iy in 1:Ny
+            ky = T(_fftfreq(Ny, iy - 1))
+            k  = sqrt(kx^2 + ky^2)
+            ϕ[iy, ix] = Complex{T}(exp(-(k * inv_s)^2 * inv2))
+        end
+    end
+    return ϕ
 end
 
 end # module FilterBanks

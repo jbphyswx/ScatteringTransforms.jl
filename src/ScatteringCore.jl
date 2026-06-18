@@ -5,6 +5,11 @@ module ScatteringCore
 
 Implements the fundamental building blocks: FFT-based convolution,
 modulus, and averaging operations.
+
+Design: All `!` functions are zero-allocation. Non-`!` wrappers allocate
+and delegate to the `!` versions. Use `mul!` with FFTW plans so the
+plan's `*` operator (which allocates a fresh output array) is never called
+in the hot path.
 """
 
 using FFTW: FFTW
@@ -18,37 +23,39 @@ export ScatteringLayer
     wavelet_convolve(signal_fft, filter_fft, ifft_plan)
 
 Perform wavelet convolution via frequency-domain multiplication.
-Allocates output. For zero-allocation, use wavelet_convolve!.
+Allocates output. For zero-allocation hot paths, use `wavelet_convolve!`.
 """
-function wavelet_convolve(signal_fft::AbstractArray{Complex{T}}, 
-                          filter_fft::AbstractArray{Complex{T}},
-                          ifft_plan) where T<:Real
-    # Frequency-domain multiplication = convolution
-    filtered_fft = signal_fft .* filter_fft
-    return ifft_plan * filtered_fft
+function wavelet_convolve(signal_fft::AbstractArray, 
+                          filter_fft::AbstractArray,
+                          ifft_plan)
+    out = similar(signal_fft)
+    buffer = signal_fft .* filter_fft
+    LinearAlgebra.mul!(out, ifft_plan, buffer)
+    return out
 end
 
 """
     wavelet_convolve!(out, signal_fft, filter_fft, ifft_plan, buffer)
 
-In-place wavelet convolution with pre-allocated buffer.
-Uses buffer for intermediate storage, writes IFFT result to out.
-Note: FFTW IFFT plan still allocates internally, but we minimize other allocs.
+Truly zero-allocation wavelet convolution.
+
+Multiplies `signal_fft .* filter_fft` into `buffer` in-place, then applies
+the IFFT plan via `mul!(out, ifft_plan, buffer)` — this writes directly into
+`out` without allocating a temporary array, unlike `ifft_plan * buffer`.
+
+`out` and `buffer` must both be pre-allocated complex arrays of the same size.
 """
-function wavelet_convolve!(out::AbstractArray{Complex{T}}, 
-                          signal_fft::AbstractArray{Complex{T}}, 
-                          filter_fft::AbstractArray{Complex{T}},
+function wavelet_convolve!(out::AbstractArray, 
+                          signal_fft::AbstractArray, 
+                          filter_fft::AbstractArray,
                           ifft_plan,
-                          buffer::AbstractArray{Complex{T}}) where T<:Real
-    # In-place multiplication into buffer
+                          buffer::AbstractArray)
+    # In-place pointwise multiply: buffer = signal_fft .* filter_fft
     @inbounds @simd for i in eachindex(signal_fft, filter_fft, buffer)
         buffer[i] = signal_fft[i] * filter_fft[i]
     end
-    # IFFT - copy result to out (FFTW plan returns new array)
-    result = ifft_plan * buffer
-    @inbounds @simd for i in eachindex(out, result)
-        out[i] = result[i]
-    end
+    # mul!(out, plan, src) writes IFFT(buffer) directly into out — zero allocation
+    LinearAlgebra.mul!(out, ifft_plan, buffer)
     return out
 end
 
@@ -56,23 +63,20 @@ end
     apply_modulus(signal)
 
 Apply complex modulus |·| to get envelope. Allocates output.
-For zero-allocation, use apply_modulus!.
+For zero-allocation hot paths, use `apply_modulus!`.
 """
-apply_modulus(signal::AbstractArray) = abs.(signal)
+function apply_modulus(signal::AbstractArray)
+    out = similar(signal, real(eltype(signal)))
+    apply_modulus!(out, signal)
+    return out
+end
 
 """
     apply_modulus!(out, signal)
 
-In-place modulus. Stores |signal| in pre-allocated out. Zero allocation.
+In-place modulus. Stores |signal| in pre-allocated `out`. Zero allocation.
 """
-function apply_modulus!(out::AbstractArray{T}, signal::AbstractArray{Complex{T}}) where T<:Real
-    @inbounds @simd for i in eachindex(out, signal)
-        out[i] = abs(signal[i])
-    end
-    return out
-end
-
-function apply_modulus!(out::AbstractArray{T}, signal::AbstractArray{T}) where T<:Real
+function apply_modulus!(out::AbstractArray, signal::AbstractArray)
     @inbounds @simd for i in eachindex(out, signal)
         out[i] = abs(signal[i])
     end
@@ -80,19 +84,13 @@ function apply_modulus!(out::AbstractArray{T}, signal::AbstractArray{T}) where T
 end
 
 """
-    spatial_average(signal)
+    spatial_average(signal::AbstractArray{T}) -> T
 
 Compute spatial average (global mean) for translation invariance.
+Type-stable: returns element type T.
 """
-spatial_average(signal::AbstractArray) = sum(signal) / length(signal)
-
-"""
-    spatial_average(signal::AbstractArray{T}) where T<:Real -> T
-
-Type-stable version that preserves element type.
-"""
-function spatial_average(signal::AbstractArray{T}) where T<:Real
-    return sum(signal) / T(length(signal))
+function spatial_average(signal::AbstractArray)
+    return sum(signal) / length(signal)
 end
 
 """

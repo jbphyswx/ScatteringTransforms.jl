@@ -71,28 +71,35 @@ Returns a length-N vector with the Fourier-domain filter coefficients.
 The response is analytic (zero for negative frequencies) for proper
 wavelet transform. Element type matches the wavelet's precision.
 """
+# Inline fftfreq for a single bin k (0-indexed) of length N.
+# Equivalent to FFTW.fftfreq(N)[k+1]. No allocation.
+# For even N: bins 0..N÷2-1 are positive, bins N÷2..N-1 are negative (Nyquist goes negative).
+# For odd N: bins 0..(N-1)÷2 are positive, rest negative.
+@inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
+
 function frequency_response(m::Morlet1D{T}) where T<:Real
     N = m.N
-    # Normalized frequency grid [0, 0.5] for positive frequencies
-    ω = FFTW.fftfreq(N)
+    ξ = m.center_freq
+    σ = m.bandwidth
+    inv2 = inv(T(2))
     
-    # Compute Gaussians: G(ω - ξ) and G(ω)
-    gabor = exp.(-((ω .- m.center_freq) ./ m.bandwidth).^2 ./ T(2))
-    lowpass = exp.(-(ω ./ m.bandwidth).^2 ./ T(2))
+    Ψ = Vector{Complex{T}}(undef, N)
     
-    # Compute kappa numerically (like kymatio) to ensure Ψ(0) = 0
-    # Find index closest to ω=0
-    zero_idx = argmin(abs.(ω))
-    kappa = gabor[zero_idx] / lowpass[zero_idx]
+    # kappa: ratio at ω=0 (bin 0). gabor(0)=exp(-(xi/sigma)^2/2), lowpass(0)=1
+    kappa = exp(-(ξ / σ)^2 * inv2)
     
-    # Morlet wavelet: G(ω-ξ) - kappa * G(ω)
-    Ψ = gabor .- kappa .* lowpass
+    @inbounds for i in 1:N
+        ω = T(_fftfreq(N, i - 1))
+        if ω < 0
+            Ψ[i] = zero(Complex{T})
+        else
+            g  = exp(-((ω - ξ) / σ)^2 * inv2)
+            lp = exp(-(ω / σ)^2 * inv2)
+            Ψ[i] = Complex{T}(g - kappa * lp)
+        end
+    end
     
-    # Make analytic: zero out negative frequencies
-    neg_idx = ω .< 0
-    Ψ[neg_idx] .= 0
-    
-    return complex.(Ψ)
+    return Ψ
 end
 
 """
@@ -152,40 +159,37 @@ Element type matches the wavelet's precision.
 """
 function frequency_response(m::Morlet2D{T}) where T<:Real
     Ny, Nx = m.N
+    k0  = m.center_freq
+    σx  = m.bandwidth_x
+    σy  = m.bandwidth_y
+    β   = m.beta
+    ct  = T(cos(m.theta))
+    st  = T(sin(m.theta))
+    inv2 = inv(T(2))
+    σx2_div2 = σx^2 * inv2
+    σy2_div2 = σy^2 * inv2
     
-    # 2D frequency grid
-    kx = FFTW.fftfreq(Nx) .* T(2π) .* Nx
-    ky = FFTW.fftfreq(Ny) .* T(2π) .* Ny
+    Ψ = Matrix{Complex{T}}(undef, Ny, Nx)
     
-    # Create 2D meshgrid
-    KX = [kx[j] for i in 1:Ny, j in 1:Nx]
-    KY = [ky[i] for i in 1:Ny, j in 1:Nx]
+    @inbounds for ix in 1:Nx
+        kx = T(_fftfreq(Nx, ix - 1)) * T(2π)
+        for iy in 1:Ny
+            ky = T(_fftfreq(Ny, iy - 1)) * T(2π)
+            # Rotate
+            kxr =  kx * ct + ky * st
+            kyr = -kx * st + ky * ct
+            if kxr < 0
+                Ψ[iy, ix] = zero(Complex{T})
+            else
+                dkx = kxr - k0
+                env = exp(-dkx^2 * σx2_div2 - kyr^2 * σy2_div2)
+                cen = exp(-kxr^2 * σx2_div2 - kyr^2 * σy2_div2)
+                Ψ[iy, ix] = Complex{T}(env - β * cen)
+            end
+        end
+    end
     
-    # Rotate coordinates by -theta to align with wavelet orientation
-    ct = cos(m.theta)
-    st = sin(m.theta)
-    KX_rot = KX .* ct .+ KY .* st  # Along wavelet direction
-    KY_rot = -KX .* st .+ KY .* ct  # Perpendicular to wavelet
-    
-    # Distance from center frequency in rotated frame
-    dkx = KX_rot .- m.center_freq
-    dky = KY_rot
-    
-    # 2D Gaussian envelope (elliptical)
-    envelope = exp.(-(dkx ./ m.bandwidth_x).^2 ./ T(2) .-
-                     (dky ./ m.bandwidth_y).^2 ./ T(2))
-    
-    # Centered Gaussian for β correction
-    centered = exp.(-(KX_rot ./ m.bandwidth_x).^2 ./ T(2) .-
-                     (KY_rot ./ m.bandwidth_y).^2 ./ T(2))
-    
-    Ψ = envelope .- m.beta .* centered
-    
-    # Make analytic: zero out region where k · direction < 0
-    neg_idx = KX_rot .< 0
-    Ψ[neg_idx] .= 0
-    
-    return complex.(Ψ)  # Returns Matrix{Complex{T}}
+    return Ψ
 end
 
 """

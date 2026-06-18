@@ -1,6 +1,7 @@
 module ScatteringTransformsTests
 
 using Test: Test
+using Aqua: Aqua
 
 # Use the required import style: using X: X
 using ScatteringTransforms: ScatteringTransforms
@@ -9,7 +10,6 @@ using Statistics: Statistics
 
 # Run Aqua quality tests first
 Test.@testset "Aqua.jl quality tests" begin
-    using Aqua: Aqua
     Aqua.test_all(ScatteringTransforms)
 end
 
@@ -188,7 +188,6 @@ end
 
 Test.@testset "Wavelet Frequency Response Peak Location" begin
     N = 512
-    using FFTW: FFTW
     
     for j in 0:3
         morlet = ScatteringTransforms.Morlet1D(N, j; Q=1)
@@ -221,7 +220,6 @@ end
 
 Test.@testset "Wavelet Shape is Gaussian" begin
     N = 512
-    using FFTW: FFTW
     
     for j in 0:3
         morlet = ScatteringTransforms.Morlet1D(N, j; Q=1)
@@ -255,6 +253,71 @@ Test.@testset "2D Filter Tests" begin
     resp = ScatteringTransforms.frequency_response(morlet)
     Test.@test size(resp) == (Ny, Nx)
     Test.@test eltype(resp) == ComplexF64
+    
+    # 1. Peak location
+    # Since theta = π/4 and j = 2, the center frequency is k0 = 3π / (4 * 2^2) = 3π / 16 ≈ 0.589.
+    # Frequency grid: kx = _fftfreq(Nx, ix-1) * 2π, ky = _fftfreq(Ny, iy-1) * 2π.
+    freqs_x = [ScatteringTransforms.Filters._fftfreq(Nx, ix-1) * 2π for ix in 1:Nx]
+    freqs_y = [ScatteringTransforms.Filters._fftfreq(Ny, iy-1) * 2π for iy in 1:Ny]
+    
+    # Find peak index
+    peak_idx = argmax(abs.(resp))
+    iy_p, ix_p = peak_idx[1], peak_idx[2]
+    kx_p, ky_p = freqs_x[ix_p], freqs_y[iy_p]
+    
+    # Check that rotated kxr is close to k0
+    ct, st = cos(π/4), sin(π/4)
+    kxr_p = kx_p * ct + ky_p * st
+    kyr_p = -kx_p * st + ky_p * ct
+    
+    Test.@test isapprox(kxr_p, morlet.center_freq, atol=0.2)
+    Test.@test isapprox(kyr_p, 0.0, atol=0.2)
+    
+    # 2. Analytic property (half-plane): zero when kxr < 0
+    any_negative_halfplane = false
+    for ix in 1:Nx, iy in 1:Ny
+        kx = freqs_x[ix]
+        ky = freqs_y[iy]
+        kxr = kx * ct + ky * st
+        if kxr < -1e-5 && abs(resp[iy, ix]) > 1e-10
+            any_negative_halfplane = true
+        end
+    end
+    Test.@test !any_negative_halfplane
+    
+    # 3. DC Response (zero mean)
+    Test.@test abs(resp[1, 1]) < 1e-10
+end
+
+Test.@testset "2D Wavelet Orientation and Scale Selectivity" begin
+    Ny, Nx = 64, 64
+    J = 3
+    L = 8
+    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=1)
+    
+    # k0 for j=1 is 3π / (4 * 2^1) = 3π/8 ≈ 1.178.
+    k0 = 3π / 8
+    theta_wave = π/4 # orient index 2 (1-based: index 3 since orient=0, 1, 2)
+    
+    # Generate grid
+    X = reshape(range(0, 2π, length=Nx+1)[1:Nx], 1, Nx)
+    Y = reshape(range(0, 2π, length=Ny+1)[1:Ny], Ny, 1)
+    k_wave = round(k0 * Nx / 2π)
+    
+    plane_wave = cos.(k_wave .* (X .* cos(theta_wave) .+ Y .* sin(theta_wave)))
+    
+    coeffs = st(plane_wave)
+    S1 = ScatteringTransforms.first_order(coeffs)
+    S1_matrix = reshape(S1, L, J) # L orientations x J scales
+    
+    # We expect the peak to be at:
+    # Scale index 2 (j=1)
+    # Orientation index 3 (θ = 2*π/8 = π/4)
+    peak_idx = argmax(S1_matrix)
+    orient_p, scale_p = peak_idx[1], peak_idx[2]
+    
+    Test.@test scale_p == 2
+    Test.@test orient_p == 3
 end
 
 Test.@testset "2D Filter Bank Tests" begin

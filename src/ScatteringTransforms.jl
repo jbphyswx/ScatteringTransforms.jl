@@ -69,7 +69,14 @@ const first_order = Coefficients.first_order
 const second_order = Coefficients.second_order
 const flatten1d = Coefficients.flatten1d
 const flatten2d = Coefficients.flatten2d
-const scattering_transform! = Scattering1D.scattering_transform!
+const scattering_transform!    = Scattering1D.scattering_transform!
+const scattering_transform2d!  = Scattering2D.scattering_transform2d!
+const compute_S1_2d! = Scattering2D.compute_S1_2d!
+const compute_S2_2d! = Scattering2D.compute_S2_2d!
+
+# Plotting stubs (implemented in ScatteringTransformsCairoMakieExt)
+function plot_filter_bank end
+function plot_coefficients end
 
 export ScatteringTransform1D, ScatteringTransform2D
 export FilterBank1D, FilterBank2D
@@ -79,9 +86,8 @@ export zeroth_order, first_order, second_order
 export flatten1d, flatten2d
 export frequency_response
 export build_filter_bank1d, build_filter_bank2d
-export scattering_transform!
-
-# Precompilation setup for faster first use
-# (optional - can be added later)
+export scattering_transform!, scattering_transform2d!
+export compute_S1_2d!, compute_S2_2d!
+export plot_filter_bank, plot_coefficients
 
 end # module

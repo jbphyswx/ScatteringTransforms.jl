@@ -1,258 +1,197 @@
 """
     generate_figures.jl
 
-Generate static figures for documentation.
-Run from docs/ directory: julia --project=.. generate_assets/generate_figures.jl
+Generate static figures for documentation using CairoMakie.
+Run from repo root: julia --project=docs docs/generate_assets/generate_figures.jl
 """
 
 using ScatteringTransforms: ScatteringTransforms
-using Plots: Plots
+using CairoMakie: CairoMakie
 using Statistics: Statistics
 using FFTW: FFTW
+using Random: Random
 
-Base.println("Generating documentation assets...")
+Random.seed!(42)
 
-# Professional plot defaults
-Plots.default(fontfamily="sans-serif", framestyle=:box, grid=false)
-
-# Create output directory
 assets_dir = Base.joinpath(Base.@__DIR__, "..", "src", "assets")
 Base.mkpath(assets_dir)
 
-# ============================================================================
-# Figure 1: 1D Signal and Scattering Coefficients
-# ============================================================================
-Base.println("Generating Figure 1: 1D Scattering Example...")
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers for synthesizing signals
+# ─────────────────────────────────────────────────────────────────────────────
 
-N = 2048
-t = range(0, 4π, length=N)
-
-# Create a signal with actual multi-scale structure
-# Pink noise (1/f spectrum) has structure at all scales
-function pink_noise(n)
-    white = Base.randn(n)
-    fft_white = FFTW.fft(white)
-    # Frequency bins for real FFT: [0, 1, 2, ..., n/2, n/2-1, ..., 1]
-    freqs = [0; 1:(n÷2-1); (n÷2); (n÷2-1):-1:1]
-    pink_fft = fft_white ./ Base.sqrt.(freqs .+ 0.1)  # Add 0.1 to avoid div by zero at DC
-    return Base.real(FFTW.ifft(pink_fft))
+function spectral_signal(N::Int, α::Real)
+    k    = [0; 1:(N÷2-1); (N÷2); (N÷2-1):-1:1]
+    amp  = (k .+ 1.0) .^ (α / 2)
+    ϕ    = 2π .* Base.rand(N)
+    fhat = amp .* exp.(im .* ϕ)
+    fhat[1] = 0.0
+    return Base.real(FFTW.ifft(fhat))
 end
 
-signal = pink_noise(N) .+ 0.5 .* Base.sin.(5*t)  # Pink noise + low freq oscillation
-
-st = ScatteringTransforms.ScatteringTransform1D(N, 6; Q=1, max_order=2)
-coeffs = st(signal)
-
-# Check we have meaningful values
-S1_max = Statistics.maximum(coeffs.S1)
-S2_max = Statistics.maximum(coeffs.S2)
-Base.println("  S1 max: $(S1_max)")
-Base.println("  S2 max: $(S2_max)")
-
-# Panel 1: Signal
-p1 = Plots.plot(t, signal, title="(a) Input Signal: Pink Noise + Oscillation",
-          xlabel="Time", ylabel="Amplitude", lw=1.0, color=:black,
-          legend=false,
-          titlefontsize=11, guidefontsize=10, tickfontsize=9,
-          left_margin=8Plots.mm, bottom_margin=6Plots.mm,
-          right_margin=2Plots.mm, top_margin=4Plots.mm)
-
-# Panel 2: S1 - First order (log scale for better visualization)
-S1_display = coeffs.S1 .+ 1e-10  # Add small offset for log scale
-p2 = Plots.bar(1:Base.length(coeffs.S1), S1_display, 
-         title="(b) S₁: First-Order (Log Scale)",
-         xlabel="Scale Index (j)", ylabel="Energy",
-         color=Plots.cgrad(:viridis, Base.length(coeffs.S1), categorical=true),
-         yscale=:log10,
-         legend=false,
-         titlefontsize=11, guidefontsize=10, tickfontsize=9,
-         left_margin=8Plots.mm, bottom_margin=8Plots.mm,
-         right_margin=2Plots.mm, top_margin=4Plots.mm)
-
-# Panel 3: S2 - Second-order (lower triangle set to NaN to preserve dynamic range and avoid -10 floor)
-S2_display = [j2 > j1 ? coeffs.S2[j1, j2] : NaN for j1 in 1:6, j2 in 1:6]
-S2_log = [isnan(x) || isinf(x) || x <= 0 ? NaN : log10(x) for x in S2_display]
-p3 = Plots.heatmap(S2_log, 
-             title="(c) S₂: Second-Order (Log10)",
-             xlabel="Scale j2", ylabel="Scale j1",
-             color=:viridis, aspect_ratio=1,
-             xticks=1:6, yticks=1:6,
-             titlefontsize=11, guidefontsize=10, tickfontsize=9,
-             left_margin=6Plots.mm, bottom_margin=8Plots.mm,
-             right_margin=8Plots.mm, top_margin=4Plots.mm)
-
-# Condensed, highly professional layout putting signal wide on top, and bar/heatmap side-by-side below
-l = Plots.@layout [
-    a{0.4h}
-    [b c]
-]
-p_combined = Plots.plot(p1, p2, p3, layout=l, size=(900, 600), margin=2Plots.mm, dpi=300)
-Plots.savefig(p_combined, Base.joinpath(assets_dir, "1d_scattering_example.png"))
-Base.println("  ✓ 1d_scattering_example.png")
-
-# ============================================================================
-# Figure 2: Filter Bank Visualization - INFORMATIVE VERSION
-# ============================================================================
-Base.println("Generating Figure 2: Filter Bank...")
-
-filters = st.filter_bank
-wavelet_responses = [Base.abs.(ψ) for ψ in filters.wavelets]
-Nfreq = length(wavelet_responses[1])
-Nhalf = Nfreq ÷ 2
-freq_axis = range(0.0, 0.5, length=Nhalf)
-
-# Plot frequency responses with meaningful annotations
-p_fb = Plots.plot(title="Morlet Wavelet Filter Bank: Frequency Tiling",
-         xlabel="Normalized Frequency (cycles/sample)", ylabel="Filter Magnitude",
-         size=(900, 320), dpi=300,
-         legend=:outerright,
-         titlefontsize=12, guidefontsize=11, tickfontsize=10,
-         legendfontsize=9,
-         left_margin=8Plots.mm,
-         bottom_margin=8Plots.mm,
-         right_margin=2Plots.mm,
-         top_margin=4Plots.mm)
-
-# 1. Plot the scaling function (low-pass filter)
-ϕ_abs = Base.abs.(filters.averaging[1:Nhalf])
-Plots.plot!(p_fb, freq_axis, ϕ_abs, label="Lowpass ϕ", lw=3.0, color=:black, linestyle=:dash)
-
-# 2. Use premium, high-contrast colors for scales (no yellow/light-green)
-colors = [:darkblue, :royalblue, :teal, :forestgreen, :darkorange, :crimson]
-for (i, response) in enumerate(wavelet_responses)
-    label = "Scale j=$(i-1)"
-    response_half = response[1:Nhalf]
-    Plots.plot!(p_fb, freq_axis, response_half, label=label, lw=2.5, color=colors[i], alpha=0.8)
+function spectral_field_2d(M::Int, α::Real)
+    Ny, Nx = M, M
+    ky_vec = [k < (Ny+1)÷2 ? k : k-Ny for k in 0:Ny-1]
+    kx_vec = [k < (Nx+1)÷2 ? k : k-Nx for k in 0:Nx-1]
+    fhat   = zeros(Complex{Float64}, Ny, Nx)
+    for ix in 1:Nx, iy in 1:Ny
+        kr = Base.sqrt(Float64(kx_vec[ix])^2 + Float64(ky_vec[iy])^2)
+        amp = (kr + 1.0)^(α / 2)
+        fhat[iy, ix] = amp * exp(2π * im * Base.rand())
+    end
+    fhat[1, 1] = 0.0
+    field = Base.real(FFTW.ifft(fhat))
+    return field ./ Statistics.std(field)
 end
 
-Plots.savefig(p_fb, Base.joinpath(assets_dir, "filter_bank.png"))
+# ─────────────────────────────────────────────────────────────────────────────
+# Figure 1: Filter bank tiling and Littlewood-Paley sum
+# ─────────────────────────────────────────────────────────────────────────────
+Base.println("Figure 1: Filter bank...")
+N_fb = 1024
+J_fb = 6
+st_fb = ScatteringTransforms.ScatteringTransform1D(N_fb, J_fb; Q=1, max_order=1)
+fig_fb = ScatteringTransforms.plot_filter_bank(st_fb.filter_bank)
+CairoMakie.save(Base.joinpath(assets_dir, "filter_bank.png"), fig_fb)
 Base.println("  ✓ filter_bank.png")
 
-# ============================================================================
-# Figure 3: 2D Scattering Example - Better Test Image
-# ============================================================================
-Base.println("Generating Figure 3: 2D Scattering Example...")
+# ─────────────────────────────────────────────────────────────────────────────
+# Figure 2: 1D Kolmogorov turbulence — signal, S1, S2
+# ─────────────────────────────────────────────────────────────────────────────
+Base.println("Figure 2: 1D scattering example...")
+N = 2048
+J = 7
+signal = spectral_signal(N, -5/3)
+signal = signal ./ Statistics.std(signal)
+st1d = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+coeffs_1d = st1d(signal)
+fig_1d = ScatteringTransforms.plot_coefficients(coeffs_1d; signal=signal)
+CairoMakie.save(Base.joinpath(assets_dir, "1d_scattering_example.png"), fig_1d)
+Base.println("  ✓ 1d_scattering_example.png")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Figure 3: 2D turbulent field — field, S1, S2
+# ─────────────────────────────────────────────────────────────────────────────
+Base.println("Figure 3: 2D scattering example...")
 M = 128
-x = range(0, 8π, length=M)
-y = range(0, 8π, length=M)
-
-# Create 2D fractal-like texture using multiple sine waves at different scales
-image = Base.zeros(M, M)
-for i in 1:M, j in 1:M
-    xi, yi = x[i], y[j]
-    # Multiple octaves of noise-like structure
-    image[i,j] += Base.sin(xi) * Base.cos(yi)  # Base frequency
-    image[i,j] += 0.5 * Base.sin(2*xi) * Base.cos(2*yi)  # Octave 2
-    image[i,j] += 0.25 * Base.sin(4*xi) * Base.cos(4*yi)  # Octave 3
-    image[i,j] += 0.125 * Base.sin(8*xi) * Base.cos(8*yi)  # Octave 4
-end
-# Normalize
-image = image ./ Statistics.maximum(Base.abs.(image))
-# Add pink noise
-image .+= 0.3 .* Base.randn(M, M)
-
-st2d = ScatteringTransforms.ScatteringTransform2D((M, M), 3; L=6, max_order=2)
-coeffs_2d = st2d(image)
-
-Base.println("  2D S1 range: [$(Statistics.minimum(coeffs_2d.S1)), $(Statistics.maximum(coeffs_2d.S1))]")
-Base.println("  2D S2 max: $(Statistics.maximum(coeffs_2d.S2))")
-
-# Normalize S2 for display
-S2_2d = coeffs_2d.S2
-if Statistics.maximum(S2_2d) > 0
-    S2_2d = S2_2d ./ Statistics.maximum(S2_2d)
-end
-
-p1 = Plots.heatmap(image, title="(a) Input Texture", 
-             color=:viridis, aspect_ratio=1,
-             titlefontsize=11, guidefontsize=10, tickfontsize=9,
-             left_margin=5Plots.mm, bottom_margin=6Plots.mm,
-             right_margin=8Plots.mm, top_margin=4Plots.mm)
-
-# Group S1 by scale for better visualization
-J, L = st2d.filter_bank.J, st2d.filter_bank.L
-S1_matrix = Base.reshape(coeffs_2d.S1, L, J)'
-
-p2 = Plots.heatmap(S1_matrix, title="(b) S₁: Scale-Orientation",
-             xlabel="Orientation (θ)", ylabel="Scale (j)",
-             color=:viridis, aspect_ratio=1,
-             xticks=1:L, yticks=1:J,
-             titlefontsize=11, guidefontsize=10, tickfontsize=9,
-             left_margin=5Plots.mm, bottom_margin=6Plots.mm,
-             right_margin=8Plots.mm, top_margin=4Plots.mm)
-
-# S2 with log scale, set lower triangle/diagonal to NaN to preserve dynamic range
-n_w = size(S2_2d, 1)
-S2_2d_display = [j2 > j1 ? S2_2d[j1, j2] : NaN for j1 in 1:n_w, j2 in 1:n_w]
-S2_2d_log = [isnan(x) || isinf(x) || x <= 0 ? NaN : log10(x) for x in S2_2d_display]
-
-p3 = Plots.heatmap(S2_2d_log, title="(c) S₂: Second-Order (Log10)",
-             xlabel="Wavelet Index (j₂, θ₂)", ylabel="Wavelet Index (j₁, θ₁)",
-             color=:viridis, aspect_ratio=1,
-             xticks=[1, 7, 13, 18], yticks=[1, 7, 13, 18],
-             titlefontsize=11, guidefontsize=10, tickfontsize=9,
-             left_margin=5Plots.mm, bottom_margin=6Plots.mm,
-             right_margin=8Plots.mm, top_margin=4Plots.mm)
-
-p_2d = Plots.plot(p1, p2, p3, layout=(1,3), size=(1050, 275), margin=2Plots.mm, dpi=300)
-Plots.savefig(p_2d, Base.joinpath(assets_dir, "2d_scattering_example.png"))
+J2 = 3
+L2 = 8
+field = spectral_field_2d(M, -3.0)
+st2d = ScatteringTransforms.ScatteringTransform2D((M, M), J2; L=L2, max_order=2)
+coeffs_2d = st2d(field)
+fig_2d = ScatteringTransforms.plot_coefficients(coeffs_2d; image=field)
+CairoMakie.save(Base.joinpath(assets_dir, "2d_scattering_example.png"), fig_2d)
 Base.println("  ✓ 2d_scattering_example.png")
 
-# ============================================================================
-# Figure 4: Zero-Allocation Performance Comparison - Real Benchmark
-# ============================================================================
-Base.println("Generating Figure 4: Performance Comparison...")
+# ─────────────────────────────────────────────────────────────────────────────
+# Figure 4: Discriminability Demo (Kolmogorov vs Gaussian phase-randomized)
+# ─────────────────────────────────────────────────────────────────────────────
+Base.println("Figure 4: Discriminability demo...")
+N_d = 2048
+J_d = 6
 
-# Warm up compilation to get accurate, stable benchmark results
-warmup_st = ScatteringTransforms.ScatteringTransform1D(128, 4; Q=1, max_order=2)
-warmup_sig = Base.randn(128)
-warmup_st(warmup_sig)
-warmup_coeffs = ScatteringTransforms.ScatteringCoefficients1D(Base.length(warmup_st.filter_bank.wavelets), Float64; compute_S2=true)
-ScatteringTransforms.scattering_transform!(warmup_coeffs, warmup_st, warmup_sig)
-
-sizes = [512, 1024, 2048, 4096, 8192]
-naive_times = Float64[]
-zero_alloc_times = Float64[]
-
-for N in sizes
-    local st, signal, coeffs
-    st = ScatteringTransforms.ScatteringTransform1D(N, 6; Q=1, max_order=2)
-    signal = Base.randn(N)
-    
-    # Garbage collect to ensure identical starting conditions
-    GC.gc()
-    
-    # Naive: allocate every time (run 100 iterations)
-    t1 = Base.@elapsed for _ in 1:100 st(signal) end
-    Base.push!(naive_times, t1 * 10)  # Convert to per-call ms: (t1 / 100) * 1000
-    
-    # Garbage collect
-    GC.gc()
-    
-    # Zero-allocation: pre-allocated (run 100 iterations)
-    coeffs = ScatteringTransforms.ScatteringCoefficients1D(Base.length(st.filter_bank.wavelets), Float64; compute_S2=true)
-    t2 = Base.@elapsed for _ in 1:100 ScatteringTransforms.scattering_transform!(coeffs, st, signal) end
-    Base.push!(zero_alloc_times, t2 * 10)  # Convert to per-call ms: (t2 / 100) * 1000
+sigA = zeros(Float64, N_d)
+# Place 12 sparse impulses
+for idx in [150, 320, 510, 720, 930, 1100, 1280, 1420, 1610, 1750, 1920]
+    sigA[idx] = randn()
 end
 
-p_perf = Plots.plot(sizes, naive_times, label="Naive (Allocates)", marker=:circle, lw=2, markersize=8,
-         title="Performance: Zero-Allocation vs Naive",
-         xlabel="Signal Size (N)", ylabel="Time per Call (ms)",
-         xscale=:log2, yscale=:log10,
-         legend=:topleft, framestyle=:box,
-         titlefontsize=12, guidefontsize=11, tickfontsize=10,
-         legendfontsize=10, dpi=300,
-         size=(800, 480),
-         left_margin=8Plots.mm, bottom_margin=8Plots.mm,
-         right_margin=3Plots.mm, top_margin=4Plots.mm)
+# Smooth slightly to create localized features
+freqs = FFTW.fftfreq(N_d)
+smooth_filter = exp.(-freqs.^2 ./ (2 * 0.02^2))
+sigA = Base.real(FFTW.ifft(FFTW.fft(sigA) .* smooth_filter))
+sigA = sigA ./ Statistics.std(sigA)
 
-# Use dynamic speedup in legend label to avoid overlapping text annotation
-speedup = naive_times[end] / zero_alloc_times[end]
-speedup_str = "$(Base.round(speedup, digits=1))x Speedup"
-Plots.plot!(p_perf, sizes, zero_alloc_times, label="Zero-Allocation ($(speedup_str))", marker=:square, lw=2, markersize=8)
+fA   = FFTW.fft(sigA)
+ampA = Base.abs.(fA)
+ϕB   = 2π .* Base.rand(N_d)
+fB   = ampA .* exp.(im .* ϕB)
+fB[1] = 0.0
+sigB  = Base.real(FFTW.ifft(fB))
+sigB  = sigB ./ Statistics.std(sigB)
 
-Plots.savefig(p_perf, Base.joinpath(assets_dir, "performance_comparison.png"))
-Base.println("  ✓ performance_comparison.png")
+st_d   = ScatteringTransforms.ScatteringTransform1D(N_d, J_d; Q=1, max_order=2)
+cA     = st_d(sigA)
+cB     = st_d(sigB)
 
-Base.println("\nAll assets generated in: $(assets_dir)")
+# Set up the custom discriminability figure using CairoMakie
+fig_disc = CairoMakie.Figure(size=(950, 1000))
+
+zi = 1:1000
+t_d = collect(0:N_d-1) ./ N_d
+
+# Panel (a): Signal A
+ax_a = CairoMakie.Axis(fig_disc[1, 1],
+    title="(a) Signal A: Intermittent process (correlated phases)",
+    xlabel="x", ylabel="u(x)"
+)
+CairoMakie.lines!(ax_a, t_d[zi], sigA[zi], color=:steelblue, linewidth=1.5)
+
+# Panel (b): Signal B
+ax_b = CairoMakie.Axis(fig_disc[1, 2],
+    title="(b) Signal B: Randomized phases (Gaussian surrogate)",
+    xlabel="x", ylabel="u(x)"
+)
+CairoMakie.lines!(ax_b, t_d[zi], sigB[zi], color=:firebrick, linewidth=1.5)
+
+# Panel (c): Power spectrum
+pA = Base.abs.(FFTW.fft(sigA)) .^ 2 ./ N_d
+pB = Base.abs.(FFTW.fft(sigB)) .^ 2 ./ N_d
+kk = collect(1:N_d÷2)
+ax_c = CairoMakie.Axis(fig_disc[2, 1:2],
+    title="(c) Power spectra: identical by construction",
+    xlabel="Wavenumber k", ylabel="E(k)",
+    xscale=log10, yscale=log10
+)
+CairoMakie.lines!(ax_c, kk, pA[2:N_d÷2+1], color=:steelblue, linewidth=2.5, label="A")
+CairoMakie.lines!(ax_c, kk, pB[2:N_d÷2+1], color=:firebrick, linewidth=1.5, linestyle=:dash, label="B")
+CairoMakie.axislegend(ax_c, position=:rt)
+
+# Panel (d): S1 coefficients
+S1A = cA.S1
+S1B = cB.S1
+scale_labels_d = ["2^$(j-1)" for j in 1:J_d]
+ax_d = CairoMakie.Axis(fig_disc[3, 1:2],
+    title="(d) S₁: nearly identical (first order is phase-blind)",
+    xlabel="Scale j", ylabel="S₁(j)",
+    xticks=(1:J_d, scale_labels_d)
+)
+CairoMakie.scatterlines!(ax_d, 1:J_d, S1A, color=:steelblue, marker=:circle, markersize=10, linewidth=2.0, label="A")
+CairoMakie.scatterlines!(ax_d, 1:J_d, S1B, color=:firebrick, marker=:rect, markersize=10, linewidth=1.5, linestyle=:dash, label="B")
+CairoMakie.axislegend(ax_d, position=:rt)
+
+# Panels (e) & (f): S2 Heatmaps
+# Find clim
+S2A_disp = copy(cA.S2)
+S2B_disp = copy(cB.S2)
+for i in 1:J_d, j in 1:J_d
+    if j <= i
+        S2A_disp[i, j] = NaN
+        S2B_disp[i, j] = NaN
+    end
+end
+min_val = min(minimum(filter(!isnan, S2A_disp)), minimum(filter(!isnan, S2B_disp)))
+max_val = max(maximum(filter(!isnan, S2A_disp)), maximum(filter(!isnan, S2B_disp)))
+crange = (min_val, max_val)
+
+ax_e = CairoMakie.Axis(fig_disc[4, 1],
+    title="(e) S₂ for A  [turbulent: cross-scale coupling]",
+    xlabel="j₂", ylabel="j₁",
+    xticks=(1:J_d, scale_labels_d), yticks=(1:J_d, scale_labels_d),
+    aspect=CairoMakie.AxisAspect(1)
+)
+hm_e = CairoMakie.heatmap!(ax_e, S2A_disp, colormap=:plasma, colorrange=crange, nan_color=:transparent)
+
+ax_f = CairoMakie.Axis(fig_disc[4, 2],
+    title="(f) S₂ for B  [Gaussian: weak coupling]",
+    xlabel="j₂", ylabel="j₁",
+    xticks=(1:J_d, scale_labels_d), yticks=(1:J_d, scale_labels_d),
+    aspect=CairoMakie.AxisAspect(1)
+)
+hm_f = CairoMakie.heatmap!(ax_f, S2B_disp, colormap=:plasma, colorrange=crange, nan_color=:transparent)
+CairoMakie.Colorbar(fig_disc[4, 3], hm_e)
+
+CairoMakie.save(Base.joinpath(assets_dir, "discriminability.png"), fig_disc)
+Base.println("  ✓ discriminability.png")
+
+Base.println("\nAll assets generated successfully in: $(assets_dir)")

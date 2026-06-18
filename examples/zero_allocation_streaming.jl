@@ -7,8 +7,9 @@ This pattern is essential for processing TB-scale ocean data.
 Run with: julia --project=. zero_allocation_streaming.jl
 """
 
-using ScatteringTransforms
-using Statistics
+using ScatteringTransforms: ScatteringTransforms
+using Statistics: Statistics
+using Test: Test
 
 println("="^60)
 println("Zero-Allocation Streaming Demo")
@@ -20,7 +21,7 @@ J = 8                       # Number of scales
 num_signals = 1000          # Simulate 1000 signals
 
 # Build transform once
-st = ScatteringTransform1D(N, J; Q=1, max_order=2)
+st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
 num_w = length(st.filter_bank.wavelets)
 
 println("\nConfiguration:")
@@ -63,12 +64,12 @@ println("-"^60)
 function streaming_inplace(signals, st)
     # Pre-allocate coefficient storage ONCE
     num_w = length(st.filter_bank.wavelets)
-    coeffs = ScatteringCoefficients1D(num_w, Float64; compute_S2=true)
+    coeffs = ScatteringTransforms.ScatteringCoefficients1D(num_w, Float64; compute_S2=true)
     
     results = Vector{Float64}[]
     for signal in signals
         # Reuses S1/S2 arrays, only creates new wrapper struct (~32 bytes)
-        coeffs = scattering_transform!(coeffs, st, signal)
+        coeffs = ScatteringTransforms.scattering_transform!(coeffs, st, signal)
         push!(results, copy(coeffs.S1))  # copy() because we reuse the array
     end
     return results
@@ -92,17 +93,16 @@ function true_zero_alloc_stream(signals, st)
     
     # Use mutable container for S0 to achieve true zero allocation
     S0_container = [0.0]  # 1-element mutable container
-    coeffs = ScatteringCoefficients1D(
+    coeffs = ScatteringTransforms.ScatteringCoefficients1D(
         Vector{Float64}(undef, num_w),
-        Matrix{Float64}(undef, num_w, num_w);
-        S0=S0_container,
-        compute_S2=true
+        zeros(Float64, num_w, num_w);
+        S0=S0_container
     )
     
     results = Vector{Float64}[]
     for signal in signals
         # True zero allocation: same struct returned, S0 updated in place
-        coeffs = scattering_transform!(coeffs, st, signal)
+        coeffs = ScatteringTransforms.scattering_transform!(coeffs, st, signal)
         push!(results, copy(coeffs.S1))
     end
     return results
@@ -152,6 +152,6 @@ println("="^60)
 # Correctness Check
 # ============================================================================
 println("\nCorrectness Verification:")
-@test all(isapprox(results_naive[i], results_streaming[i]) for i in eachindex(signals))
-@test all(isapprox(results_naive[i], results_true_zero[i]) for i in eachindex(signals))
+Test.@test all(isapprox(results_naive[i], results_streaming[i]) for i in eachindex(signals))
+Test.@test all(isapprox(results_naive[i], results_true_zero[i]) for i in eachindex(signals))
 println("  ✓ All approaches produce identical results")

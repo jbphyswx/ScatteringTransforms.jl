@@ -7,7 +7,7 @@ Requires: CUDA.jl and a CUDA-capable GPU.
 Run with: julia --project=. gpu_acceleration.jl
 """
 
-using ScatteringTransforms
+using ScatteringTransforms: ScatteringTransforms
 
 println("="^60)
 println("GPU Acceleration Demo (CUDA)")
@@ -15,7 +15,7 @@ println("="^60)
 
 # Check if CUDA is available
 try
-    using CUDA
+    using CUDA: CUDA
     println("\nCUDA is available!")
     println("  Device: $(CUDA.name(CUDA.device()))")
 catch e
@@ -40,10 +40,10 @@ println("CPU Version (Reference)")
 println("-"^60)
 
 signal_cpu = randn(Float32, N)  # Float32 for GPU efficiency
-st_cpu = ScatteringTransform1D(N, J; Q=1, max_order=2, T=Float32)
+st_cpu = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, T=Float32)
 
 # Warmup
-_ = st_cpu(signal_cpu)
+coeffs_cpu = st_cpu(signal_cpu)
 
 # Benchmark
 start_time = time()
@@ -63,7 +63,7 @@ println("GPU Version (CUDA)")
 println("-"^60)
 
 # Transfer to GPU
-signal_gpu = CuVector{Float32}(signal_cpu)
+signal_gpu = CUDA.CuVector{Float32}(signal_cpu)
 
 # Note: For full GPU support, the filter bank and buffers would also need
 # to be on the GPU. Currently the package is GPU-ready in terms of type
@@ -93,11 +93,11 @@ println("-"^60)
 
 # Create CuArray-based coefficients (conceptual)
 num_w = length(st_cpu.filter_bank.wavelets)
-S1_cu = CuVector{Float32}(undef, num_w)
-S2_cu = CuMatrix{Float32}(undef, num_w, num_w)
+S1_cu = CUDA.CuVector{Float32}(undef, num_w)
+S2_cu = CUDA.CuMatrix{Float32}(undef, num_w, num_w)
 
 # This would work if we had GPU FFT plans
-coeffs_cu = ScatteringCoefficients1D(S1_cu, S2_cu; S0=Float32(0))
+coeffs_cu = ScatteringTransforms.ScatteringCoefficients1D(S1_cu, S2_cu; S0=Float32(0))
 
 println("  CuVector S1: $(typeof(coeffs_cu.S1))")
 println("  CuMatrix S2: $(typeof(coeffs_cu.S2))")
