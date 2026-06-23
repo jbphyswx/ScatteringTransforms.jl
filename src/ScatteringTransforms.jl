@@ -8,12 +8,14 @@ Supports 1D, 2D planar (gridded), and (via extension) 2D spherical scattering.
 ```julia
 using ScatteringTransforms
 
-# 1D scattering
-st = ScatteringTransform1D(; J=8, Q=1, max_order=2)
+# 1D scattering (N = signal length, J = number of octaves)
+signal = randn(1024)
+st = ScatteringTransform1D(1024, 8; Q=1, max_order=2)
 coeffs = st(signal)
 
-# 2D planar scattering  
-st2d = ScatteringTransform2D(; J=4, L=8, max_order=2)
+# 2D planar scattering (N = image size, J = scales, L = orientations)
+image = randn(256, 256)
+st2d = ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
 coeffs2d = st2d(image)
 ```
 

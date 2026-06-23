@@ -11,14 +11,12 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
-JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
 
 [extensions]
 ScatteringTransformsCUDAExt = "CUDA"
 ScatteringTransformsCairoMakieExt = "CairoMakie"
-ScatteringTransformsJLD2Ext = "JLD2"
 ScatteringTransformsKernelAbstractionsExt = "KernelAbstractions"
 ScatteringTransformsNUFSHTExt = ["NUFSHT", "FastSphericalHarmonics"]
 
@@ -26,12 +24,11 @@ ScatteringTransformsNUFSHTExt = ["NUFSHT", "FastSphericalHarmonics"]
 CUDA = "5"
 CairoMakie = "0.15"
 FFTW = "1"
-JLD2 = "0.5"
 FastSphericalHarmonics = "1"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1"
 NUFSHT = "0.1"
-julia = "1.9"
+julia = "1.11"
 
 [workspace]
 projects = ["test", "docs"]

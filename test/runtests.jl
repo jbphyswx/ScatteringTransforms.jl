@@ -2,6 +2,7 @@ module ScatteringTransformsTests
 
 using Test: Test
 using Aqua: Aqua
+using ExplicitImports: ExplicitImports as EI
 
 # Use the required import style: using X: X
 using ScatteringTransforms: ScatteringTransforms
@@ -11,6 +12,25 @@ using Statistics: Statistics
 # Run Aqua quality tests first
 Test.@testset "Aqua.jl quality tests" begin
     Aqua.test_all(ScatteringTransforms)
+end
+
+Test.@testset "Explicit imports (no implicit / no stale)" begin
+    # Enforce the package style: no reliance on bare `using` re-exports, no dead imports.
+    # Checks the core module and every loaded backend extension (skipped if the weakdep
+    # isn't loaded in the test environment).
+    Test.@test (EI.check_no_implicit_imports(ScatteringTransforms); true)
+    Test.@test (EI.check_no_stale_explicit_imports(ScatteringTransforms); true)
+    for extname in (
+        :ScatteringTransformsCUDAExt,
+        :ScatteringTransformsCairoMakieExt,
+        :ScatteringTransformsKernelAbstractionsExt,
+        :ScatteringTransformsNUFSHTExt,
+    )
+        ext = Base.get_extension(ScatteringTransforms, extname)
+        ext === nothing && continue
+        Test.@test (EI.check_no_implicit_imports(ext); true)
+        Test.@test (EI.check_no_stale_explicit_imports(ext); true)
+    end
 end
 
 Test.@testset "1D Morlet Wavelet Mathematical Properties" begin
@@ -106,6 +126,11 @@ Test.@testset "1D Filter Bank with Q > 1 Fractional Center Frequencies" begin
 end
 
 Test.@testset "2D S2 Coefficients Zero-Initialization Verification" begin
+    # TODO(Phase 2): this asserts the PROVISIONAL dense-matrix-with-zero-triangle storage
+    # contract. The dense S2 matrix is a placeholder for the true scattering path structure;
+    # it will be replaced by a path-indexed container and these assertions become
+    # path-structure checks (counts per order, frequency-decreasing constraint). Until then
+    # keep verifying the current contract so the suite stays green.
     Ny, Nx = 64, 64
     J = 3
     L = 4
@@ -113,7 +138,7 @@ Test.@testset "2D S2 Coefficients Zero-Initialization Verification" begin
     image = randn(Ny, Nx)
     coeffs = st(image)
     S2 = ScatteringTransforms.second_order(coeffs)
-    
+
     # Verify diagonal and lower triangle are exactly zero (due to zeros allocation fix)
     n = size(S2, 1)
     for j1 in 1:n
@@ -378,6 +403,22 @@ Test.@testset "Translation invariance (approximate)" begin
     S1_2 = ScatteringTransforms.first_order(coeffs2)
     rel_diff = abs.(S1_1 .- S1_2) ./ (S1_1 .+ 1e-10)
     Test.@test all(rel_diff .< 0.1)  # Within 10% due to edge effects
+end
+
+Test.@testset "compute_shape_sparsity: shape reduction (TODO Phase 6)" begin
+    # `compute_shape_sparsity` currently returns `shape` as all zeros — the anisotropy/shape
+    # reduction (RWST / Cheng-Ménard s22) is not yet implemented. Recorded as broken so the
+    # intent to implement it in Phase 6 is tracked and flips green when done.
+    Ny, Nx = 64, 64
+    J = 3
+    L = 4
+    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
+    image = randn(Ny, Nx)
+    coeffs = st(image)
+    S1 = ScatteringTransforms.first_order(coeffs)
+    S2 = ScatteringTransforms.second_order(coeffs)
+    res = ScatteringTransforms.Scattering2D.compute_shape_sparsity(S1, S2, st.filter_bank.meta)
+    Test.@test_broken any(res.shape .!= 0)
 end
 
 end # module
