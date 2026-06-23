@@ -15,10 +15,35 @@ using ..Filters: Filters
 export FilterBank1D, FilterBank2D
 export build_filter_bank1d, build_filter_bank2d
 export averaging_filter
+export WaveletMeta
 
 # Inline fftfreq for a single 0-indexed bin — no allocation.
 # Mirrors FFTW.fftfreq(N)[k+1].
 @inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
+
+"""
+    WaveletMeta{T}
+
+Concrete per-wavelet metadata (replaces the abstract `Vector{NamedTuple}`).
+
+# Fields
+- `scale::Int`: octave index `j`
+- `q::Int`: sub-octave index within the octave (1D, `0..Q-1`); `0` for 2D
+- `orient::Int`: orientation index `l` (2D, `0..L-1`); `0` for 1D
+- `j_eff::T`: effective log-scale used to order paths. `j + q/Q` in 1D, `T(j)` in 2D. The
+  second-order admissibility constraint is `j_eff(child) > j_eff(parent)` (frequency strictly
+  decreasing) — which for 2D means *scale strictly increasing over all orientation pairs*.
+- `center_freq::T`: wavelet center frequency
+- `theta::T`: orientation angle in radians (2D); `0` for 1D
+"""
+struct WaveletMeta{T}
+    scale::Int
+    q::Int
+    orient::Int
+    j_eff::T
+    center_freq::T
+    theta::T
+end
 
 """
     FilterBank1D{T,V<:AbstractVector{Complex{T}}}
@@ -39,7 +64,7 @@ Complete 1D filter bank for scattering transform.
 struct FilterBank1D{T,V<:AbstractVector{Complex{T}}}
     wavelets::Vector{V}
     averaging::V
-    meta::Vector{NamedTuple}
+    meta::Vector{WaveletMeta{T}}
     J::Int
     Q::Int
 end
@@ -64,18 +89,17 @@ function build_filter_bank1d(N::Int, J::Int; Q::Int=1, T::Type{<:Real}=Float64)
     V = typeof(ψ_sample)
     
     wavelets = Vector{V}(undef, 0)
-    meta = Vector{NamedTuple}(undef, 0)
-    
+    meta = Vector{WaveletMeta{T}}(undef, 0)
+
     for j in 0:J-1
         for q in 0:Q-1
             effective_j = j + q / Q
-            
+
             morlet = Filters.Morlet1D{T}(N, j * Q + q; Q=Q)
             ψ = Filters.frequency_response(morlet)
-            
+
             push!(wavelets, ψ)
-            push!(meta, (scale=j, q=q, j_eff=effective_j, 
-                        center_freq=morlet.center_freq))
+            push!(meta, WaveletMeta{T}(j, q, 0, T(effective_j), morlet.center_freq, zero(T)))
         end
     end
     
@@ -124,7 +148,7 @@ Complete 2D filter bank with oriented wavelets.
 struct FilterBank2D{T,M<:AbstractMatrix{Complex{T}}}
     wavelets::Vector{M}
     averaging::M
-    meta::Vector{NamedTuple}
+    meta::Vector{WaveletMeta{T}}
     J::Int
     L::Int
 end
@@ -149,18 +173,19 @@ function build_filter_bank2d(N::NTuple{2,Int}, J::Int; L::Int=8, T::Type{<:Real}
     M = typeof(ψ_sample)
     
     wavelets = Vector{M}(undef, 0)
-    meta = Vector{NamedTuple}(undef, 0)
-    
+    meta = Vector{WaveletMeta{T}}(undef, 0)
+
     for j in 0:J-1
         for l in 0:L-1
             theta = T(π) * l / L
-            
+
             morlet = Filters.Morlet2D{T}(N, j, theta; L=L)
             ψ = Filters.frequency_response(morlet)
-            
+
             push!(wavelets, ψ)
-            push!(meta, (scale=j, orient=l, theta=theta,
-                        center_freq=morlet.center_freq))
+            # j_eff = T(j): same-scale (different-orientation) pairs share j_eff and are therefore
+            # NOT admissible as second-order paths; only strictly coarser scales are.
+            push!(meta, WaveletMeta{T}(j, 0, l, T(j), morlet.center_freq, theta))
         end
     end
     

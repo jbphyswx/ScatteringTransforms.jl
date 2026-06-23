@@ -43,6 +43,7 @@ include("Filters.jl")
 include("FilterBanks.jl")
 include("ScatteringCore.jl")
 include("Coefficients.jl")
+include("PathGraph.jl")
 include("Scattering1D.jl")
 include("Scattering2D.jl")
 
@@ -50,6 +51,7 @@ include("Scattering2D.jl")
 using .Filters: Filters
 using .FilterBanks: FilterBanks
 using .ScatteringCore: ScatteringCore
+using .PathGraph: PathGraph
 using .Scattering1D: Scattering1D
 using .Scattering2D: Scattering2D
 using .Coefficients: Coefficients
@@ -59,6 +61,8 @@ const ScatteringTransform1D = Scattering1D.ScatteringTransform1D
 const ScatteringTransform2D = Scattering2D.ScatteringTransform2D
 const FilterBank1D = FilterBanks.FilterBank1D
 const FilterBank2D = FilterBanks.FilterBank2D
+const WaveletMeta = FilterBanks.WaveletMeta
+const ScatteringTree = PathGraph.ScatteringTree
 const Morlet1D = Filters.Morlet1D
 const Morlet2D = Filters.Morlet2D
 const ScatteringCoefficients1D = Coefficients.ScatteringCoefficients1D
@@ -82,6 +86,7 @@ function plot_coefficients end
 
 export ScatteringTransform1D, ScatteringTransform2D
 export FilterBank1D, FilterBank2D
+export WaveletMeta, ScatteringTree
 export Morlet1D, Morlet2D
 export ScatteringCoefficients1D, ScatteringCoefficients2D
 export zeroth_order, first_order, second_order

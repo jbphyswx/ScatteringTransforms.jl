@@ -180,6 +180,42 @@ Test.@testset "2D S2 Coefficients Zero-Initialization Verification" begin
     Test.@test any(upper_vals .> 0.0)
 end
 
+Test.@testset "Path graph: 2D second order is scale-increasing (correctness fix)" begin
+    # The 2D second-order constraint must be SCALE strictly increasing over ALL orientation
+    # pairs — not a flat-index upper triangle (which wrongly mixed scale and orientation and
+    # included same-scale, different-orientation pairs).
+    PG = ScatteringTransforms.PathGraph
+    Ny, Nx = 64, 64
+    J = 3
+    L = 4
+    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
+    meta = st.filter_bank.meta
+    tree = st.tree
+
+    n_paths = 0
+    for p in PG.order_range(tree, 2)
+        idx = PG.path_indices(tree, p)
+        i1, i2 = idx[1], idx[2]
+        Test.@test meta[i2].scale > meta[i1].scale   # strictly coarser only
+        n_paths += 1
+    end
+    # binom(J,2) scale pairs, each with L*L orientation pairs.
+    Test.@test n_paths == (J * (J - 1) ÷ 2) * L * L
+
+    image = randn(Ny, Nx)
+    coeffs = st(image)
+    S2 = ScatteringTransforms.second_order(coeffs)
+    nw = J * L
+    # Same-scale (incl. different-orientation) second-order entries are exactly zero.
+    for i1 in 1:nw, i2 in 1:nw
+        if meta[i1].scale == meta[i2].scale
+            Test.@test S2[i1, i2] == 0
+        end
+    end
+    # Genuine cross-scale second-order energy exists.
+    Test.@test any(S2[i1, i2] > 0 for i1 in 1:nw for i2 in 1:nw if meta[i2].scale > meta[i1].scale)
+end
+
 
 Test.@testset "1D Scattering Transform Tests" begin
     N = 256

@@ -60,7 +60,8 @@ function ScatteringTransforms.Scattering1D.ScatteringTransform1D(
     filter_bank = ScatteringTransforms.FilterBanks.FilterBank1D{T, V_type}(
         cu_wavelets, cu_avg, cpu_fb.meta, cpu_fb.J, cpu_fb.Q
     )
-    
+    tree = ScatteringTransforms.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+
     # GPU FFT plans via CUFFT (plan_fft / plan_ifft on CuArray use CUFFT automatically)
     dummy_cu = CUDA.zeros(Complex{T}, N)
     fft_plan  = CUDA.CUFFT.plan_fft(dummy_cu)
@@ -83,8 +84,8 @@ function ScatteringTransforms.Scattering1D.ScatteringTransform1D(
     M_type = typeof(buffer_conv)
     R_type = typeof(buffer_mod)
     return ScatteringTransforms.Scattering1D.ScatteringTransform1D{
-        T, M_type, R_type, typeof(fft_plan), typeof(ifft_plan)}(
-        filter_bank, max_order, fft_plan, ifft_plan,
+        T, M_type, R_type, typeof(fft_plan), typeof(ifft_plan), typeof(tree)}(
+        filter_bank, tree, max_order, fft_plan, ifft_plan,
         buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
         U1_buffers, U1_fft_buffers,
     )
@@ -115,7 +116,8 @@ function ScatteringTransforms.Scattering2D.ScatteringTransform2D(
     filter_bank = ScatteringTransforms.FilterBanks.FilterBank2D{T, M_fb}(
         cu_wavelets, cu_avg, cpu_fb.meta, cpu_fb.J, cpu_fb.L
     )
-    
+    tree = ScatteringTransforms.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+
     dummy_cu = CUDA.zeros(Complex{T}, N)
     fft_plan  = CUDA.CUFFT.plan_fft(dummy_cu)
     ifft_plan = CUDA.CUFFT.plan_ifft(dummy_cu)
@@ -137,8 +139,8 @@ function ScatteringTransforms.Scattering2D.ScatteringTransform2D(
     M_type = typeof(buffer_conv)
     R_type = typeof(buffer_mod)
     return ScatteringTransforms.Scattering2D.ScatteringTransform2D{
-        T, M_type, R_type, typeof(fft_plan), typeof(ifft_plan)}(
-        filter_bank, max_order, fft_plan, ifft_plan,
+        T, M_type, R_type, typeof(fft_plan), typeof(ifft_plan), typeof(tree)}(
+        filter_bank, tree, max_order, fft_plan, ifft_plan,
         buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
         U1_buffers, U1_fft_buffers,
     )

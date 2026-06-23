@@ -17,6 +17,7 @@ using LinearAlgebra: LinearAlgebra
 using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Coefficients: Coefficients
+using ..PathGraph: PathGraph
 
 export ScatteringTransform2D, scattering_transform2d!
 export compute_S1_2d!, compute_S2_2d!
@@ -43,8 +44,9 @@ export compute_shape_sparsity
 - `U1_buffers`: Real matrices for first-order moduli (one per wavelet)
 - `U1_fft_buffers`: Complex matrices for FFT of U1 (one per wavelet)
 """
-struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T},FP,IP}
+struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T},FP,IP,Tree<:PathGraph.ScatteringTree}
     filter_bank::FilterBanks.FilterBank2D{T,M}   # carry the matrix-type param M (was abstract {T})
+    tree::Tree      # admissible scattering paths (source of truth for second-order)
     max_order::Int
     fft_plan::FP    # concrete plan type param — no dynamic dispatch on mul!
     ifft_plan::IP
@@ -61,7 +63,8 @@ struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T
                                    max_order::Int=2,
                                    T::Type=Float64)
         filter_bank = FilterBanks.build_filter_bank2d(N, J; L=L, T=T)
-        
+        tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+
         # Pre-plan 2D FFTs; mul!(out, plan, src) is zero-allocation
         dummy = zeros(Complex{T}, N)
         fft_plan  = FFTW.plan_fft(dummy)
@@ -81,8 +84,8 @@ struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T
             U1_fft_buffers = Matrix{Complex{T}}[]
         end
         
-        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(fft_plan), typeof(ifft_plan)}(
-            filter_bank, max_order, fft_plan, ifft_plan,
+        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(fft_plan), typeof(ifft_plan), typeof(tree)}(
+            filter_bank, tree, max_order, fft_plan, ifft_plan,
             buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
             U1_buffers, U1_fft_buffers
         )
@@ -173,15 +176,19 @@ function compute_S2_2d!(S2::AbstractMatrix, st::ScatteringTransform2D,
         LinearAlgebra.mul!(st.U1_fft_buffers[j1], st.fft_plan, st.buffer_input)
     end
     
-    # Pass 3: second-order scattering
-    @inbounds for j1 in 1:num_w
-        for j2 in (j1+1):num_w
-            ψ2_fft = st.filter_bank.wavelets[j2]
-            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1], ψ2_fft,
-                                              st.ifft_plan, st.buffer_input)
-            ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
-            S2[j1, j2] = ScatteringCore.spatial_average(st.buffer_mod)
-        end
+    # Pass 3: second-order scattering over the ADMISSIBLE paths only. The constraint is
+    # j_eff strictly increasing, i.e. *scale strictly increasing over all orientation pairs*.
+    # The previous flat-index loop (`j2 in (j1+1):num_w`) wrongly included same-scale,
+    # different-orientation pairs (where scale₂ == scale₁); the tree excludes them.
+    tree = st.tree
+    @inbounds for p in PathGraph.order_range(tree, 2)
+        idx = PathGraph.path_indices(tree, p)
+        j1, j2 = idx[1], idx[2]
+        ψ2_fft = st.filter_bank.wavelets[j2]
+        ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1], ψ2_fft,
+                                          st.ifft_plan, st.buffer_input)
+        ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
+        S2[j1, j2] = ScatteringCore.spatial_average(st.buffer_mod)
     end
     return S2
 end
@@ -195,9 +202,9 @@ Following Skinner et al. (2025), these are:
 - s₂₁ (sparsity): ⟨S₂/S₁⟩ over orientations
 - s₂₂ (shape): ⟨S₂^∥ / S₂^⊥⟩ over orientations
 """
-function compute_shape_sparsity(S1::AbstractVector{T}, 
+function compute_shape_sparsity(S1::AbstractVector{T},
                                 S2::AbstractMatrix{T},
-                                meta::Vector{NamedTuple}) where T<:Real
+                                meta::AbstractVector{<:FilterBanks.WaveletMeta}) where T<:Real
     # Group by scales
     J = maximum(m.scale for m in meta) + 1
     L = length(meta) ÷ J  # orientations per scale
