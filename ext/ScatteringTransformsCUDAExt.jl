@@ -82,7 +82,8 @@ function ScatteringTransforms.Scattering1D.ScatteringTransform1D(
     buffer_signal_fft = CUDA.zeros(Complex{T}, N)
     M_type = typeof(buffer_conv)
     R_type = typeof(buffer_mod)
-    return ScatteringTransforms.Scattering1D.ScatteringTransform1D{T, M_type, R_type}(
+    return ScatteringTransforms.Scattering1D.ScatteringTransform1D{
+        T, M_type, R_type, typeof(fft_plan), typeof(ifft_plan)}(
         filter_bank, max_order, fft_plan, ifft_plan,
         buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
         U1_buffers, U1_fft_buffers,
@@ -135,7 +136,8 @@ function ScatteringTransforms.Scattering2D.ScatteringTransform2D(
     buffer_signal_fft = CUDA.zeros(Complex{T}, N)
     M_type = typeof(buffer_conv)
     R_type = typeof(buffer_mod)
-    return ScatteringTransforms.Scattering2D.ScatteringTransform2D{T, M_type, R_type}(
+    return ScatteringTransforms.Scattering2D.ScatteringTransform2D{
+        T, M_type, R_type, typeof(fft_plan), typeof(ifft_plan)}(
         filter_bank, max_order, fft_plan, ifft_plan,
         buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
         U1_buffers, U1_fft_buffers,

@@ -34,12 +34,12 @@ export scattering_transform!, compute_S1!, compute_S2!
 - `U1_buffers`: Vector of real buffers for S2 computation (one per wavelet)
 - `U1_fft_buffers`: Vector of complex buffers for FFT of U1 (one per wavelet)
 """
-struct ScatteringTransform1D{T,V<:AbstractVector{Complex{T}},M<:AbstractVector{T}}
+struct ScatteringTransform1D{T,V<:AbstractVector{Complex{T}},M<:AbstractVector{T},FP,IP}
     filter_bank::FilterBanks.FilterBank1D{T,V}
     max_order::Int
-    fft_plan
-    ifft_plan
-    
+    fft_plan::FP    # concrete plan type param — no dynamic dispatch on mul!
+    ifft_plan::IP
+
     # Workspace buffers for zero-allocation transforms
     buffer_input::V       # Complex buffer for real→complex promotion of input
     buffer_signal_fft::V  # Preserves signal FFT across S1/S2 passes (buffer_conv gets overwritten)
@@ -76,7 +76,7 @@ struct ScatteringTransform1D{T,V<:AbstractVector{Complex{T}},M<:AbstractVector{T
             U1_fft_buffers = Vector{Complex{T}}[]
         end
         
-        new{T, typeof(buffer_conv), typeof(buffer_mod)}(
+        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(fft_plan), typeof(ifft_plan)}(
             filter_bank, max_order, fft_plan, ifft_plan,
             buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
             U1_buffers, U1_fft_buffers

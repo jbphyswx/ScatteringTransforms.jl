@@ -43,12 +43,12 @@ export compute_shape_sparsity
 - `U1_buffers`: Real matrices for first-order moduli (one per wavelet)
 - `U1_fft_buffers`: Complex matrices for FFT of U1 (one per wavelet)
 """
-struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T}}
-    filter_bank::FilterBanks.FilterBank2D{T}
+struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T},FP,IP}
+    filter_bank::FilterBanks.FilterBank2D{T,M}   # carry the matrix-type param M (was abstract {T})
     max_order::Int
-    fft_plan
-    ifft_plan
-    
+    fft_plan::FP    # concrete plan type param — no dynamic dispatch on mul!
+    ifft_plan::IP
+
     buffer_input::M
     buffer_signal_fft::M
     buffer_conv::M
@@ -81,7 +81,7 @@ struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T
             U1_fft_buffers = Matrix{Complex{T}}[]
         end
         
-        new{T, typeof(buffer_conv), typeof(buffer_mod)}(
+        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(fft_plan), typeof(ifft_plan)}(
             filter_bank, max_order, fft_plan, ifft_plan,
             buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
             U1_buffers, U1_fft_buffers

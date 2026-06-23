@@ -33,6 +33,33 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
     end
 end
 
+Test.@testset "Type stability (concrete struct fields + inferred transforms)" begin
+    # Every field of the transform struct must be concretely typed — in particular the FFT
+    # plan fields (previously untyped `Any`, causing dynamic dispatch on every `mul!`) and the
+    # 2D filter-bank field (previously `FilterBank2D{T}` with the matrix param dropped).
+    N = 256
+    J = 4
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    for ft in fieldtypes(typeof(st))
+        Test.@test isconcretetype(ft)
+    end
+    signal = randn(N)
+    Test.@test (Test.@inferred st(signal); true)
+
+    st2 = ScatteringTransforms.ScatteringTransform2D((64, 64), 3; L=4, max_order=2)
+    for ft in fieldtypes(typeof(st2))
+        Test.@test isconcretetype(ft)
+    end
+    image = randn(64, 64)
+    Test.@test (Test.@inferred st2(image); true)
+
+    # Element type is preserved end-to-end (Float32 in -> Float32 out).
+    stf = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, T=Float32)
+    cf = stf(Float32.(signal))
+    Test.@test eltype(ScatteringTransforms.first_order(cf)) == Float32
+    Test.@test ScatteringTransforms.zeroth_order(cf) isa Float32
+end
+
 Test.@testset "1D Morlet Wavelet Mathematical Properties" begin
     N = 512
     j = 2
