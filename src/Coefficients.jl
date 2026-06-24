@@ -11,7 +11,7 @@ using LinearAlgebra: LinearAlgebra
 
 export ScatteringCoefficients1D, ScatteringCoefficients2D
 export zeroth_order, first_order, second_order
-export flatten1d, flatten2d
+export flatten1d, flatten2d, flatten1d!, flatten2d!, flatten_length
 export update_S0
 
 # ============================================================================
@@ -96,27 +96,40 @@ function update_S0(c::ScatteringCoefficients1D, val)
 end
 
 """
+    flatten_length(c) -> Int
+
+Length of the flattened coefficient vector `[S0; S1; vec(S2 upper triangle)]`.
+"""
+flatten_length(c::ScatteringCoefficients1D) = c.n_wavelets * (c.n_wavelets - 1) ÷ 2 + c.n_wavelets + 1
+
+"""
     flatten1d(coeffs::ScatteringCoefficients1D{T}) -> Vector{T}
 
 Flatten to vector: [S0; S1; vec(S2 upper triangular)].
 Only includes unique S2 elements where j2 > j1 (saves ~50% space).
 """
 function flatten1d(c::ScatteringCoefficients1D)
+    return flatten1d!(similar(c.S1, flatten_length(c)), c)
+end
+
+"""
+    flatten1d!(out, c) -> out
+
+Zero-allocation flatten into a pre-allocated vector of length `flatten_length(c)`.
+"""
+function flatten1d!(out::AbstractVector, c::ScatteringCoefficients1D)
     n = c.n_wavelets
-    n_s2 = n * (n - 1) ÷ 2
-    result = similar(c.S1, n_s2 + n + 1)
-    
-    result[1] = zeroth_order(c)
-    result[2:1+n] .= c.S1
-    
+    length(out) == flatten_length(c) ||
+        throw(DimensionMismatch("out length $(length(out)) != flatten_length $(flatten_length(c))"))
+    out[1] = zeroth_order(c)
+    @inbounds out[2:(1 + n)] .= c.S1
     idx = 2 + n
     S2 = c.S2
-    @inbounds for j1 in 1:n, j2 in (j1+1):n
-        result[idx] = S2[j1, j2]
+    @inbounds for j1 in 1:n, j2 in (j1 + 1):n
+        out[idx] = S2[j1, j2]
         idx += 1
     end
-    
-    return result
+    return out
 end
 
 # ============================================================================
@@ -173,27 +186,35 @@ function update_S0(c::ScatteringCoefficients2D, val)
     return ScatteringCoefficients2D(c.S1, c.S2; S0=val, n_scales=c.n_scales, n_orientations=c.n_orientations)
 end
 
+flatten_length(c::ScatteringCoefficients2D) = c.n_wavelets * (c.n_wavelets - 1) ÷ 2 + c.n_wavelets + 1
+
 """
     flatten2d(coeffs::ScatteringCoefficients2D{T}) -> Vector{T}
 
 Flatten to vector: [S0; S1; vec(S2 upper triangular)].
 """
 function flatten2d(c::ScatteringCoefficients2D)
+    return flatten2d!(similar(c.S1, flatten_length(c)), c)
+end
+
+"""
+    flatten2d!(out, c) -> out
+
+Zero-allocation flatten into a pre-allocated vector of length `flatten_length(c)`.
+"""
+function flatten2d!(out::AbstractVector, c::ScatteringCoefficients2D)
     n = c.n_wavelets
-    n_s2 = n * (n - 1) ÷ 2
-    result = similar(c.S1, n_s2 + n + 1)
-    
-    result[1] = zeroth_order(c)
-    result[2:1+n] .= c.S1
-    
+    length(out) == flatten_length(c) ||
+        throw(DimensionMismatch("out length $(length(out)) != flatten_length $(flatten_length(c))"))
+    out[1] = zeroth_order(c)
+    @inbounds out[2:(1 + n)] .= c.S1
     idx = 2 + n
     S2 = c.S2
-    @inbounds for j1 in 1:n, j2 in (j1+1):n
-        result[idx] = S2[j1, j2]
+    @inbounds for j1 in 1:n, j2 in (j1 + 1):n
+        out[idx] = S2[j1, j2]
         idx += 1
     end
-    
-    return result
+    return out
 end
 
 end # module Coefficients

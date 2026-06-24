@@ -469,6 +469,30 @@ Test.@testset "Translation invariance (approximate)" begin
     Test.@test all(rel_diff .< 0.1)  # Within 10% due to edge effects
 end
 
+Test.@testset "Batched transforms reuse the plan and match per-signal results" begin
+    N = 128
+    J = 4
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    X = randn(N, 5)
+    B = ScatteringTransforms.scattering_batch(st, X)
+    Test.@test size(B, 2) == 5
+    for b in 1:5
+        Test.@test isapprox(B[:, b], ScatteringTransforms.flatten1d(st(view(X, :, b))); rtol=1e-10)
+    end
+    # steady-state batch call allocates only the output + per-column scalar-S0 wrappers (no
+    # per-signal workspace), i.e. far less than B independent transforms would.
+    Test.@test (ScatteringTransforms.scattering_batch(st, X); true)
+
+    # 2D
+    st2 = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2)
+    X2 = randn(32, 32, 4)
+    B2 = ScatteringTransforms.scattering_batch(st2, X2)
+    Test.@test size(B2, 2) == 4
+    for b in 1:4
+        Test.@test isapprox(B2[:, b], ScatteringTransforms.flatten2d(st2(view(X2, :, :, b))); rtol=1e-10)
+    end
+end
+
 Test.@testset "Spectral plans: in-core direct sum matches FFTW fast path" begin
     # The slow in-core DirectSumPlan default and the FFTW extension fast path must agree.
     N = 128

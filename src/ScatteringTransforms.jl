@@ -102,10 +102,58 @@ const first_order = Coefficients.first_order
 const second_order = Coefficients.second_order
 const flatten1d = Coefficients.flatten1d
 const flatten2d = Coefficients.flatten2d
+const flatten1d! = Coefficients.flatten1d!
+const flatten2d! = Coefficients.flatten2d!
+const flatten_length = Coefficients.flatten_length
 const scattering_transform!    = Scattering1D.scattering_transform!
 const scattering_transform2d!  = Scattering2D.scattering_transform2d!
 const compute_S1_2d! = Scattering2D.compute_S1_2d!
 const compute_S2_2d! = Scattering2D.compute_S2_2d!
+
+# ============================================================================
+# Batched transforms — process a stack of signals/images reusing one plan + workspace
+# ============================================================================
+
+"""
+    scattering_batch(st::ScatteringTransform1D, X) -> Matrix
+
+Apply a 1D scattering transform to a batch of signals `X` of size `(N, B)` (signals as columns),
+returning a `(flatten_length, B)` matrix whose column `b` is `flatten1d(st(X[:, b]))`. The plan
+and all workspace buffers are reused across the batch (only the small scalar-S0 wrapper is
+re-allocated per column).
+"""
+function scattering_batch(st::ScatteringTransform1D, X::AbstractMatrix)
+    N, B = size(X)
+    nw = length(st.filter_bank.wavelets)
+    T = eltype(st.filter_bank.averaging) |> real
+    coeffs = Coefficients.ScatteringCoefficients1D(nw, T; compute_S2 = st.max_order >= 2)
+    out = Matrix{T}(undef, Coefficients.flatten_length(coeffs), B)
+    @inbounds for b in 1:B
+        c = Scattering1D.scattering_transform!(coeffs, st, view(X, :, b))
+        Coefficients.flatten1d!(view(out, :, b), c)
+    end
+    return out
+end
+
+"""
+    scattering_batch(st::ScatteringTransform2D, X) -> Matrix
+
+Apply a 2D scattering transform to a batch of images `X` of size `(Ny, Nx, B)`, returning a
+`(flatten_length, B)` matrix whose column `b` is `flatten2d(st(X[:, :, b]))`. Plan and workspace
+are reused across the batch.
+"""
+function scattering_batch(st::ScatteringTransform2D, X::AbstractArray{<:Any,3})
+    Ny, Nx, B = size(X)
+    T = eltype(st.filter_bank.averaging) |> real
+    coeffs = Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.L, T;
+                                                   compute_S2 = st.max_order >= 2)
+    out = Matrix{T}(undef, Coefficients.flatten_length(coeffs), B)
+    @inbounds for b in 1:B
+        c = Scattering2D.scattering_transform2d!(coeffs, st, view(X, :, :, b))
+        Coefficients.flatten2d!(view(out, :, b), c)
+    end
+    return out
+end
 
 # Plotting stubs (implemented in ScatteringTransformsCairoMakieExt)
 function plot_filter_bank end
@@ -124,6 +172,8 @@ export flatten1d, flatten2d
 export frequency_response
 export build_filter_bank1d, build_filter_bank2d
 export scattering_transform!, scattering_transform2d!
+export scattering_batch
+export flatten1d!, flatten2d!, flatten_length
 export scattering_field, scattering_field!
 export ScatteringField1D, ScatteringField2D, path_field
 export compute_S1_2d!, compute_S2_2d!
