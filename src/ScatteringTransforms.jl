@@ -39,6 +39,8 @@ using LinearAlgebra: LinearAlgebra
 
 # Include core components (creates submodules)
 # Order matters: Coefficients must be before Scattering1D/Scattering2D
+include("Backends.jl")
+include("Domains.jl")
 include("Filters.jl")
 include("FilterBanks.jl")
 include("ScatteringCore.jl")
@@ -49,6 +51,8 @@ include("Scattering1D.jl")
 include("Scattering2D.jl")
 
 # Import submodules using X: X pattern
+using .Backends: Backends
+using .Domains: Domains
 using .Filters: Filters
 using .FilterBanks: FilterBanks
 using .ScatteringCore: ScatteringCore
@@ -65,6 +69,18 @@ const FilterBank1D = FilterBanks.FilterBank1D
 const FilterBank2D = FilterBanks.FilterBank2D
 const WaveletMeta = FilterBanks.WaveletMeta
 const ScatteringTree = PathGraph.ScatteringTree
+# Backend taxonomy
+const SerialCPU = Backends.SerialCPU
+const ThreadedCPU = Backends.ThreadedCPU
+const GPUBackend = Backends.GPUBackend
+const AutoBackend = Backends.AutoBackend
+const Distributed = Backends.Distributed
+const MPI = Backends.MPI
+# Domain tags
+const Line1D = Domains.Line1D
+const Plane2D = Domains.Plane2D
+const Volume3D = Domains.Volume3D
+const Sphere = Domains.Sphere
 const ScatteringField1D = ScatteringFields.ScatteringField1D
 const ScatteringField2D = ScatteringFields.ScatteringField2D
 const path_field = ScatteringFields.path_field
@@ -94,6 +110,8 @@ function plot_coefficients end
 export ScatteringTransform1D, ScatteringTransform2D
 export FilterBank1D, FilterBank2D
 export WaveletMeta, ScatteringTree
+export SerialCPU, ThreadedCPU, GPUBackend, AutoBackend, Distributed, MPI
+export Line1D, Plane2D, Volume3D, Sphere
 export Morlet1D, Morlet2D
 export ScatteringCoefficients1D, ScatteringCoefficients2D
 export zeroth_order, first_order, second_order
