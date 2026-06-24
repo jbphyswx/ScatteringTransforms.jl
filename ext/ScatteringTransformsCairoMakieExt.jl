@@ -2,7 +2,6 @@ module ScatteringTransformsCairoMakieExt
 
 using CairoMakie: CairoMakie
 using ScatteringTransforms: ScatteringTransforms
-using FFTW: FFTW
 
 # Implement plot_filter_bank for 1D Filter Banks
 function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBank1D)
@@ -125,6 +124,7 @@ function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Scatteri
         )
         # Zero out diagonal / lower triangle for plotting
         S2_disp = copy(c.S2)
+        S2_disp[S2_disp .== 0] .= NaN  # blank invalid/empty scattering paths
         for i in 1:J_eff, j in 1:J_eff
             if j <= i
                 S2_disp[i, j] = NaN
@@ -155,6 +155,7 @@ function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Scatteri
             aspect=CairoMakie.AxisAspect(1)
         )
         S2_disp = copy(c.S2)
+        S2_disp[S2_disp .== 0] .= NaN  # blank invalid/empty scattering paths
         for i in 1:J_eff, j in 1:J_eff
             if j <= i
                 S2_disp[i, j] = NaN
@@ -206,6 +207,7 @@ function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Scatteri
             aspect=CairoMakie.AxisAspect(1)
         )
         S2_disp = copy(c.S2)
+        S2_disp[S2_disp .== 0] .= NaN  # blank invalid/empty scattering paths
         nw = J * L
         for i in 1:nw, j in 1:nw
             if j <= i
@@ -238,6 +240,7 @@ function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Scatteri
             aspect=CairoMakie.AxisAspect(1)
         )
         S2_disp = copy(c.S2)
+        S2_disp[S2_disp .== 0] .= NaN  # blank invalid/empty scattering paths
         nw = J * L
         for i in 1:nw, j in 1:nw
             if j <= i
