@@ -4,34 +4,44 @@ version = "0.1.0"
 authors = ["Jordan Benjamin"]
 
 [deps]
-FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 
 [weakdeps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
-FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
-JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
 NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 
 [extensions]
 ScatteringTransformsCUDAExt = "CUDA"
 ScatteringTransformsCairoMakieExt = "CairoMakie"
-ScatteringTransformsJLD2Ext = "JLD2"
+ScatteringTransformsDifferentiationInterfaceExt = "DifferentiationInterface"
+ScatteringTransformsDistributedExt = "Distributed"
+ScatteringTransformsFFTWExt = "FFTW"
 ScatteringTransformsKernelAbstractionsExt = "KernelAbstractions"
-ScatteringTransformsNUFSHTExt = ["NUFSHT", "FastSphericalHarmonics"]
+ScatteringTransformsMPIExt = "MPI"
+ScatteringTransformsNUFSHTExt = "NUFSHT"
+ScatteringTransformsOhMyThreadsExt = "OhMyThreads"
 
 [compat]
 CUDA = "5"
 CairoMakie = "0.15"
+DifferentiationInterface = "0.7"
+Distributed = "1"
 FFTW = "1"
-JLD2 = "0.5"
-FastSphericalHarmonics = "1"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1"
+MPI = "0.20"
 NUFSHT = "0.1"
-julia = "1.9"
+PrecompileTools = "1"
+OhMyThreads = "0.7, 0.8"
+julia = "1.11"
 
 [workspace]
 projects = ["test", "docs"]

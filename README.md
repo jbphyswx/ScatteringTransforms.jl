@@ -6,10 +6,26 @@ Fast, generic wavelet scattering transforms in Julia.
 
 ## Features
 
-- **Fully Generic**: Works with `Float32`, `Float64`, and automatic differentiation
-- **GPU-Ready**: Compatible with CUDA arrays (`CuVector`, `CuMatrix`)
-- **Zero-Allocation**: In-place operations with pre-allocated buffers
-- **Type-Stable**: Fully parametric types for optimal performance
+- **1D / 2D / 3D**: signals, images, and volumes with oriented Morlet wavelets.
+- **Two outputs**: globally-averaged coefficients (`st(x)`) and the localized (Mallat) field
+  `scattering_field(st, x) = (|U_p x| ⋆ φ_J) ↓ s` (their spatial means agree by construction).
+- **Correct path structure**: second order over strictly coarser scales, all orientation pairs
+  (enumerated once into a `ScatteringTree`).
+- **Reduced descriptors**: normalized (`S1/S0`, `S2/S1`), log, and 2D sparsity `s₂₁` /
+  anisotropy `s₂₂` (`compute_shape_sparsity`).
+- **Reconstruction**: exact linear wavelet-frame inverse (`wavelet_transform`/`iwavelet`), phase
+  retrieval (`reconstruct_phase`), and gradient-descent `synthesize` from coefficients
+  (DifferentiationInterface extension; any `ADTypes` backend, e.g. `AutoMooncake`).
+- **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
+  monogenic amplitude + continuous orientation/phase (`monogenic_components`); spherical
+  `spherical_monogenic_scattering` on S² (spin-0 identity, no spin-1 synthesis needed).
+- **Pluggable spectral backend**: dependency-free direct-sum default; `using FFTW` switches on
+  an `O(N log N)` fast path automatically
+  (`spectral = AutoSpectral() | DirectSumBackend() | FFTBackend()`).
+- **Batching & threading**: `scattering_batch` reuses one plan/workspace; `using OhMyThreads`
+  enables `scattering_batch(ThreadedBackend(), …)`.
+- **Generic & type-stable**: `Float32`/`Float64`, autodiff-friendly, GPU-array-ready hot path,
+  in-place `!` methods over pre-allocated buffers.
 
 ## Quick Start
 
@@ -30,31 +46,88 @@ coeffs = st(signal)
 image = randn(256, 256)
 st2d = ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
 coeffs_2d = st2d(image)
+
+# 3D volumetric scattering
+st3d = ScatteringTransform3D((32, 32, 32), 3; n_orient=6, max_order=2)
+coeffs_3d = st3d(randn(32, 32, 32))
+
+# Localized (Mallat) field, reduced descriptors, batching
+field  = scattering_field(st, signal)              # per-path low-passed, subsampled maps
+norm   = normalized_coefficients(coeffs)           # s1 = S1/S0, s2 = S2/S1
+batch  = scattering_batch(st, randn(N, 100))       # (coeffs × 100), one plan reused
+
+using FFTW         # → automatic O(N log N) fast path
+using OhMyThreads  # → scattering_batch(ThreadedBackend(), st, X)
 ```
 
-## Wavelet & Scattering Visualizations
+## Why scattering? (the headline result)
 
-Here are the generated figures showcasing the 1D/2D wavelet tiling and scattering transform outputs:
+Two signals can have **identical power spectra** yet very different structure. The scattering
+transform tells them apart: an intermittent signal (sparse bursts) has strong **cross-scale
+coupling** `S₂/S₁`, while its phase-randomized Gaussian surrogate does not — even though their
+power spectra (and first-order `S₁`) are the same.
 
-### 1. 1D Wavelet Scattering
-Decomposition of a 1D pink noise signal with a low-frequency oscillation, showing first-order ($S_1$) and second-order ($S_2$) coefficients:
+![Discriminability](docs/src/assets/discriminability.png)
 
-![1D Scattering Example](docs/src/assets/1d_scattering_example.png)
+## Visualizations
 
-### 2. Frequency Tiling (Morlet Filter Bank)
-The frequency response of the 1D Morlet filter bank showing optimal overlapping frequency coverage across multiple scales:
+### Filter bank — a tight frame
+1D Morlet filter bank in the frequency domain. The Littlewood–Paley sum `|φ|² + Σⱼ|ψⱼ|²` is
+flat at **1** (a tight frame ⇒ the transform is non-expansive — no frequency is amplified).
 
 ![Morlet Filter Bank](docs/src/assets/filter_bank.png)
 
-### 3. 2D Wavelet Scattering
-Applying a 2D scattering transform to a multi-scale fractal texture, showing the orientation-scale decomposition and second-order coefficients:
+### 1D scattering
+A 1/f (turbulent) signal with its `S₀`, first-order `S₁(j)`, and second-order `S₂(j₁,j₂)`
+(only admissible strictly-coarser scale pairs are populated).
+
+![1D Scattering Example](docs/src/assets/1d_scattering_example.png)
+
+### 2D scattering
+A turbulent 2D field with `S₁` over scale × orientation and `S₂` over wavelet pairs. The `S₂`
+panel is a `(J·L)²` matrix whose only populated blocks are **strictly coarser scale pairs**
+(all orientation pairs); the same-scale diagonal blocks are empty by construction.
 
 ![2D Scattering Example](docs/src/assets/2d_scattering_example.png)
 
-### 4. Zero-Allocation Streaming Benchmarks
-Comparing the execution time of the zero-allocation API against the standard allocating API across different signal sizes:
+### Localized (Mallat) field
+`scattering_field` returns `S_p x = (|U_p x| ⋆ φ_J)↓` per path — energy localized in **scale
+and space** (here: two bursts at different scales light up different rows/positions).
 
-![Performance Comparison](docs/src/assets/performance_comparison.png)
+![Localized field](docs/src/assets/localized_field.png)
+
+### Reduced descriptors — anisotropy
+The shape reduction `s₂₂` (second angular harmonic of `S₂`) cleanly separates an oriented
+texture from an isotropic one.
+
+![Reductions](docs/src/assets/reductions.png)
+
+### Reconstruction & synthesis
+The complex (pre-modulus) wavelet layer is exactly invertible (`iwavelet`, machine precision);
+from the scattering *coefficients*, `synthesize` (DifferentiationInterface + an AD backend)
+descends `‖S(x̂)−S(x)‖²` to draw a new sample with matching multiscale statistics — 1D and 2D.
+
+![Reconstruction & synthesis (1D)](docs/src/assets/reconstruction_synthesis.png)
+![Reconstruction & synthesis (2D)](docs/src/assets/reconstruction_2d.png)
+
+### Monogenic (Riesz) scattering
+The rotation-covariant monogenic amplitude replaces the oriented modulus; `monogenic_components`
+recovers the local amplitude envelope and a **continuous** orientation (a radial pinwheel here),
+not quantized orientation bins.
+
+![Monogenic analysis](docs/src/assets/monogenic.png)
+
+### Spherical scattering
+On S² (scattered points, via NUFSHT): analytic and monogenic transforms, the latter computing the
+spin-1 Riesz energy with spin-0 transforms via a Bochner identity.
+
+![Spherical scattering](docs/src/assets/spherical_scattering.png)
+
+### Spectral backends
+The in-core direct-sum default is dependency-free but `O(N²)`; loading `FFTW` switches on an
+`O(N log N)` fast path automatically (≈100–1000× faster), with identical results.
+
+![Backend performance](docs/src/assets/backend_performance.png)
 
 ## Documentation
 
@@ -66,9 +139,11 @@ Comparing the execution time of the zero-allocation API against the standard all
 
 See the [examples/](examples/) directory:
 
-- `basic_usage.jl` - Getting started with 1D and 2D scattering
+- `basic_usage.jl` - 1D/2D/3D scattering, localized field, reductions, batching/threading
 - `zero_allocation_streaming.jl` - High-performance streaming for large datasets
-- `gpu_acceleration.jl` - GPU-ready type system demonstration
+- `backends.jl` - spectral (direct-sum vs FFTW) and compute (serial/threaded/GPU) backends
+- `synthesis_and_inverse.jl` - exact inverse, phase retrieval, and coefficient synthesis
+- `monogenic.jl` - monogenic (Riesz) scattering: amplitude envelope + continuous orientation
 
 Run examples:
 ```bash

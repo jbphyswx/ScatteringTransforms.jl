@@ -12,34 +12,105 @@ using LinearAlgebra: LinearAlgebra
 # Import Filters submodule
 using ..Filters: Filters
 
-export FilterBank1D, FilterBank2D
-export build_filter_bank1d, build_filter_bank2d
-export averaging_filter
+export FilterBank1D, FilterBank2D, FilterBank3D
+export build_filter_bank1d, build_filter_bank2d, build_filter_bank3d
+export WaveletMeta
 
 # Inline fftfreq for a single 0-indexed bin — no allocation.
 # Mirrors FFTW.fftfreq(N)[k+1].
 @inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
 
 """
-    FilterBank1D{T,V<:AbstractVector{Complex{T}}}
+    _complement_lowpass(wavelets) -> averaging filter φ
 
-Complete 1D filter bank for scattering transform.
+Build the scaling function (low-pass averaging filter) as the *complement* of the wavelet
+energy: `|φ(ω)|² = max(0, 1 − Σⱼ|ψⱼ(ω)|²)`. This makes the Littlewood–Paley sum
+`Σⱼ|ψⱼ|² + |φ|² ≡ 1` a (near) tight frame, so the transform is non-expansive (no frequency is
+amplified). The DC bin is pinned to `φ(0)=1` exactly (the wavelets are zero-mean there), which
+keeps the localized-field spatial mean equal to the globally-averaged coefficient.
+Works for 1D/2D/3D filter arrays.
+"""
+function _complement_lowpass(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{Complex{T}}}
+    ϕ = similar(first(wavelets))
+    @inbounds for i in eachindex(ϕ)
+        s = zero(T)
+        for ψ in wavelets
+            s += abs2(ψ[i])
+        end
+        ϕ[i] = Complex{T}(sqrt(max(zero(T), one(T) - s)))
+    end
+    ϕ[firstindex(ϕ)] = one(Complex{T})   # exact DC = 1 (preserves mean ⇔ averaged-coefficient)
+    return ϕ
+end
 
-# Type Parameters
-- `T`: Real element type (Float32, Float64, etc.)
-- `V`: Wavelet vector type (allows CPU/GPU arrays)
+"""
+    _tight_frame_lowpass!(wavelets) -> averaging filter φ
+
+Globally rescale `wavelets` (in place) so that `max_ω Σⱼ|ψⱼ(ω)|² = 1` — making the transform
+non-expansive — then return the complement low-pass φ, giving a tight frame with
+Littlewood–Paley sum `Σⱼ|ψⱼ|² + |φ|² ≡ 1`. The rescale is a single global constant, so it does
+not change the *relative* coefficient structure.
+"""
+function _tight_frame_lowpass!(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{Complex{T}}}
+    maxs = zero(T)
+    @inbounds for i in eachindex(first(wavelets))
+        s = zero(T)
+        for ψ in wavelets
+            s += abs2(ψ[i])
+        end
+        maxs = max(maxs, s)
+    end
+    if maxs > zero(T)
+        c = inv(sqrt(maxs))
+        for ψ in wavelets
+            ψ .*= c
+        end
+    end
+    return _complement_lowpass(wavelets)
+end
+
+"""
+    WaveletMeta{T}
+
+Concrete per-wavelet metadata (replaces the abstract `Vector{NamedTuple}`).
 
 # Fields
-- `wavelets::Vector{V}`: Wavelet filters in Fourier domain
-- `averaging::V`: Low-pass averaging (scaling) filter
-- `meta::Vector{NamedTuple}`: Metadata for each wavelet
-- `J::Int`: Number of octaves (scales)
-- `Q::Int`: Number of wavelets per octave
+- `scale::Int`: octave index `j`
+- `q::Int`: sub-octave index within the octave (1D, `0..Q-1`); `0` for 2D
+- `orient::Int`: orientation index `l` (2D, `0..L-1`); `0` for 1D
+- `j_eff::T`: effective log-scale used to order paths. `j + q/Q` in 1D, `T(j)` in 2D. The
+  second-order admissibility constraint is `j_eff(child) > j_eff(parent)` (frequency strictly
+  decreasing) — which for 2D means *scale strictly increasing over all orientation pairs*.
+- `center_freq::T`: wavelet center frequency
+- `theta::T`: orientation angle in radians (2D); `0` for 1D
 """
-struct FilterBank1D{T,V<:AbstractVector{Complex{T}}}
-    wavelets::Vector{V}
+struct WaveletMeta{T}
+    scale::Int
+    q::Int
+    orient::Int
+    j_eff::T
+    center_freq::T
+    theta::T
+end
+
+"""
+    FilterBank1D{T,V,W,MV}
+
+Complete 1D filter bank for the scattering transform. Every container is a type parameter (no
+hardcoded `Vector`): `V` the per-filter array type (CPU/GPU/static/…), `W` the wavelet
+collection, `MV` the metadata collection.
+
+# Fields
+- `wavelets::W`: wavelet filters in the Fourier domain (`W<:AbstractVector{V}`)
+- `averaging::V`: low-pass averaging (scaling) filter
+- `meta::MV`: per-wavelet `WaveletMeta`
+- `J::Int`: number of octaves (scales)
+- `Q::Int`: wavelets per octave
+"""
+struct FilterBank1D{T, V<:AbstractVector{Complex{T}}, W<:AbstractVector{V}, MV<:AbstractVector{WaveletMeta{T}}}
+    wavelets::W
     averaging::V
-    meta::Vector{NamedTuple}
+    meta::MV
     J::Int
     Q::Int
 end
@@ -64,67 +135,44 @@ function build_filter_bank1d(N::Int, J::Int; Q::Int=1, T::Type{<:Real}=Float64)
     V = typeof(ψ_sample)
     
     wavelets = Vector{V}(undef, 0)
-    meta = Vector{NamedTuple}(undef, 0)
-    
+    meta = Vector{WaveletMeta{T}}(undef, 0)
+
     for j in 0:J-1
         for q in 0:Q-1
             effective_j = j + q / Q
-            
+
             morlet = Filters.Morlet1D{T}(N, j * Q + q; Q=Q)
             ψ = Filters.frequency_response(morlet)
-            
+
             push!(wavelets, ψ)
-            push!(meta, (scale=j, q=q, j_eff=effective_j, 
-                        center_freq=morlet.center_freq))
+            push!(meta, WaveletMeta{T}(j, q, 0, T(effective_j), morlet.center_freq, zero(T)))
         end
     end
     
-    # Build averaging filter with same element type
-    ϕ = averaging_filter(N, J, T)
-    
-    return FilterBank1D{T,V}(wavelets, ϕ, meta, J, Q)
+    # Low-pass = complement of the wavelet energy (tight-frame Littlewood-Paley ≈ 1)
+    ϕ = _tight_frame_lowpass!(wavelets)
+
+    return FilterBank1D(wavelets, ϕ, meta, J, Q)
 end
 
 """
-    averaging_filter(N::Int, J::Int, ::Type{T}=Float64) -> Vector{Complex{T}}
+    FilterBank2D{T,M,W,MV}
 
-Build low-pass averaging filter (father wavelet / scaling function).
-Element type T allows Float32/Float64.
-"""
-function averaging_filter(N::Int, J::Int, ::Type{T}=Float64) where {T<:Real}
-    xi_J  = T(0.5) / T(2.0)^(J - 1)
-    sigma = xi_J * T(0.8)
-    inv2  = inv(T(2))
-    inv_s = inv(sigma)
-    
-    ϕ = Vector{Complex{T}}(undef, N)
-    @inbounds for i in 1:N
-        ω = T(_fftfreq(N, i - 1))
-        ϕ[i] = Complex{T}(exp(-(ω * inv_s)^2 * inv2))
-    end
-    return ϕ
-end
-
-"""
-    FilterBank2D{T,M<:AbstractMatrix{Complex{T}}}
-
-Complete 2D filter bank with oriented wavelets.
-
-# Type Parameters
-- `T`: Real element type
-- `M`: Matrix type for wavelets (allows CPU/GPU arrays)
+Complete 2D filter bank with oriented wavelets. Containers are type parameters (no hardcoded
+`Vector`): `M` the per-filter matrix type, `W` the wavelet collection, `MV` the metadata
+collection.
 
 # Fields
-- `wavelets::Vector{M}`: Wavelets indexed by [scale_index]
-- `averaging::M`: Low-pass averaging filter
-- `meta::Vector{NamedTuple}`: Metadata
-- `J::Int`: Number of scales
-- `L::Int`: Number of orientations
+- `wavelets::W`: oriented wavelet filters (`W<:AbstractVector{M}`)
+- `averaging::M`: low-pass averaging filter
+- `meta::MV`: per-wavelet `WaveletMeta`
+- `J::Int`: number of scales
+- `L::Int`: number of orientations
 """
-struct FilterBank2D{T,M<:AbstractMatrix{Complex{T}}}
-    wavelets::Vector{M}
+struct FilterBank2D{T, M<:AbstractMatrix{Complex{T}}, W<:AbstractVector{M}, MV<:AbstractVector{WaveletMeta{T}}}
+    wavelets::W
     averaging::M
-    meta::Vector{NamedTuple}
+    meta::MV
     J::Int
     L::Int
 end
@@ -149,49 +197,66 @@ function build_filter_bank2d(N::NTuple{2,Int}, J::Int; L::Int=8, T::Type{<:Real}
     M = typeof(ψ_sample)
     
     wavelets = Vector{M}(undef, 0)
-    meta = Vector{NamedTuple}(undef, 0)
-    
+    meta = Vector{WaveletMeta{T}}(undef, 0)
+
     for j in 0:J-1
         for l in 0:L-1
             theta = T(π) * l / L
-            
+
             morlet = Filters.Morlet2D{T}(N, j, theta; L=L)
             ψ = Filters.frequency_response(morlet)
-            
+
             push!(wavelets, ψ)
-            push!(meta, (scale=j, orient=l, theta=theta,
-                        center_freq=morlet.center_freq))
+            # j_eff = T(j): same-scale (different-orientation) pairs share j_eff and are therefore
+            # NOT admissible as second-order paths; only strictly coarser scales are.
+            push!(meta, WaveletMeta{T}(j, 0, l, T(j), morlet.center_freq, theta))
         end
     end
     
-    # 2D averaging filter with same element type
-    ϕ = averaging_filter2d(N, J, T)
-    
-    return FilterBank2D{T,M}(wavelets, ϕ, meta, J, L)
+    # Low-pass = complement of the wavelet energy (tight-frame Littlewood-Paley ≈ 1)
+    ϕ = _tight_frame_lowpass!(wavelets)
+
+    return FilterBank2D(wavelets, ϕ, meta, J, L)
 end
 
 """
-    averaging_filter2d(N::NTuple{2,Int}, J::Int, ::Type{T}=Float64) -> Matrix{Complex{T}}
+    FilterBank3D{T,A<:AbstractArray{Complex{T},3}}
 
-Build 2D low-pass averaging filter.
+Complete 3D oriented Morlet filter bank: `J` scales × `n_orient` sphere directions, plus a
+low-pass averaging filter.
 """
-function averaging_filter2d(N::NTuple{2,Int}, J::Int, ::Type{T}=Float64) where {T<:Real}
-    Ny, Nx = N
-    xi_J  = T(0.5) / T(2.0)^(J - 1)
-    sigma = xi_J * T(0.8)
-    inv2  = inv(T(2))
-    inv_s = inv(sigma)
-    
-    ϕ = Matrix{Complex{T}}(undef, Ny, Nx)
-    @inbounds for ix in 1:Nx
-        kx = T(_fftfreq(Nx, ix - 1))
-        for iy in 1:Ny
-            ky = T(_fftfreq(Ny, iy - 1))
-            k  = sqrt(kx^2 + ky^2)
-            ϕ[iy, ix] = Complex{T}(exp(-(k * inv_s)^2 * inv2))
+struct FilterBank3D{T, A<:AbstractArray{Complex{T},3}, W<:AbstractVector{A}, MV<:AbstractVector{WaveletMeta{T}}}
+    wavelets::W
+    averaging::A
+    meta::MV
+    J::Int
+    n_orient::Int
+end
+
+"""
+    build_filter_bank3d(N::NTuple{3,Int}, J::Int; n_orient::Int=6, T=Float64) -> FilterBank3D
+
+Build a 3D oriented Morlet filter bank with `J` dyadic scales and `n_orient` near-uniform
+orientations on the sphere (Fibonacci spiral).
+"""
+function build_filter_bank3d(N::NTuple{3,Int}, J::Int; n_orient::Int=6, T::Type{<:Real}=Float64)
+    dirs = Filters.fibonacci_directions(n_orient, T)
+    morlet = Filters.Morlet3D{T}(N, 0, dirs[1])
+    ψ_sample = Filters.frequency_response(morlet)
+    A = typeof(ψ_sample)
+
+    wavelets = Vector{A}(undef, 0)
+    meta = Vector{WaveletMeta{T}}(undef, 0)
+    for j in 0:(J - 1)
+        for (o, d) in enumerate(dirs)
+            morlet = Filters.Morlet3D{T}(N, j, d)
+            push!(wavelets, Filters.frequency_response(morlet))
+            push!(meta, WaveletMeta{T}(j, 0, o - 1, T(j), morlet.center_freq, zero(T)))
         end
     end
-    return ϕ
+    # Low-pass = complement of the wavelet energy (tight-frame Littlewood-Paley ≈ 1)
+    ϕ = _tight_frame_lowpass!(wavelets)
+    return FilterBank3D(wavelets, ϕ, meta, J, n_orient)
 end
 
 end # module FilterBanks

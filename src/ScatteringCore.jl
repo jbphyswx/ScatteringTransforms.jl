@@ -7,55 +7,69 @@ Implements the fundamental building blocks: FFT-based convolution,
 modulus, and averaging operations.
 
 Design: All `!` functions are zero-allocation. Non-`!` wrappers allocate
-and delegate to the `!` versions. Use `mul!` with FFTW plans so the
-plan's `*` operator (which allocates a fresh output array) is never called
-in the hot path.
+and delegate to the `!` versions. Spectral transforms go through the plan
+interface (`Plans.inverse_transform!`), so the engine is agnostic to whether
+the backing transform is the in-core direct sum, FFTW, CUFFT, etc.
 """
 
-using FFTW: FFTW
 using LinearAlgebra: LinearAlgebra
+using ..Plans: Plans
 
 export wavelet_convolve, wavelet_convolve!
 export apply_modulus, apply_modulus!, spatial_average
+export scattering
 export ScatteringLayer
 
 """
-    wavelet_convolve(signal_fft, filter_fft, ifft_plan)
+    scattering(st, x) -> ScatteringCoefficients
 
-Perform wavelet convolution via frequency-domain multiplication.
+Non-mutating, allocation-tolerant, element-type-generic scattering transform — the
+autodiff-friendly counterpart of the in-place callable `st(x)`. It composes the non-mutating
+[`Plans.forward_transform`](@ref)/[`Plans.inverse_transform`](@ref) with broadcast modulus and
+mean (no preallocated workspace, no `mul!`), so gradients flow through it via
+DifferentiationInterface (Mooncake/Zygote/Enzyme) and it accepts `Dual`/`Float32` inputs. It
+returns the same coefficient container as `st(x)` and matches it numerically. Methods are added
+for the 1D/2D/3D transforms in their respective submodules.
+
+Use `st(x)` (mutating, zero-alloc) for production forward passes; use `scattering(st, x)` when
+you need to differentiate the forward map (e.g. gradient-descent synthesis).
+"""
+function scattering end
+
+"""
+    wavelet_convolve(signal_fft, filter_fft, plan)
+
+Perform wavelet convolution via frequency-domain multiplication then inverse transform.
 Allocates output. For zero-allocation hot paths, use `wavelet_convolve!`.
 """
-function wavelet_convolve(signal_fft::AbstractArray, 
+function wavelet_convolve(signal_fft::AbstractArray,
                           filter_fft::AbstractArray,
-                          ifft_plan)
+                          plan)
     out = similar(signal_fft)
     buffer = signal_fft .* filter_fft
-    LinearAlgebra.mul!(out, ifft_plan, buffer)
+    Plans.inverse_transform!(out, plan, buffer)
     return out
 end
 
 """
-    wavelet_convolve!(out, signal_fft, filter_fft, ifft_plan, buffer)
+    wavelet_convolve!(out, signal_fft, filter_fft, plan, buffer)
 
 Truly zero-allocation wavelet convolution.
 
-Multiplies `signal_fft .* filter_fft` into `buffer` in-place, then applies
-the IFFT plan via `mul!(out, ifft_plan, buffer)` — this writes directly into
-`out` without allocating a temporary array, unlike `ifft_plan * buffer`.
+Multiplies `signal_fft .* filter_fft` into `buffer` in-place, then applies the inverse spectral
+transform via `Plans.inverse_transform!(out, plan, buffer)` — writing directly into `out`.
 
 `out` and `buffer` must both be pre-allocated complex arrays of the same size.
 """
-function wavelet_convolve!(out::AbstractArray, 
-                          signal_fft::AbstractArray, 
+function wavelet_convolve!(out::AbstractArray,
+                          signal_fft::AbstractArray,
                           filter_fft::AbstractArray,
-                          ifft_plan,
+                          plan,
                           buffer::AbstractArray)
-    # In-place pointwise multiply: buffer = signal_fft .* filter_fft
-    @inbounds @simd for i in eachindex(signal_fft, filter_fft, buffer)
-        buffer[i] = signal_fft[i] * filter_fft[i]
-    end
-    # mul!(out, plan, src) writes IFFT(buffer) directly into out — zero allocation
-    LinearAlgebra.mul!(out, ifft_plan, buffer)
+    # In-place pointwise multiply via broadcast: works on CPU Arrays AND GPU arrays
+    # (fuses to a single kernel), avoiding scalar indexing.
+    @. buffer = signal_fft * filter_fft
+    Plans.inverse_transform!(out, plan, buffer)
     return out
 end
 
@@ -77,9 +91,9 @@ end
 In-place modulus. Stores |signal| in pre-allocated `out`. Zero allocation.
 """
 function apply_modulus!(out::AbstractArray, signal::AbstractArray)
-    @inbounds @simd for i in eachindex(out, signal)
-        out[i] = abs(signal[i])
-    end
+    # Broadcast: CPU + GPU compatible (no scalar indexing). On GPU arrays this fuses to one
+    # kernel; the KernelAbstractions extension provides an explicit-kernel override.
+    @. out = abs(signal)
     return out
 end
 
