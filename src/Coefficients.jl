@@ -84,14 +84,14 @@ Extract the second-order (S2) scattering coefficients.
 
 Update the zeroth-order coefficient storage with `val` and return the coefficients.
 """
-function update_S0(c::ScatteringCoefficients1D{T,V,M,<:AbstractArray}, val) where {T,V,M}
+function update_S0(c::ScatteringCoefficients1D{T,V,M,S0}, val) where {T,V,M,S0<:AbstractArray}
     # Mutable container S0: update in place, return same struct (true zero alloc)
     c.S0[1] = val
     return c
 end
 
 # Scalar S0: return new wrapper (only allocates the small struct, not S1/S2)
-function update_S0(c::ScatteringCoefficients1D, val)
+function update_S0(c::ScatteringCoefficients1D{T,V,M,S0}, val) where {T,V,M,S0}
     return ScatteringCoefficients1D(c.S1, c.S2; S0=val)
 end
 
@@ -177,12 +177,12 @@ n_wavelets(c::ScatteringCoefficients2D) = c.n_wavelets
 @inline first_order(c::ScatteringCoefficients2D) = c.S1
 @inline second_order(c::ScatteringCoefficients2D) = c.S2
 
-function update_S0(c::ScatteringCoefficients2D{T,V,M,<:AbstractArray}, val) where {T,V,M}
+function update_S0(c::ScatteringCoefficients2D{T,V,M,S0}, val) where {T,V,M,S0<:AbstractArray}
     c.S0[1] = val
     return c
 end
 
-function update_S0(c::ScatteringCoefficients2D, val)
+function update_S0(c::ScatteringCoefficients2D{T,V,M,S0}, val) where {T,V,M,S0}
     return ScatteringCoefficients2D(c.S1, c.S2; S0=val, n_scales=c.n_scales, n_orientations=c.n_orientations)
 end
 

@@ -555,6 +555,22 @@ Test.@testset "Translation invariance (approximate)" begin
     Test.@test all(rel_diff .< 0.1)  # Within 10% due to edge effects
 end
 
+Test.@testset "Mutable S0 container → in-place update, truly zero-alloc streaming" begin
+    # A mutable S0 container makes scattering_transform! mutate in place (same object) and
+    # allocate nothing in steady state — the dispatch that powers zero-allocation streaming.
+    N = 256
+    J = 4
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    nw = length(st.filter_bank.wavelets)
+    coeffs = ScatteringTransforms.ScatteringCoefficients1D(Vector{Float64}(undef, nw), zeros(nw, nw); S0=[0.0])
+    sig = randn(N)
+    r = ScatteringTransforms.scattering_transform!(coeffs, st, sig)
+    Test.@test r === coeffs                                                  # mutated in place
+    Test.@test ScatteringTransforms.zeroth_order(coeffs) ≈ Statistics.mean(sig)
+    ScatteringTransforms.scattering_transform!(coeffs, st, sig)              # warm up
+    Test.@test (@allocated ScatteringTransforms.scattering_transform!(coeffs, st, sig)) == 0
+end
+
 Test.@testset "Batched transforms reuse the plan and match per-signal results" begin
     N = 128
     J = 4

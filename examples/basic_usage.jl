@@ -8,7 +8,7 @@ Run with: `julia --project=. basic_usage.jl`
 
 using ScatteringTransforms: ScatteringTransforms as ST
 using FFTW: FFTW                      # loading FFTW enables the O(N log N) fast path (spectral=:auto)
-using OhMyThreads: OhMyThreads        # loading this enables ThreadedCPU batched transforms
+using OhMyThreads: OhMyThreads        # loading this enables ThreadedBackend batched transforms
 using Statistics: Statistics
 using Test: Test
 
@@ -51,7 +51,7 @@ println("\n4. Batched transform (plan + workspace reused)")
 X = randn(N, 64)
 coeffs_batch = ST.scattering_batch(st, X)
 println("   scattering_batch(st, $(size(X))) → ", size(coeffs_batch), " (coeffs × batch)")
-threaded = ST.scattering_batch(ST.ThreadedCPU(), st, X)
+threaded = ST.scattering_batch(ST.ThreadedBackend(), st, X)
 println("   threaded == serial: ", threaded ≈ coeffs_batch)
 
 # ---------------------------------------------------------------------------
