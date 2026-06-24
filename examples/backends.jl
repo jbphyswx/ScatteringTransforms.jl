@@ -20,8 +20,8 @@ N, J = 2048, 7
 x = randn(N)
 
 # ── spectral backend: in-core direct sum (default-available) vs FFTW fast path ─
-st_direct = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=:direct)
-st_fftw   = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=:fftw)
+st_direct = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.DirectSumBackend())
+st_fftw   = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.FFTBackend())
 cd, cf = st_direct(x), st_fftw(x)
 println("\nspectral backends agree: ",
         ST.first_order(cd) ≈ ST.first_order(cf) && ST.second_order(cd) ≈ ST.second_order(cf))

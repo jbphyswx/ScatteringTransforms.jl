@@ -18,8 +18,10 @@ using ..PathGraph: PathGraph
 export ScatteringTransform3D, scattering_transform3d!
 export compute_S1_3d!, compute_S2_3d!
 
-struct ScatteringTransform3D{T,M<:AbstractArray{Complex{T},3},R<:AbstractArray{T,3},P<:Plans.AbstractScatteringPlan,Tree<:PathGraph.ScatteringTree}
-    filter_bank::FilterBanks.FilterBank3D{T,M}
+struct ScatteringTransform3D{T, M<:AbstractArray{Complex{T},3}, R<:AbstractArray{T,3},
+                             P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
+                             FB<:FilterBanks.FilterBank3D, UB<:AbstractVector, UF<:AbstractVector}
+    filter_bank::FB
     tree::Tree
     max_order::Int
     plan::P
@@ -27,39 +29,35 @@ struct ScatteringTransform3D{T,M<:AbstractArray{Complex{T},3},R<:AbstractArray{T
     buffer_signal_fft::M
     buffer_conv::M
     buffer_mod::R
-    U1_buffers::Vector{R}
-    U1_fft_buffers::Vector{M}
+    U1_buffers::UB
+    U1_fft_buffers::UF
+end
 
-    function ScatteringTransform3D(N::NTuple{3,Int}, J::Int;
-                                   n_orient::Int=6,
-                                   max_order::Int=2,
-                                   T::Type=Float64,
-                                   spectral::Symbol=:auto)
-        filter_bank = FilterBanks.build_filter_bank3d(N, J; n_orient=n_orient, T=T)
-        tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
-        plan = Plans.make_plan(spectral, T, N)
+function ScatteringTransform3D(N::NTuple{3,Int}, J::Int;
+                               n_orient::Int=6,
+                               max_order::Int=2,
+                               T::Type=Float64,
+                               spectral::Plans.AbstractSpectralBackend=Plans.AutoSpectral())
+    filter_bank = FilterBanks.build_filter_bank3d(N, J; n_orient=n_orient, T=T)
+    tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+    plan = Plans.make_plan(spectral, T, N)
 
-        dummy = zeros(Complex{T}, N)
-        num_w = length(filter_bank.wavelets)
-        buffer_input      = similar(dummy)
-        buffer_signal_fft = similar(dummy)
-        buffer_conv       = similar(dummy)
-        buffer_mod        = zeros(T, N)
-
-        if max_order >= 2
-            U1_buffers     = [zeros(T, N) for _ in 1:num_w]
-            U1_fft_buffers = [similar(dummy) for _ in 1:num_w]
-        else
-            U1_buffers     = Array{T,3}[]
-            U1_fft_buffers = Array{Complex{T},3}[]
-        end
-
-        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(plan), typeof(tree)}(
-            filter_bank, tree, max_order, plan,
-            buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
-            U1_buffers, U1_fft_buffers,
-        )
+    dummy = zeros(Complex{T}, N)
+    num_w = length(filter_bank.wavelets)
+    buffer_input      = similar(dummy)
+    buffer_signal_fft = similar(dummy)
+    buffer_conv       = similar(dummy)
+    buffer_mod        = zeros(T, N)
+    if max_order >= 2
+        U1_buffers     = [zeros(T, N) for _ in 1:num_w]
+        U1_fft_buffers = [similar(dummy) for _ in 1:num_w]
+    else
+        U1_buffers     = Array{T,3}[]
+        U1_fft_buffers = Array{Complex{T},3}[]
     end
+    return ScatteringTransform3D(filter_bank, tree, max_order, plan,
+                                 buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
+                                 U1_buffers, U1_fft_buffers)
 end
 
 """

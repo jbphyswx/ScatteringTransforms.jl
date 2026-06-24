@@ -19,6 +19,7 @@ so the transform engine never references FFTW/CUDA directly.
 using LinearAlgebra: LinearAlgebra
 
 export AbstractScatteringPlan, DirectSumPlan, forward_transform!, inverse_transform!, make_plan
+export AbstractSpectralBackend, DirectSumBackend, FFTBackend, AutoSpectral
 
 """
     AbstractScatteringPlan
@@ -53,25 +54,38 @@ extension being loaded.
 function fftw_plan end
 
 """
-    make_plan(spectral, T, dims) -> AbstractScatteringPlan
+    AbstractSpectralBackend
 
-Select a spectral plan. `spectral` is one of:
-- `:direct` — the in-core `DirectSumPlan` (always available, slow);
-- `:fftw`   — the FFTW fast path (requires `using FFTW`);
-- `:auto`   — FFTW if its extension is loaded, otherwise the direct sum.
+Selects which spectral transform a transform uses: [`DirectSumBackend`](@ref) (in-core, always
+available), [`FFTBackend`](@ref) (FFTW fast path, requires `using FFTW`), or [`AutoSpectral`](@ref)
+(FFTW if loaded, else the direct sum). Dispatched on the *type* (not a Symbol) so the choice is
+explicit and specializing.
 """
-function make_plan(spectral::Symbol, ::Type{T}, dims) where {T}
-    spectral === :direct && return DirectSumPlan(T, dims)
-    have_fftw = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsFFTWExt) !== nothing
-    if spectral === :fftw
-        have_fftw || throw(ArgumentError("spectral=:fftw requires the FFTW extension. Run `using FFTW`."))
-        return fftw_plan(T, dims)
-    elseif spectral === :auto
-        return have_fftw ? fftw_plan(T, dims) : DirectSumPlan(T, dims)
-    else
-        throw(ArgumentError("unknown spectral=$(repr(spectral)) (use :auto, :direct, or :fftw)"))
-    end
+abstract type AbstractSpectralBackend end
+
+"In-core direct-summation DFT (dependency-free, `O(N²)`)."
+struct DirectSumBackend <: AbstractSpectralBackend end
+
+"FFTW fast path (`O(N log N)`); requires the FFTW extension (`using FFTW`)."
+struct FFTBackend <: AbstractSpectralBackend end
+
+"Use the FFTW fast path if its extension is loaded, otherwise the in-core direct sum."
+struct AutoSpectral <: AbstractSpectralBackend end
+
+_have_fftw() = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsFFTWExt) !== nothing
+
+"""
+    make_plan(spectral::AbstractSpectralBackend, T, dims) -> AbstractScatteringPlan
+
+Build the spectral plan selected by `spectral` for arrays of size `dims` and element type `T`.
+"""
+make_plan(::DirectSumBackend, ::Type{T}, dims) where {T} = DirectSumPlan(T, dims)
+function make_plan(::FFTBackend, ::Type{T}, dims) where {T}
+    _have_fftw() || throw(ArgumentError("FFTBackend requires the FFTW extension. Run `using FFTW`."))
+    return fftw_plan(T, dims)
 end
+make_plan(::AutoSpectral, ::Type{T}, dims) where {T} =
+    _have_fftw() ? fftw_plan(T, dims) : DirectSumPlan(T, dims)
 
 # ---------------------------------------------------------------------------
 # In-core direct-summation DFT plan (slow but dependency-free default)

@@ -97,6 +97,11 @@ const DirectSumPlan = Plans.DirectSumPlan
 const AbstractScatteringPlan = Plans.AbstractScatteringPlan
 const forward_transform! = Plans.forward_transform!
 const inverse_transform! = Plans.inverse_transform!
+# Spectral backend selectors (type-dispatched, not symbols)
+const AbstractSpectralBackend = Plans.AbstractSpectralBackend
+const DirectSumBackend = Plans.DirectSumBackend
+const FFTBackend = Plans.FFTBackend
+const AutoSpectral = Plans.AutoSpectral
 const ScatteringField1D = ScatteringFields.ScatteringField1D
 const ScatteringField2D = ScatteringFields.ScatteringField2D
 const path_field = ScatteringFields.path_field
@@ -172,13 +177,13 @@ end
 
 # Serializable build spec for reconstructing a transform on a remote worker (FFTW/CUFFT plans
 # are not serializable, so distributed workers rebuild rather than receive the transform).
-_spectral_sym(st) = st.plan isa Plans.DirectSumPlan ? :direct : :fftw
+_spectral_backend(st) = st.plan isa Plans.DirectSumPlan ? DirectSumBackend() : FFTBackend()
 transform_spec(st::ScatteringTransform1D) =
     (kind = :st1d, N = length(st.buffer_mod), J = st.filter_bank.J, Q = st.filter_bank.Q,
-     max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)), spectral = _spectral_sym(st))
+     max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)), spectral = _spectral_backend(st))
 transform_spec(st::ScatteringTransform2D) =
     (kind = :st2d, N = size(st.buffer_mod), J = st.filter_bank.J, L = st.filter_bank.L,
-     max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)), spectral = _spectral_sym(st))
+     max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)), spectral = _spectral_backend(st))
 
 function rebuild_transform(spec)
     if spec.kind === :st1d
@@ -222,6 +227,7 @@ export WaveletMeta, ScatteringTree
 export SerialBackend, ThreadedBackend, GPUBackend, AutoBackend, DistributedBackend, MPIBackend
 export Line1D, Plane2D, Volume3D, Sphere
 export DirectSumPlan, AbstractScatteringPlan, forward_transform!, inverse_transform!
+export AbstractSpectralBackend, DirectSumBackend, FFTBackend, AutoSpectral
 export Morlet1D, Morlet2D, Morlet3D
 export ScatteringCoefficients1D, ScatteringCoefficients2D
 export zeroth_order, first_order, second_order
@@ -243,18 +249,18 @@ export plot_filter_bank, plot_coefficients
 using PrecompileTools: @setup_workload, @compile_workload
 @setup_workload begin
     @compile_workload begin
-        st1 = ScatteringTransform1D(32, 3; Q = 1, max_order = 2, spectral = :direct)
+        st1 = ScatteringTransform1D(32, 3; Q = 1, max_order = 2, spectral = DirectSumBackend())
         c1 = st1(zeros(Float64, 32))
         flatten1d(c1)
         scattering_field(st1, zeros(Float64, 32); subsample = 1)
         scattering_batch(st1, zeros(Float64, 32, 2))
         normalized_coefficients(c1)
 
-        st2 = ScatteringTransform2D((16, 16), 2; L = 4, max_order = 2, spectral = :direct)
+        st2 = ScatteringTransform2D((16, 16), 2; L = 4, max_order = 2, spectral = DirectSumBackend())
         c2 = st2(zeros(Float64, 16, 16))
         compute_shape_sparsity(first_order(c2), second_order(c2), st2.filter_bank.meta)
 
-        st3 = ScatteringTransform3D((8, 8, 8), 2; n_orient = 6, max_order = 2, spectral = :direct)
+        st3 = ScatteringTransform3D((8, 8, 8), 2; n_orient = 6, max_order = 2, spectral = DirectSumBackend())
         st3(zeros(Float64, 8, 8, 8))
     end
 end

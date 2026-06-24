@@ -41,8 +41,7 @@ function ScatteringTransforms.FilterBanks.FilterBank1D{T}(
 ) where T<:Real
     cu_wavelets = [CUDA.CuVector{Complex{T}}(ψ) for ψ in fb.wavelets]
     cu_avg      = CUDA.CuVector{Complex{T}}(fb.averaging)
-    V = eltype(cu_wavelets)
-    return ScatteringTransforms.FilterBanks.FilterBank1D{T, V}(cu_wavelets, cu_avg, fb.meta, fb.J, fb.Q)
+    return ScatteringTransforms.FilterBanks.FilterBank1D(cu_wavelets, cu_avg, fb.meta, fb.J, fb.Q)
 end
 
 """
@@ -56,8 +55,7 @@ function ScatteringTransforms.FilterBanks.FilterBank2D{T}(
 ) where T<:Real
     cu_wavelets = [CUDA.CuMatrix{Complex{T}}(ψ) for ψ in fb.wavelets]
     cu_avg      = CUDA.CuMatrix{Complex{T}}(fb.averaging)
-    M = typeof(cu_avg)
-    return ScatteringTransforms.FilterBanks.FilterBank2D{T, M}(cu_wavelets, cu_avg, fb.meta, fb.J, fb.L)
+    return ScatteringTransforms.FilterBanks.FilterBank2D(cu_wavelets, cu_avg, fb.meta, fb.J, fb.L)
 end
 
 """
@@ -82,8 +80,7 @@ function ScatteringTransforms.Scattering1D.ScatteringTransform1D(
     cpu_fb = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=Q, T=T)
     cu_wavelets = [CUDA.CuVector{Complex{T}}(ψ) for ψ in cpu_fb.wavelets]
     cu_avg = CUDA.CuVector{Complex{T}}(cpu_fb.averaging)
-    V_type = typeof(cu_avg)
-    filter_bank = ScatteringTransforms.FilterBanks.FilterBank1D{T, V_type}(
+    filter_bank = ScatteringTransforms.FilterBanks.FilterBank1D(
         cu_wavelets, cu_avg, cpu_fb.meta, cpu_fb.J, cpu_fb.Q
     )
     tree = ScatteringTransforms.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
@@ -105,10 +102,7 @@ function ScatteringTransforms.Scattering1D.ScatteringTransform1D(
     end
 
     buffer_signal_fft = CUDA.zeros(Complex{T}, N)
-    M_type = typeof(buffer_conv)
-    R_type = typeof(buffer_mod)
-    return ScatteringTransforms.Scattering1D.ScatteringTransform1D{
-        T, M_type, R_type, typeof(plan), typeof(tree)}(
+    return ScatteringTransforms.Scattering1D.ScatteringTransform1D(
         filter_bank, tree, max_order, plan,
         buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
         U1_buffers, U1_fft_buffers,
@@ -136,8 +130,7 @@ function ScatteringTransforms.Scattering2D.ScatteringTransform2D(
     cpu_fb = ScatteringTransforms.FilterBanks.build_filter_bank2d(N, J; L=L, T=T)
     cu_wavelets = [CUDA.CuMatrix{Complex{T}}(ψ) for ψ in cpu_fb.wavelets]
     cu_avg = CUDA.CuMatrix{Complex{T}}(cpu_fb.averaging)
-    M_fb = typeof(cu_avg)
-    filter_bank = ScatteringTransforms.FilterBanks.FilterBank2D{T, M_fb}(
+    filter_bank = ScatteringTransforms.FilterBanks.FilterBank2D(
         cu_wavelets, cu_avg, cpu_fb.meta, cpu_fb.J, cpu_fb.L
     )
     tree = ScatteringTransforms.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
@@ -158,10 +151,7 @@ function ScatteringTransforms.Scattering2D.ScatteringTransform2D(
     end
 
     buffer_signal_fft = CUDA.zeros(Complex{T}, N)
-    M_type = typeof(buffer_conv)
-    R_type = typeof(buffer_mod)
-    return ScatteringTransforms.Scattering2D.ScatteringTransform2D{
-        T, M_type, R_type, typeof(plan), typeof(tree)}(
+    return ScatteringTransforms.Scattering2D.ScatteringTransform2D(
         filter_bank, tree, max_order, plan,
         buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
         U1_buffers, U1_fft_buffers,
@@ -181,8 +171,7 @@ function ScatteringTransforms.Scattering3D.ScatteringTransform3D(
     cpu_fb = ScatteringTransforms.FilterBanks.build_filter_bank3d(N, J; n_orient=n_orient, T=T)
     cu_wavelets = [CUDA.CuArray{Complex{T},3}(ψ) for ψ in cpu_fb.wavelets]
     cu_avg = CUDA.CuArray{Complex{T},3}(cpu_fb.averaging)
-    A_fb = typeof(cu_avg)
-    filter_bank = ScatteringTransforms.FilterBanks.FilterBank3D{T, A_fb}(
+    filter_bank = ScatteringTransforms.FilterBanks.FilterBank3D(
         cu_wavelets, cu_avg, cpu_fb.meta, cpu_fb.J, cpu_fb.n_orient
     )
     tree = ScatteringTransforms.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
@@ -203,10 +192,7 @@ function ScatteringTransforms.Scattering3D.ScatteringTransform3D(
     end
 
     buffer_signal_fft = CUDA.zeros(Complex{T}, N)
-    M_type = typeof(buffer_conv)
-    R_type = typeof(buffer_mod)
-    return ScatteringTransforms.Scattering3D.ScatteringTransform3D{
-        T, M_type, R_type, typeof(plan), typeof(tree)}(
+    return ScatteringTransforms.Scattering3D.ScatteringTransform3D(
         filter_bank, tree, max_order, plan,
         buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
         U1_buffers, U1_fft_buffers,

@@ -33,54 +33,47 @@ export scattering_transform!, compute_S1!, compute_S2!
 - `U1_buffers`: Vector of real buffers for S2 computation (one per wavelet)
 - `U1_fft_buffers`: Vector of complex buffers for FFT of U1 (one per wavelet)
 """
-struct ScatteringTransform1D{T,V<:AbstractVector{Complex{T}},M<:AbstractVector{T},P<:Plans.AbstractScatteringPlan,Tree<:PathGraph.ScatteringTree}
-    filter_bank::FilterBanks.FilterBank1D{T,V}
-    tree::Tree      # admissible scattering paths (source of truth for second-order)
+struct ScatteringTransform1D{T, V<:AbstractVector{Complex{T}}, M<:AbstractVector{T},
+                             P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
+                             FB<:FilterBanks.FilterBank1D, UB<:AbstractVector, UF<:AbstractVector}
+    filter_bank::FB         # any FilterBank1D (CPU/GPU/static/…), kept as a type param
+    tree::Tree              # admissible scattering paths (source of truth for second-order)
     max_order::Int
-    plan::P         # spectral transform plan (direct-sum default, FFTW fast path); concrete type param
+    plan::P                 # spectral plan (direct-sum default, FFTW fast path); concrete type param
+    buffer_input::V         # complex buffer for real→complex promotion of input
+    buffer_signal_fft::V    # preserves signal FFT across S1/S2 passes
+    buffer_conv::V          # convolution / inverse-transform output
+    buffer_mod::M           # real modulus buffer
+    U1_buffers::UB          # per-wavelet first-order moduli (S2)
+    U1_fft_buffers::UF      # per-wavelet U1 transforms (S2)
+end
 
-    # Workspace buffers for zero-allocation transforms
-    buffer_input::V       # Complex buffer for real→complex promotion of input
-    buffer_signal_fft::V  # Preserves signal FFT across S1/S2 passes (buffer_conv gets overwritten)
-    buffer_conv::V        # Complex buffer for convolution output (IFFT result)
-    buffer_mod::M         # Real buffer for modulus output
-    U1_buffers::Vector{M}    # Real buffers for S2 first-order moduli
-    U1_fft_buffers::Vector{V}  # Complex buffers for FFT of each U1
-    
-    function ScatteringTransform1D(N::Int, J::Int;
-                                   Q::Int=1,
-                                   max_order::Int=2,
-                                   T::Type=Float64,
-                                   spectral::Symbol=:auto)
-        filter_bank = FilterBanks.build_filter_bank1d(N, J; Q=Q, T=T)
-        tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+function ScatteringTransform1D(N::Int, J::Int;
+                               Q::Int=1,
+                               max_order::Int=2,
+                               T::Type=Float64,
+                               spectral::Plans.AbstractSpectralBackend=Plans.AutoSpectral())
+    filter_bank = FilterBanks.build_filter_bank1d(N, J; Q=Q, T=T)
+    tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+    plan = Plans.make_plan(spectral, T, (N,))
 
-        # Spectral plan: in-core direct sum by default, FFTW fast path if loaded.
-        plan = Plans.make_plan(spectral, T, (N,))
-
-        # Pre-allocate workspace buffers
-        dummy = zeros(Complex{T}, N)
-        num_w = length(filter_bank.wavelets)
-        buffer_input      = similar(dummy)   # for real→complex of input
-        buffer_signal_fft = similar(dummy)   # preserved copy of signal FFT
-        buffer_conv       = similar(dummy)   # convolution / ifft output
-        buffer_mod        = Vector{T}(undef, N)
-
-        # Only allocate U1 / U1_fft buffers if S2 is needed
-        if max_order >= 2
-            U1_buffers     = [Vector{T}(undef, N) for _ in 1:num_w]
-            U1_fft_buffers = [similar(dummy) for _ in 1:num_w]
-        else
-            U1_buffers     = Vector{T}[]
-            U1_fft_buffers = Vector{Complex{T}}[]
-        end
-
-        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(plan), typeof(tree)}(
-            filter_bank, tree, max_order, plan,
-            buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
-            U1_buffers, U1_fft_buffers
-        )
+    dummy = zeros(Complex{T}, N)
+    num_w = length(filter_bank.wavelets)
+    buffer_input      = similar(dummy)
+    buffer_signal_fft = similar(dummy)
+    buffer_conv       = similar(dummy)
+    buffer_mod        = Vector{T}(undef, N)
+    if max_order >= 2
+        U1_buffers     = [Vector{T}(undef, N) for _ in 1:num_w]
+        U1_fft_buffers = [similar(dummy) for _ in 1:num_w]
+    else
+        U1_buffers     = Vector{T}[]
+        U1_fft_buffers = Vector{Complex{T}}[]
     end
+    # auto field constructor infers all type parameters
+    return ScatteringTransform1D(filter_bank, tree, max_order, plan,
+                                 buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
+                                 U1_buffers, U1_fft_buffers)
 end
 
 """

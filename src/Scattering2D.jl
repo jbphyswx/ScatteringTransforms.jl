@@ -43,51 +43,46 @@ export compute_shape_sparsity
 - `U1_buffers`: Real matrices for first-order moduli (one per wavelet)
 - `U1_fft_buffers`: Complex matrices for FFT of U1 (one per wavelet)
 """
-struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T},P<:Plans.AbstractScatteringPlan,Tree<:PathGraph.ScatteringTree}
-    filter_bank::FilterBanks.FilterBank2D{T,M}   # carry the matrix-type param M (was abstract {T})
-    tree::Tree      # admissible scattering paths (source of truth for second-order)
+struct ScatteringTransform2D{T, M<:AbstractMatrix{Complex{T}}, R<:AbstractMatrix{T},
+                             P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
+                             FB<:FilterBanks.FilterBank2D, UB<:AbstractVector, UF<:AbstractVector}
+    filter_bank::FB
+    tree::Tree
     max_order::Int
-    plan::P         # spectral transform plan (direct-sum default, FFTW fast path); concrete type param
-
+    plan::P
     buffer_input::M
     buffer_signal_fft::M
     buffer_conv::M
     buffer_mod::R
-    U1_buffers::Vector{R}
-    U1_fft_buffers::Vector{M}
-    
-    function ScatteringTransform2D(N::NTuple{2,Int}, J::Int;
-                                   L::Int=8,
-                                   max_order::Int=2,
-                                   T::Type=Float64,
-                                   spectral::Symbol=:auto)
-        filter_bank = FilterBanks.build_filter_bank2d(N, J; L=L, T=T)
-        tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+    U1_buffers::UB
+    U1_fft_buffers::UF
+end
 
-        # Spectral plan: in-core direct sum by default, FFTW fast path if loaded.
-        plan = Plans.make_plan(spectral, T, N)
+function ScatteringTransform2D(N::NTuple{2,Int}, J::Int;
+                               L::Int=8,
+                               max_order::Int=2,
+                               T::Type=Float64,
+                               spectral::Plans.AbstractSpectralBackend=Plans.AutoSpectral())
+    filter_bank = FilterBanks.build_filter_bank2d(N, J; L=L, T=T)
+    tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+    plan = Plans.make_plan(spectral, T, N)
 
-        dummy = zeros(Complex{T}, N)
-        num_w = length(filter_bank.wavelets)
-        buffer_input      = similar(dummy)
-        buffer_signal_fft = similar(dummy)
-        buffer_conv       = similar(dummy)
-        buffer_mod        = zeros(T, N)
-        
-        if max_order >= 2
-            U1_buffers     = [zeros(T, N) for _ in 1:num_w]
-            U1_fft_buffers = [similar(dummy) for _ in 1:num_w]
-        else
-            U1_buffers     = Matrix{T}[]
-            U1_fft_buffers = Matrix{Complex{T}}[]
-        end
-        
-        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(plan), typeof(tree)}(
-            filter_bank, tree, max_order, plan,
-            buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
-            U1_buffers, U1_fft_buffers
-        )
+    dummy = zeros(Complex{T}, N)
+    num_w = length(filter_bank.wavelets)
+    buffer_input      = similar(dummy)
+    buffer_signal_fft = similar(dummy)
+    buffer_conv       = similar(dummy)
+    buffer_mod        = zeros(T, N)
+    if max_order >= 2
+        U1_buffers     = [zeros(T, N) for _ in 1:num_w]
+        U1_fft_buffers = [similar(dummy) for _ in 1:num_w]
+    else
+        U1_buffers     = Matrix{T}[]
+        U1_fft_buffers = Matrix{Complex{T}}[]
     end
+    return ScatteringTransform2D(filter_bank, tree, max_order, plan,
+                                 buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
+                                 U1_buffers, U1_fft_buffers)
 end
 
 """

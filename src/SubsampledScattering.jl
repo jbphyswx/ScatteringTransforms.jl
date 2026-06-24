@@ -28,34 +28,35 @@ modulus envelope is decimated by `2^(scale - oversampling)` before the second wa
 (multi-resolution wavelet bank). Opt-in and approximate — a large `oversampling` reproduces the
 exact [`ScatteringTransform1D`](@ref); aggressive values trade a little accuracy for speed.
 """
-struct SubsampledScattering1D{T, Tree<:PathGraph.ScatteringTree}
+struct SubsampledScattering1D{T, Tree<:PathGraph.ScatteringTree,
+                              MV<:AbstractVector{FilterBanks.WaveletMeta{T}}, WF<:AbstractVector,
+                              PF<:Plans.AbstractScatteringPlan, LV<:AbstractDict}
     N::Int
     J::Int
     Q::Int
     max_order::Int
     oversampling::Int
-    spectral::Symbol
     tree::Tree
-    meta::Vector{FilterBanks.WaveletMeta{T}}
-    wavelets_full::Vector{Vector{Complex{T}}}        # ψ_i at full N
-    plan_full::Plans.AbstractScatteringPlan
-    # per decimation factor ds > 1: wavelets at N÷ds and a plan at N÷ds
-    levels::Dict{Int, Tuple{Vector{Vector{Complex{T}}}, Plans.AbstractScatteringPlan}}
+    meta::MV
+    wavelets_full::WF              # ψ_i at full N
+    plan_full::PF                  # full-resolution spectral plan (concrete type param)
+    levels::LV                     # ds > 1 ⇒ (reduced-resolution wavelets, reduced-resolution plan)
 end
 
 # Decimation factor for a first-order wavelet of octave `scale`.
 _ds(scale::Int, oversampling::Int) = 1 << max(0, scale - oversampling)
 
-function SubsampledScattering1D(N::Int, J::Int; Q::Int = 1, max_order::Int = 2,
-                                oversampling::Int = 1, T::Type = Float64, spectral::Symbol = :auto)
+function SubsampledScattering1D(N::Int, J::Int; Q::Int = 1, max_order::Int = 2, oversampling::Int = 1,
+                                T::Type = Float64,
+                                spectral::Plans.AbstractSpectralBackend = Plans.AutoSpectral())
     fb = FilterBanks.build_filter_bank1d(N, J; Q = Q, T = T)
     meta = fb.meta
     wavelets_full = fb.wavelets
     tree = PathGraph.build_tree([m.j_eff for m in meta], max_order)
     plan_full = Plans.make_plan(spectral, T, (N,))
 
-    # Build a reduced-resolution wavelet bank + plan for each distinct ds > 1 that occurs.
-    levels = Dict{Int, Tuple{Vector{Vector{Complex{T}}}, Plans.AbstractScatteringPlan}}()
+    # Reduced-resolution wavelet bank + plan for each distinct ds > 1 (concrete Dict value type).
+    levels = Dict{Int, Tuple{typeof(wavelets_full), typeof(plan_full)}}()
     for m in meta
         ds = _ds(m.scale, oversampling)
         (ds == 1 || haskey(levels, ds)) && continue
@@ -64,8 +65,9 @@ function SubsampledScattering1D(N::Int, J::Int; Q::Int = 1, max_order::Int = 2,
         wl = [Filters.frequency_response(Filters.Morlet1D{T}(N1, mm.scale * Q + mm.q; Q = Q)) for mm in meta]
         levels[ds] = (wl, Plans.make_plan(spectral, T, (N1,)))
     end
-    return SubsampledScattering1D{T, typeof(tree)}(N, J, Q, max_order, oversampling, spectral,
-                                                   tree, meta, wavelets_full, plan_full, levels)
+    return SubsampledScattering1D{T, typeof(tree), typeof(meta), typeof(wavelets_full),
+                                  typeof(plan_full), typeof(levels)}(
+        N, J, Q, max_order, oversampling, tree, meta, wavelets_full, plan_full, levels)
 end
 
 function (st::SubsampledScattering1D{T})(signal::AbstractVector) where {T}

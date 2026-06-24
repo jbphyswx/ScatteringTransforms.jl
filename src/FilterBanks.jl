@@ -30,7 +30,7 @@ amplified). The DC bin is pinned to `φ(0)=1` exactly (the wavelets are zero-mea
 keeps the localized-field spatial mean equal to the globally-averaged coefficient.
 Works for 1D/2D/3D filter arrays.
 """
-function _complement_lowpass(wavelets::Vector{A}) where {T, A<:AbstractArray{Complex{T}}}
+function _complement_lowpass(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{Complex{T}}}
     ϕ = similar(first(wavelets))
     @inbounds for i in eachindex(ϕ)
         s = zero(T)
@@ -51,7 +51,7 @@ non-expansive — then return the complement low-pass φ, giving a tight frame w
 Littlewood–Paley sum `Σⱼ|ψⱼ|² + |φ|² ≡ 1`. The rescale is a single global constant, so it does
 not change the *relative* coefficient structure.
 """
-function _tight_frame_lowpass!(wavelets::Vector{A}) where {T, A<:AbstractArray{Complex{T}}}
+function _tight_frame_lowpass!(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{Complex{T}}}
     maxs = zero(T)
     @inbounds for i in eachindex(first(wavelets))
         s = zero(T)
@@ -94,25 +94,23 @@ struct WaveletMeta{T}
 end
 
 """
-    FilterBank1D{T,V<:AbstractVector{Complex{T}}}
+    FilterBank1D{T,V,W,MV}
 
-Complete 1D filter bank for scattering transform.
-
-# Type Parameters
-- `T`: Real element type (Float32, Float64, etc.)
-- `V`: Wavelet vector type (allows CPU/GPU arrays)
+Complete 1D filter bank for the scattering transform. Every container is a type parameter (no
+hardcoded `Vector`): `V` the per-filter array type (CPU/GPU/static/…), `W` the wavelet
+collection, `MV` the metadata collection.
 
 # Fields
-- `wavelets::Vector{V}`: Wavelet filters in Fourier domain
-- `averaging::V`: Low-pass averaging (scaling) filter
-- `meta::Vector{NamedTuple}`: Metadata for each wavelet
-- `J::Int`: Number of octaves (scales)
-- `Q::Int`: Number of wavelets per octave
+- `wavelets::W`: wavelet filters in the Fourier domain (`W<:AbstractVector{V}`)
+- `averaging::V`: low-pass averaging (scaling) filter
+- `meta::MV`: per-wavelet `WaveletMeta`
+- `J::Int`: number of octaves (scales)
+- `Q::Int`: wavelets per octave
 """
-struct FilterBank1D{T,V<:AbstractVector{Complex{T}}}
-    wavelets::Vector{V}
+struct FilterBank1D{T, V<:AbstractVector{Complex{T}}, W<:AbstractVector{V}, MV<:AbstractVector{WaveletMeta{T}}}
+    wavelets::W
     averaging::V
-    meta::Vector{WaveletMeta{T}}
+    meta::MV
     J::Int
     Q::Int
 end
@@ -154,29 +152,27 @@ function build_filter_bank1d(N::Int, J::Int; Q::Int=1, T::Type{<:Real}=Float64)
     # Low-pass = complement of the wavelet energy (tight-frame Littlewood-Paley ≈ 1)
     ϕ = _tight_frame_lowpass!(wavelets)
 
-    return FilterBank1D{T,V}(wavelets, ϕ, meta, J, Q)
+    return FilterBank1D(wavelets, ϕ, meta, J, Q)
 end
 
 """
-    FilterBank2D{T,M<:AbstractMatrix{Complex{T}}}
+    FilterBank2D{T,M,W,MV}
 
-Complete 2D filter bank with oriented wavelets.
-
-# Type Parameters
-- `T`: Real element type
-- `M`: Matrix type for wavelets (allows CPU/GPU arrays)
+Complete 2D filter bank with oriented wavelets. Containers are type parameters (no hardcoded
+`Vector`): `M` the per-filter matrix type, `W` the wavelet collection, `MV` the metadata
+collection.
 
 # Fields
-- `wavelets::Vector{M}`: Wavelets indexed by [scale_index]
-- `averaging::M`: Low-pass averaging filter
-- `meta::Vector{NamedTuple}`: Metadata
-- `J::Int`: Number of scales
-- `L::Int`: Number of orientations
+- `wavelets::W`: oriented wavelet filters (`W<:AbstractVector{M}`)
+- `averaging::M`: low-pass averaging filter
+- `meta::MV`: per-wavelet `WaveletMeta`
+- `J::Int`: number of scales
+- `L::Int`: number of orientations
 """
-struct FilterBank2D{T,M<:AbstractMatrix{Complex{T}}}
-    wavelets::Vector{M}
+struct FilterBank2D{T, M<:AbstractMatrix{Complex{T}}, W<:AbstractVector{M}, MV<:AbstractVector{WaveletMeta{T}}}
+    wavelets::W
     averaging::M
-    meta::Vector{WaveletMeta{T}}
+    meta::MV
     J::Int
     L::Int
 end
@@ -220,7 +216,7 @@ function build_filter_bank2d(N::NTuple{2,Int}, J::Int; L::Int=8, T::Type{<:Real}
     # Low-pass = complement of the wavelet energy (tight-frame Littlewood-Paley ≈ 1)
     ϕ = _tight_frame_lowpass!(wavelets)
 
-    return FilterBank2D{T,M}(wavelets, ϕ, meta, J, L)
+    return FilterBank2D(wavelets, ϕ, meta, J, L)
 end
 
 """
@@ -229,10 +225,10 @@ end
 Complete 3D oriented Morlet filter bank: `J` scales × `n_orient` sphere directions, plus a
 low-pass averaging filter.
 """
-struct FilterBank3D{T,A<:AbstractArray{Complex{T},3}}
-    wavelets::Vector{A}
+struct FilterBank3D{T, A<:AbstractArray{Complex{T},3}, W<:AbstractVector{A}, MV<:AbstractVector{WaveletMeta{T}}}
+    wavelets::W
     averaging::A
-    meta::Vector{WaveletMeta{T}}
+    meta::MV
     J::Int
     n_orient::Int
 end
@@ -260,7 +256,7 @@ function build_filter_bank3d(N::NTuple{3,Int}, J::Int; n_orient::Int=6, T::Type{
     end
     # Low-pass = complement of the wavelet energy (tight-frame Littlewood-Paley ≈ 1)
     ϕ = _tight_frame_lowpass!(wavelets)
-    return FilterBank3D{T,A}(wavelets, ϕ, meta, J, n_orient)
+    return FilterBank3D(wavelets, ϕ, meta, J, n_orient)
 end
 
 end # module FilterBanks

@@ -491,8 +491,8 @@ Test.@testset "3D volumetric scattering transform" begin
     end
 
     # in-core direct sum matches the FFTW fast path in 3D
-    st_d = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=:direct)
-    st_f = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=:fftw)
+    st_d = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=ScatteringTransforms.DirectSumBackend())
+    st_f = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=ScatteringTransforms.FFTBackend())
     Test.@test isapprox(ScatteringTransforms.first_order(st_d(vol)),
                         ScatteringTransforms.first_order(st_f(vol)); rtol=1e-6)
     Test.@test isapprox(ScatteringTransforms.second_order(st_d(vol)),
@@ -675,16 +675,16 @@ Test.@testset "Spectral plans: in-core direct sum matches FFTW fast path" begin
     N = 128
     J = 4
     signal = randn(N)
-    st_d = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=:direct)
-    st_f = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=:fftw)
+    st_d = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ScatteringTransforms.DirectSumBackend())
+    st_f = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ScatteringTransforms.FFTBackend())
     cd, cf = st_d(signal), st_f(signal)
     Test.@test isapprox(ScatteringTransforms.zeroth_order(cd), ScatteringTransforms.zeroth_order(cf); rtol=1e-6)
     Test.@test isapprox(ScatteringTransforms.first_order(cd), ScatteringTransforms.first_order(cf); rtol=1e-6)
     Test.@test isapprox(ScatteringTransforms.second_order(cd), ScatteringTransforms.second_order(cf); rtol=1e-6)
 
     img = randn(32, 32)
-    s2d = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=:direct)
-    s2f = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=:fftw)
+    s2d = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=ScatteringTransforms.DirectSumBackend())
+    s2f = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=ScatteringTransforms.FFTBackend())
     Test.@test isapprox(ScatteringTransforms.first_order(s2d(img)),
                         ScatteringTransforms.first_order(s2f(img)); rtol=1e-6)
     Test.@test isapprox(ScatteringTransforms.second_order(s2d(img)),
