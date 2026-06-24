@@ -46,6 +46,10 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
     end
 end
 
+# JET optimization/abstract-interpretation audit of the hot paths (skipped on pre-release Julia,
+# where JET refuses to run — see test_jet.jl).
+include("test_jet.jl")
+
 Test.@testset "Type stability (concrete struct fields + inferred transforms)" begin
     # Every field of the transform struct must be concretely typed — in particular the FFT
     # plan fields (previously untyped `Any`, causing dynamic dispatch on every `mul!`) and the
