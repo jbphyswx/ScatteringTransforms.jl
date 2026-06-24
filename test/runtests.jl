@@ -468,6 +468,75 @@ Test.@testset "Translation invariance (approximate)" begin
     Test.@test all(rel_diff .< 0.1)  # Within 10% due to edge effects
 end
 
+Test.@testset "1D localized field: mean equals averaged coefficient" begin
+    # The localized (Mallat) field S_p x = (|U_p x| ⋆ φ_J) ↓ s. With s = 1 (no decimation) and
+    # φ̂(0) = 1, the spatial mean of each path's field must equal that path's globally-averaged
+    # coefficient — the two outputs are consistent by construction.
+    PG = ScatteringTransforms.PathGraph
+    N = 256
+    J = 4
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    signal = randn(N)
+    coeffs = st(signal)
+    sf = ScatteringTransforms.scattering_field(st, signal; subsample=1)
+    tree = st.tree
+
+    root = first(PG.order_range(tree, 0))
+    Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, root)),
+                        ScatteringTransforms.zeroth_order(coeffs); atol=1e-10)
+
+    S1 = ScatteringTransforms.first_order(coeffs)
+    for p in PG.order_range(tree, 1)
+        j = PG.path_indices(tree, p)[1]
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, p)), S1[j]; atol=1e-8)
+    end
+
+    S2 = ScatteringTransforms.second_order(coeffs)
+    for p in PG.order_range(tree, 2)
+        idx = PG.path_indices(tree, p)
+        j1, j2 = idx[1], idx[2]
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, p)), S2[j1, j2]; atol=1e-8)
+    end
+
+    # Decimation: subsample=8 -> field length N/8, all finite. (The decimated mean is a
+    # finite-sample estimate of the full mean, not exact, so we don't assert equality here;
+    # the subsample=1 case above is the exact consistency check.)
+    sf8 = ScatteringTransforms.scattering_field(st, signal; subsample=8)
+    Test.@test size(sf8.data, 1) == N ÷ 8
+    Test.@test all(isfinite, sf8.data)
+end
+
+Test.@testset "2D localized field: mean equals averaged coefficient" begin
+    PG = ScatteringTransforms.PathGraph
+    Ny, Nx = 64, 64
+    J = 3
+    L = 4
+    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
+    image = randn(Ny, Nx)
+    coeffs = st(image)
+    sf = ScatteringTransforms.scattering_field(st, image; subsample=1)
+    tree = st.tree
+
+    root = first(PG.order_range(tree, 0))
+    Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, root)),
+                        ScatteringTransforms.zeroth_order(coeffs); atol=1e-10)
+    S1 = ScatteringTransforms.first_order(coeffs)
+    for p in PG.order_range(tree, 1)
+        j = PG.path_indices(tree, p)[1]
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, p)), S1[j]; atol=1e-8)
+    end
+    S2 = ScatteringTransforms.second_order(coeffs)
+    for p in PG.order_range(tree, 2)
+        idx = PG.path_indices(tree, p)
+        j1, j2 = idx[1], idx[2]
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, p)), S2[j1, j2]; atol=1e-8)
+    end
+
+    sf2 = ScatteringTransforms.scattering_field(st, image; subsample=2)
+    Test.@test size(sf2.data) == (Ny ÷ 2, Nx ÷ 2, PG.npaths(tree))
+    Test.@test all(isfinite, sf2.data)
+end
+
 Test.@testset "compute_shape_sparsity: shape reduction (TODO Phase 6)" begin
     # `compute_shape_sparsity` currently returns `shape` as all zeros — the anisotropy/shape
     # reduction (RWST / Cheng-Ménard s22) is not yet implemented. Recorded as broken so the

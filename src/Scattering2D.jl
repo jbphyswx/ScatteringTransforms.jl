@@ -18,6 +18,7 @@ using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Coefficients: Coefficients
 using ..PathGraph: PathGraph
+using ..ScatteringFields: ScatteringFields
 
 export ScatteringTransform2D, scattering_transform2d!
 export compute_S1_2d!, compute_S2_2d!
@@ -234,6 +235,103 @@ function compute_shape_sparsity(S1::AbstractVector{T},
     end
     
     return (sparsity=sparsity, shape=shape)
+end
+
+# ============================================================================
+# Localized (Mallat) 2D scattering field: S_p x = (|U_p x| ⋆ φ_J) ↓ s (per dim)
+# ============================================================================
+
+function _default_subsample(Ny::Int, Nx::Int, J::Int)
+    ds = 1 << max(0, J - 1)
+    while ds > 1 && (Ny % ds != 0 || Nx % ds != 0)
+        ds >>= 1
+    end
+    return ds
+end
+
+# Low-pass a real field `U` (Ny×Nx) by φ_J and decimate by `ds` per dim into `dst`.
+# Reuses buffer_input/buffer_conv; leaves buffer_signal_fft (the preserved image FFT) intact.
+@inline function _lowpass_downsample!(dst, st::ScatteringTransform2D, U::AbstractMatrix, ds::Int)
+    φ = st.filter_bank.averaging
+    @inbounds @simd for i in eachindex(U)
+        st.buffer_input[i] = complex(U[i])
+    end
+    LinearAlgebra.mul!(st.buffer_conv, st.fft_plan, st.buffer_input)        # U_fft -> buffer_conv
+    @inbounds @simd for i in eachindex(st.buffer_conv)
+        st.buffer_conv[i] *= φ[i]
+    end
+    LinearAlgebra.mul!(st.buffer_input, st.ifft_plan, st.buffer_conv)       # (U ⋆ φ) -> buffer_input
+    @inbounds for jx in 1:size(dst, 2), jy in 1:size(dst, 1)
+        dst[jy, jx] = real(st.buffer_input[(jy - 1) * ds + 1, (jx - 1) * ds + 1])
+    end
+    return dst
+end
+
+function ScatteringFields.scattering_field(st::ScatteringTransform2D, image::AbstractMatrix;
+        subsample::Int = _default_subsample(size(st.buffer_mod, 1), size(st.buffer_mod, 2),
+                                            st.filter_bank.J))
+    Ny, Nx = size(st.buffer_mod)
+    (Ny % subsample == 0 && Nx % subsample == 0) ||
+        throw(ArgumentError("subsample factor $subsample must divide both image dims ($Ny, $Nx)"))
+    T = eltype(st.buffer_mod)
+    My, Mx = Ny ÷ subsample, Nx ÷ subsample
+    npath = PathGraph.npaths(st.tree)
+    data = zeros(T, My, Mx, npath)
+    field = ScatteringFields.ScatteringField2D(st.tree, data, subsample)
+    return ScatteringFields.scattering_field!(field, st, image)
+end
+
+function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringField2D,
+        st::ScatteringTransform2D, image::AbstractMatrix)
+    tree = st.tree
+    ds = field.subsample
+    data = field.data
+
+    @inbounds @simd for i in eachindex(image)
+        st.buffer_input[i] = complex(image[i])
+    end
+    LinearAlgebra.mul!(st.buffer_signal_fft, st.fft_plan, st.buffer_input)
+
+    # order 0 (root): (x ⋆ φ_J) ↓
+    @inbounds @simd for i in eachindex(image)
+        st.buffer_mod[i] = image[i]
+    end
+    root = first(PathGraph.order_range(tree, 0))
+    _lowpass_downsample!(view(data, :, :, root), st, st.buffer_mod, ds)
+
+    # order 1
+    @inbounds for p in PathGraph.order_range(tree, 1)
+        j = PathGraph.path_indices(tree, p)[1]
+        ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft,
+            st.filter_bank.wavelets[j], st.ifft_plan, st.buffer_input)
+        ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
+        _lowpass_downsample!(view(data, :, :, p), st, st.buffer_mod, ds)
+    end
+
+    # order 2
+    if st.max_order >= 2 && length(tree.by_order) >= 3
+        num_w = length(st.filter_bank.wavelets)
+        @inbounds for (j1, ψ1_fft) in enumerate(st.filter_bank.wavelets)
+            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft, ψ1_fft,
+                st.ifft_plan, st.buffer_input)
+            ScatteringCore.apply_modulus!(st.U1_buffers[j1], st.buffer_conv)
+        end
+        @inbounds for j1 in 1:num_w
+            @simd for i in eachindex(st.U1_buffers[j1])
+                st.buffer_input[i] = complex(st.U1_buffers[j1][i])
+            end
+            LinearAlgebra.mul!(st.U1_fft_buffers[j1], st.fft_plan, st.buffer_input)
+        end
+        @inbounds for p in PathGraph.order_range(tree, 2)
+            idx = PathGraph.path_indices(tree, p)
+            j1, j2 = idx[1], idx[2]
+            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1],
+                st.filter_bank.wavelets[j2], st.ifft_plan, st.buffer_input)
+            ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
+            _lowpass_downsample!(view(data, :, :, p), st, st.buffer_mod, ds)
+        end
+    end
+    return field
 end
 
 end # module Scattering2D

@@ -44,6 +44,7 @@ include("FilterBanks.jl")
 include("ScatteringCore.jl")
 include("Coefficients.jl")
 include("PathGraph.jl")
+include("ScatteringFields.jl")
 include("Scattering1D.jl")
 include("Scattering2D.jl")
 
@@ -52,6 +53,7 @@ using .Filters: Filters
 using .FilterBanks: FilterBanks
 using .ScatteringCore: ScatteringCore
 using .PathGraph: PathGraph
+using .ScatteringFields: ScatteringFields
 using .Scattering1D: Scattering1D
 using .Scattering2D: Scattering2D
 using .Coefficients: Coefficients
@@ -63,6 +65,11 @@ const FilterBank1D = FilterBanks.FilterBank1D
 const FilterBank2D = FilterBanks.FilterBank2D
 const WaveletMeta = FilterBanks.WaveletMeta
 const ScatteringTree = PathGraph.ScatteringTree
+const ScatteringField1D = ScatteringFields.ScatteringField1D
+const ScatteringField2D = ScatteringFields.ScatteringField2D
+const path_field = ScatteringFields.path_field
+const scattering_field = ScatteringFields.scattering_field    # 1D + 2D methods added in submodules
+const scattering_field! = ScatteringFields.scattering_field!
 const Morlet1D = Filters.Morlet1D
 const Morlet2D = Filters.Morlet2D
 const ScatteringCoefficients1D = Coefficients.ScatteringCoefficients1D
@@ -94,6 +101,8 @@ export flatten1d, flatten2d
 export frequency_response
 export build_filter_bank1d, build_filter_bank2d
 export scattering_transform!, scattering_transform2d!
+export scattering_field, scattering_field!
+export ScatteringField1D, ScatteringField2D, path_field
 export compute_S1_2d!, compute_S2_2d!
 export plot_filter_bank, plot_coefficients
 
