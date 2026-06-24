@@ -202,4 +202,25 @@ export compute_S1_2d!, compute_S2_2d!
 export compute_shape_sparsity, normalized_coefficients, log_coefficients
 export plot_filter_bank, plot_coefficients
 
+# Precompile the hot paths (using the dependency-free direct-sum backend, so no weakdep is
+# required at precompile time) to cut time-to-first-transform.
+using PrecompileTools: @setup_workload, @compile_workload
+@setup_workload begin
+    @compile_workload begin
+        st1 = ScatteringTransform1D(32, 3; Q = 1, max_order = 2, spectral = :direct)
+        c1 = st1(zeros(Float64, 32))
+        flatten1d(c1)
+        scattering_field(st1, zeros(Float64, 32); subsample = 1)
+        scattering_batch(st1, zeros(Float64, 32, 2))
+        normalized_coefficients(c1)
+
+        st2 = ScatteringTransform2D((16, 16), 2; L = 4, max_order = 2, spectral = :direct)
+        c2 = st2(zeros(Float64, 16, 16))
+        compute_shape_sparsity(first_order(c2), second_order(c2), st2.filter_bank.meta)
+
+        st3 = ScatteringTransform3D((8, 8, 8), 2; n_orient = 6, max_order = 2, spectral = :direct)
+        st3(zeros(Float64, 8, 8, 8))
+    end
+end
+
 end # module

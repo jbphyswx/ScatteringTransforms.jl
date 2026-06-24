@@ -1,120 +1,93 @@
 """
     basic_usage.jl
 
-Basic demonstration of 1D and 2D scattering transforms.
-Run with: julia --project=. basic_usage.jl
+A guided tour of ScatteringTransforms.jl: averaged coefficients, the localized (Mallat) field,
+reduced descriptors, batching, multithreading, the FFTW fast path, and 3D volumes.
+Run with: `julia --project=. basic_usage.jl`
 """
 
-using ScatteringTransforms: ScatteringTransforms
+using ScatteringTransforms: ScatteringTransforms as ST
+using FFTW: FFTW                      # loading FFTW enables the O(N log N) fast path (spectral=:auto)
+using OhMyThreads: OhMyThreads        # loading this enables ThreadedCPU batched transforms
 using Statistics: Statistics
 using Test: Test
 
-println("="^60)
-println("ScatteringTransforms.jl - Basic Usage Demo")
-println("="^60)
+println("="^64)
+println("ScatteringTransforms.jl — guided tour")
+println("="^64)
 
-# ============================================================================
-# 1D Scattering Transform
-# ============================================================================
-println("\n1. 1D Scattering Transform")
-println("-"^40)
-
-# Create a test signal: sum of sine waves with noise
+# ---------------------------------------------------------------------------
+# 1. 1D averaged scattering coefficients
+# ---------------------------------------------------------------------------
+println("\n1. 1D averaged coefficients  S0=⟨x⟩, S1[λ]=⟨|x⋆ψ_λ|⟩, S2[λ1,λ2]=⟨||x⋆ψ_λ1|⋆ψ_λ2|⟩")
 N = 1024
-t = range(0, 2π, length=N)
-signal = sin.(10*t) .+ 0.5*sin.(50*t) .+ 0.1*randn(N)
+t = range(0, 2π, length = N)
+x = sin.(10 .* t) .+ 0.5 .* sin.(50 .* t) .+ 0.1 .* randn(N)
+st = ST.ScatteringTransform1D(N, 6; Q = 1, max_order = 2)   # spectral=:auto → FFTW (loaded above)
+c = st(x)
+println("   S0 = ", round(ST.zeroth_order(c), digits = 4),
+        " | S1: ", length(ST.first_order(c)), " coeffs | S2: ", size(ST.second_order(c)))
 
-println("  Signal length: $N")
-println("  Signal type: $(typeof(signal))")
+# ---------------------------------------------------------------------------
+# 2. Localized (Mallat) field — and its consistency with the averaged coefficients
+# ---------------------------------------------------------------------------
+println("\n2. Localized field  S_p x = (|U_p x| ⋆ φ_J) ↓ s   (mean over space == averaged coeff)")
+sf = ST.scattering_field(st, x; subsample = 1)
+root = first(ST.PathGraph.order_range(st.tree, 0))
+println("   mean(field[root]) = ", round(Statistics.mean(ST.path_field(sf, root)), digits = 6),
+        "   vs  S0 = ", round(ST.zeroth_order(c), digits = 6))
 
-# Build scattering transform
-st = ScatteringTransforms.ScatteringTransform1D(N, 6; Q=1, max_order=2)
-println("  Number of wavelets: $(length(st.filter_bank.wavelets))")
+# ---------------------------------------------------------------------------
+# 3. Reduced descriptors (amplitude-normalized, log)
+# ---------------------------------------------------------------------------
+println("\n3. Reduced descriptors")
+nc = ST.normalized_coefficients(c)
+println("   normalized s1 (S1/S0), first 3: ", round.(nc.s1[1:3], digits = 3))
 
-# Compute scattering coefficients
-coeffs = st(signal)
+# ---------------------------------------------------------------------------
+# 4. Batched transform — one plan + workspace reused across many signals
+# ---------------------------------------------------------------------------
+println("\n4. Batched transform (plan + workspace reused)")
+X = randn(N, 64)
+coeffs_batch = ST.scattering_batch(st, X)
+println("   scattering_batch(st, $(size(X))) → ", size(coeffs_batch), " (coeffs × batch)")
+threaded = ST.scattering_batch(ST.ThreadedCPU(), st, X)
+println("   threaded == serial: ", threaded ≈ coeffs_batch)
 
-# Display results
-println("\n  Results:")
-println("    S0 (average): $(coeffs.S0)")
-println("    S1 (first order): $(length(coeffs.S1)) coefficients")
-println("    S2 (second order): $(size(coeffs.S2)) matrix")
-println("    S1 range: [$(minimum(coeffs.S1)), $(maximum(coeffs.S1))]")
+# ---------------------------------------------------------------------------
+# 5. 2D oriented scattering + anisotropy / sparsity
+# ---------------------------------------------------------------------------
+println("\n5. 2D scattering + reduced sparsity/shape")
+M = 128
+xs = range(0, 8π, length = M)'
+oriented = repeat(sin.(xs), M, 1)                  # horizontal stripes → anisotropic
+st2 = ST.ScatteringTransform2D((M, M), 3; L = 8, max_order = 2)
+c2 = st2(oriented)
+red = ST.compute_shape_sparsity(ST.first_order(c2), ST.second_order(c2), st2.filter_bank.meta)
+println("   max sparsity s21 = ", round(maximum(red.sparsity), digits = 4),
+        " | max |shape s22| = ", round(maximum(abs, red.shape), digits = 4), " (≠0 ⇒ oriented)")
 
-# ============================================================================
-# Zero-Allocation Streaming (Performance Critical)
-# ============================================================================
-println("\n2. Zero-Allocation Streaming Demo")
-println("-"^40)
+# ---------------------------------------------------------------------------
+# 6. 3D volumetric scattering
+# ---------------------------------------------------------------------------
+println("\n6. 3D volumetric scattering")
+st3 = ST.ScatteringTransform3D((16, 16, 16), 2; n_orient = 6, max_order = 2)
+c3 = st3(randn(16, 16, 16))
+println("   3D S1: ", length(ST.first_order(c3)), " coeffs (J × n_orient)")
 
-# Pre-allocate once
-num_w = length(st.filter_bank.wavelets)
-coeffs_reused = ScatteringTransforms.ScatteringCoefficients1D(num_w, Float64; compute_S2=true)
+# ---------------------------------------------------------------------------
+# 7. Element types: Float32 end-to-end
+# ---------------------------------------------------------------------------
+stf = ST.ScatteringTransform1D(N, 6; Q = 1, max_order = 2, T = Float32)
+cf = stf(Float32.(x))
+println("\n7. Float32 in → ", eltype(ST.first_order(cf)), " out")
 
-# Simulate streaming over 100 signals
-n_signals = 100
-println("  Processing $n_signals signals with zero allocation...")
-
-for i in 1:n_signals
-    signal_i = randn(N)  # Simulated data
-    coeffs_reused = ScatteringTransforms.scattering_transform!(coeffs_reused, st, signal_i)
-    # coeffs_reused now contains results, S1/S2 arrays reused
+# light sanity checks so the example doubles as a smoke test
+Test.@testset "basic_usage smoke" begin
+    Test.@test ST.zeroth_order(c) ≈ Statistics.mean(x)
+    Test.@test Statistics.mean(ST.path_field(sf, root)) ≈ ST.zeroth_order(c) atol = 1e-8
+    Test.@test threaded ≈ coeffs_batch
+    Test.@test eltype(ST.first_order(cf)) == Float32
 end
 
-println("  Completed! Only ~32 bytes allocated per iteration (wrapper struct)")
-println("  Arrays S1/S2: ZERO allocation (reused)")
-
-# ============================================================================
-# 2D Scattering Transform
-# ============================================================================
-println("\n3. 2D Scattering Transform")
-println("-"^40)
-
-# Create a test image: texture with different scales
-M = 128
-x = range(0, 4π, length=M)
-y = range(0, 4π, length=M)
-X = [sin(2*xi) * cos(3*yi) + 0.1*randn() for xi in x, yi in y]
-
-println("  Image size: $(size(X))")
-
-# Build 2D scattering transform
-st2d = ScatteringTransforms.ScatteringTransform2D((M, M), 3; L=4, max_order=2)
-println("  Scales (J): $(st2d.filter_bank.J)")
-println("  Orientations (L): $(st2d.filter_bank.L)")
-println("  Total wavelets: $(length(st2d.filter_bank.wavelets))")
-
-# Compute 2D scattering coefficients
-coeffs_2d = st2d(X)
-
-println("\n  Results:")
-println("    S0 (average): $(coeffs_2d.S0)")
-println("    S1 (first order): $(length(coeffs_2d.S1)) coefficients")
-println("    S2 (second order): $(size(coeffs_2d.S2)) matrix")
-
-# ============================================================================
-# Float32 Support (GPU-Ready)
-# ============================================================================
-println("\n4. Float32 Support (GPU-Ready)")
-println("-"^40)
-
-signal_f32 = Float32.(signal)
-st_f32 = ScatteringTransforms.ScatteringTransform1D(N, 6; Q=1, max_order=2, T=Float32)
-coeffs_f32 = st_f32(signal_f32)
-
-println("  Signal type: $(typeof(signal_f32))")
-println("  Coefficient type: $(eltype(coeffs_f32.S1))")
-println("  S0: $(coeffs_f32.S0)")
-
-# ============================================================================
-# Summary
-# ============================================================================
-println("\n" * "="^60)
-println("Summary")
-println("="^60)
-println("  - 1D scattering: ✓ Working")
-println("  - 2D scattering: ✓ Working")
-println("  - Zero-allocation streaming: ✓ Working")
-println("  - Float32 support: ✓ Working (GPU-ready)")
-println("  - Multiple dispatch S0: ✓ Working")
-println("="^60)
+println("\n", "="^64, "\nDone.\n", "="^64)
