@@ -168,4 +168,49 @@ function ScatteringTransforms.Scattering2D.ScatteringTransform2D(
     )
 end
 
+"""
+    ScatteringTransform3D(N, J, device::CUDA.CuDevice; n_orient=6, max_order=2, T=Float32)
+
+GPU constructor for the 3D volumetric scattering transform (CuArray filter bank + workspace,
+CUFFT plan).
+"""
+function ScatteringTransforms.Scattering3D.ScatteringTransform3D(
+    N::NTuple{3,Int}, J::Int, device::CUDA.CuDevice;
+    n_orient::Int=6, max_order::Int=2, T::Type=Float32,
+)
+    cpu_fb = ScatteringTransforms.FilterBanks.build_filter_bank3d(N, J; n_orient=n_orient, T=T)
+    cu_wavelets = [CUDA.CuArray{Complex{T},3}(ψ) for ψ in cpu_fb.wavelets]
+    cu_avg = CUDA.CuArray{Complex{T},3}(cpu_fb.averaging)
+    A_fb = typeof(cu_avg)
+    filter_bank = ScatteringTransforms.FilterBanks.FilterBank3D{T, A_fb}(
+        cu_wavelets, cu_avg, cpu_fb.meta, cpu_fb.J, cpu_fb.n_orient
+    )
+    tree = ScatteringTransforms.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+
+    plan = _cufft_plan(T, N)
+
+    num_w = length(filter_bank.wavelets)
+    buffer_input = CUDA.zeros(Complex{T}, N)
+    buffer_conv  = CUDA.zeros(Complex{T}, N)
+    buffer_mod   = CUDA.zeros(T, N)
+
+    if max_order >= 2
+        U1_buffers     = [CUDA.zeros(T, N) for _ in 1:num_w]
+        U1_fft_buffers = [CUDA.zeros(Complex{T}, N) for _ in 1:num_w]
+    else
+        U1_buffers     = CUDA.CuArray{T,3}[]
+        U1_fft_buffers = CUDA.CuArray{Complex{T},3}[]
+    end
+
+    buffer_signal_fft = CUDA.zeros(Complex{T}, N)
+    M_type = typeof(buffer_conv)
+    R_type = typeof(buffer_mod)
+    return ScatteringTransforms.Scattering3D.ScatteringTransform3D{
+        T, M_type, R_type, typeof(plan), typeof(tree)}(
+        filter_bank, tree, max_order, plan,
+        buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
+        U1_buffers, U1_fft_buffers,
+    )
+end
+
 end # module ScatteringTransformsCUDAExt

@@ -9,6 +9,7 @@ using ScatteringTransforms: ScatteringTransforms
 using FFTW: FFTW
 using OhMyThreads: OhMyThreads
 using Distributed: Distributed
+using MPI: MPI
 using Statistics: Statistics
 
 # Run Aqua quality tests first
@@ -30,6 +31,7 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
         :ScatteringTransformsNUFSHTExt,
         :ScatteringTransformsOhMyThreadsExt,
         :ScatteringTransformsDistributedExt,
+        :ScatteringTransformsMPIExt,
     )
         ext = Base.get_extension(ScatteringTransforms, extname)
         ext === nothing && continue
@@ -571,6 +573,23 @@ Test.@testset "Distributed batch (single process) matches serial" begin
     st2 = ScatteringTransforms.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
     X2 = randn(24, 24, 5)
     Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.DistributedBackend(), st2, X2) ≈
+               ScatteringTransforms.scattering_batch(st2, X2)
+end
+
+Test.@testset "MPI batch (single rank) matches serial" begin
+    # SPMD: each rank computes its column block and Allgatherv combines them. With a single rank
+    # (no mpiexec needed) the result must equal the serial batch. Multi-rank verification is for
+    # `mpiexec -n k` on the user's cluster.
+    MPI.Initialized() || MPI.Init()
+    N = 96
+    J = 4
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    X = randn(N, 6)
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.MPIBackend(), st, X) ≈
+               ScatteringTransforms.scattering_batch(st, X)
+    st2 = ScatteringTransforms.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
+    X2 = randn(24, 24, 5)
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.MPIBackend(), st2, X2) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
 end
 
