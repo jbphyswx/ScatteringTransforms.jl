@@ -198,6 +198,16 @@ function scattering_batch(b::Backends.AbstractExecutionBackend, st, X)
         "(ThreadedBackend), `using Distributed` (DistributedBackend), or `using MPI` (MPIBackend)."))
 end
 
+# Spherical scattering on S² (scattered points); method added by the NUFSHT extension.
+"""
+    spherical_scattering(pts_theta, pts_phi, lmax, J; max_order=2)
+
+Build a spherical scattering transform for a scalar field at scattered points `(θ, φ)` on S²,
+using smooth difference-of-Gaussians band-pass wavelets. Requires `using NUFSHT`.
+"""
+spherical_scattering(args...; kwargs...) = throw(ArgumentError(
+    "spherical scattering requires the NUFSHT extension — run `using NUFSHT`."))
+
 # Plotting stubs (implemented in ScatteringTransformsCairoMakieExt)
 function plot_filter_bank end
 function plot_coefficients end
@@ -222,6 +232,7 @@ export scattering_field, scattering_field!
 export ScatteringField1D, ScatteringField2D, path_field
 export compute_S1_2d!, compute_S2_2d!
 export compute_shape_sparsity, normalized_coefficients, log_coefficients
+export spherical_scattering
 export plot_filter_bank, plot_coefficients
 
 # Precompile the hot paths (using the dependency-free direct-sum backend, so no weakdep is

@@ -10,6 +10,7 @@ using FFTW: FFTW
 using OhMyThreads: OhMyThreads
 using Distributed: Distributed
 using MPI: MPI
+using NUFSHT: NUFSHT
 using Statistics: Statistics
 
 # Run Aqua quality tests first
@@ -32,6 +33,7 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
         :ScatteringTransformsOhMyThreadsExt,
         :ScatteringTransformsDistributedExt,
         :ScatteringTransformsMPIExt,
+        :ScatteringTransformsNUFSHTExt,
     )
         ext = Base.get_extension(ScatteringTransforms, extname)
         ext === nothing && continue
@@ -482,6 +484,28 @@ Test.@testset "3D volumetric scattering transform" begin
                         ScatteringTransforms.first_order(st_f(vol)); rtol=1e-6)
     Test.@test isapprox(ScatteringTransforms.second_order(st_d(vol)),
                         ScatteringTransforms.second_order(st_f(vol)); rtol=1e-6)
+end
+
+Test.@testset "Spherical scattering (NUFSHT, smooth difference-of-Gaussians bands)" begin
+    lmax = 24
+    J = 3
+    M = 400
+    θ = acos.(2 .* rand(M) .- 1)   # uniform in cos θ
+    φ = 2π .* rand(M)
+    st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J)
+    field = randn(M)
+    res = st(field)
+
+    Test.@test res.S0 ≈ Statistics.mean(field)
+    Test.@test length(res.S1) == J
+    Test.@test all(res.S1 .>= 0)
+    Test.@test size(res.S2) == (J, J)
+    # second order only for strictly coarser j2 < j1 ⇒ diagonal + upper triangle are exactly zero
+    for j1 in 1:J, j2 in j1:J
+        Test.@test res.S2[j1, j2] == 0
+    end
+    Test.@test any(res.S2[j1, j2] > 0 for j1 in 1:J for j2 in 1:(j1 - 1))
+    Test.@test all(isfinite, res.S1)
 end
 
 Test.@testset "3D Morlet wavelet: analytic + zero-mean" begin
