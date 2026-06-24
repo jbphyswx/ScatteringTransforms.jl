@@ -167,6 +167,28 @@ function scattering_batch(st::ScatteringTransform2D, X::AbstractArray{<:Any,3})
     return out
 end
 
+# Serializable build spec for reconstructing a transform on a remote worker (FFTW/CUFFT plans
+# are not serializable, so distributed workers rebuild rather than receive the transform).
+_spectral_sym(st) = st.plan isa Plans.DirectSumPlan ? :direct : :fftw
+transform_spec(st::ScatteringTransform1D) =
+    (kind = :st1d, N = length(st.buffer_mod), J = st.filter_bank.J, Q = st.filter_bank.Q,
+     max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)), spectral = _spectral_sym(st))
+transform_spec(st::ScatteringTransform2D) =
+    (kind = :st2d, N = size(st.buffer_mod), J = st.filter_bank.J, L = st.filter_bank.L,
+     max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)), spectral = _spectral_sym(st))
+
+function rebuild_transform(spec)
+    if spec.kind === :st1d
+        return ScatteringTransform1D(spec.N, spec.J; Q = spec.Q, max_order = spec.max_order,
+                                     T = spec.T, spectral = spec.spectral)
+    elseif spec.kind === :st2d
+        return ScatteringTransform2D(spec.N, spec.J; L = spec.L, max_order = spec.max_order,
+                                     T = spec.T, spectral = spec.spectral)
+    else
+        throw(ArgumentError("unknown transform spec kind $(spec.kind)"))
+    end
+end
+
 # Backend-dispatched batched transforms. Serial runs in-process; ThreadedBackend / Distributed /
 # MPI methods are added by the corresponding extensions (per-task/per-worker workspace).
 scattering_batch(::Backends.SerialBackend, st, X) = scattering_batch(st, X)

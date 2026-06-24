@@ -10,6 +10,7 @@ PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 [weakdeps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
@@ -19,6 +20,7 @@ OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 [extensions]
 ScatteringTransformsCUDAExt = "CUDA"
 ScatteringTransformsCairoMakieExt = "CairoMakie"
+ScatteringTransformsDistributedExt = "Distributed"
 ScatteringTransformsFFTWExt = "FFTW"
 ScatteringTransformsKernelAbstractionsExt = "KernelAbstractions"
 ScatteringTransformsNUFSHTExt = ["NUFSHT", "FastSphericalHarmonics"]
@@ -27,6 +29,7 @@ ScatteringTransformsOhMyThreadsExt = "OhMyThreads"
 [compat]
 CUDA = "5"
 CairoMakie = "0.15"
+Distributed = "1"
 FFTW = "1"
 FastSphericalHarmonics = "1"
 KernelAbstractions = "0.9"

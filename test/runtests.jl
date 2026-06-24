@@ -8,6 +8,7 @@ using ExplicitImports: ExplicitImports as EI
 using ScatteringTransforms: ScatteringTransforms
 using FFTW: FFTW
 using OhMyThreads: OhMyThreads
+using Distributed: Distributed
 using Statistics: Statistics
 
 # Run Aqua quality tests first
@@ -28,6 +29,7 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
         :ScatteringTransformsKernelAbstractionsExt,
         :ScatteringTransformsNUFSHTExt,
         :ScatteringTransformsOhMyThreadsExt,
+        :ScatteringTransformsDistributedExt,
     )
         ext = Base.get_extension(ScatteringTransforms, extname)
         ext === nothing && continue
@@ -552,6 +554,23 @@ Test.@testset "Threaded batch (OhMyThreads) matches serial batch" begin
     st2 = ScatteringTransforms.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
     X2 = randn(24, 24, 5)
     Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.ThreadedBackend(), st2, X2) ≈
+               ScatteringTransforms.scattering_batch(st2, X2)
+end
+
+Test.@testset "Distributed batch (single process) matches serial" begin
+    # DistributedBackend distributes batch columns across workers; each worker rebuilds the
+    # transform from a spec (plans aren't serializable) and runs the inner backend. With no
+    # added workers, pmap runs locally and must equal the serial batch.
+    N = 96
+    J = 4
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    X = randn(N, 6)
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.DistributedBackend(), st, X) ≈
+               ScatteringTransforms.scattering_batch(st, X)
+
+    st2 = ScatteringTransforms.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
+    X2 = randn(24, 24, 5)
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.DistributedBackend(), st2, X2) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
 end
 
