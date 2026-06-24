@@ -12,8 +12,8 @@ using LinearAlgebra: LinearAlgebra
 # Import Filters submodule
 using ..Filters: Filters
 
-export FilterBank1D, FilterBank2D
-export build_filter_bank1d, build_filter_bank2d
+export FilterBank1D, FilterBank2D, FilterBank3D
+export build_filter_bank1d, build_filter_bank2d, build_filter_bank3d
 export averaging_filter
 export WaveletMeta
 
@@ -214,6 +214,72 @@ function averaging_filter2d(N::NTuple{2,Int}, J::Int, ::Type{T}=Float64) where {
             ky = T(_fftfreq(Ny, iy - 1))
             k  = sqrt(kx^2 + ky^2)
             ϕ[iy, ix] = Complex{T}(exp(-(k * inv_s)^2 * inv2))
+        end
+    end
+    return ϕ
+end
+
+"""
+    FilterBank3D{T,A<:AbstractArray{Complex{T},3}}
+
+Complete 3D oriented Morlet filter bank: `J` scales × `n_orient` sphere directions, plus a
+low-pass averaging filter.
+"""
+struct FilterBank3D{T,A<:AbstractArray{Complex{T},3}}
+    wavelets::Vector{A}
+    averaging::A
+    meta::Vector{WaveletMeta{T}}
+    J::Int
+    n_orient::Int
+end
+
+"""
+    build_filter_bank3d(N::NTuple{3,Int}, J::Int; n_orient::Int=6, T=Float64) -> FilterBank3D
+
+Build a 3D oriented Morlet filter bank with `J` dyadic scales and `n_orient` near-uniform
+orientations on the sphere (Fibonacci spiral).
+"""
+function build_filter_bank3d(N::NTuple{3,Int}, J::Int; n_orient::Int=6, T::Type{<:Real}=Float64)
+    dirs = Filters.fibonacci_directions(n_orient, T)
+    morlet = Filters.Morlet3D{T}(N, 0, dirs[1])
+    ψ_sample = Filters.frequency_response(morlet)
+    A = typeof(ψ_sample)
+
+    wavelets = Vector{A}(undef, 0)
+    meta = Vector{WaveletMeta{T}}(undef, 0)
+    for j in 0:(J - 1)
+        for (o, d) in enumerate(dirs)
+            morlet = Filters.Morlet3D{T}(N, j, d)
+            push!(wavelets, Filters.frequency_response(morlet))
+            push!(meta, WaveletMeta{T}(j, 0, o - 1, T(j), morlet.center_freq, zero(T)))
+        end
+    end
+    ϕ = averaging_filter3d(N, J, T)
+    return FilterBank3D{T,A}(wavelets, ϕ, meta, J, n_orient)
+end
+
+"""
+    averaging_filter3d(N::NTuple{3,Int}, J::Int, ::Type{T}=Float64) -> Array{Complex{T},3}
+
+Build a radially-symmetric 3D low-pass averaging filter.
+"""
+function averaging_filter3d(N::NTuple{3,Int}, J::Int, ::Type{T}=Float64) where {T<:Real}
+    Nz, Ny, Nx = N
+    xi_J  = T(0.5) / T(2.0)^(J - 1)
+    sigma = xi_J * T(0.8)
+    inv2  = inv(T(2))
+    inv_s = inv(sigma)
+
+    ϕ = Array{Complex{T},3}(undef, Nz, Ny, Nx)
+    @inbounds for ix in 1:Nx
+        kx = T(_fftfreq(Nx, ix - 1))
+        for iy in 1:Ny
+            ky = T(_fftfreq(Ny, iy - 1))
+            for iz in 1:Nz
+                kz = T(_fftfreq(Nz, iz - 1))
+                k = sqrt(kx^2 + ky^2 + kz^2)
+                ϕ[iz, iy, ix] = Complex{T}(exp(-(k * inv_s)^2 * inv2))
+            end
         end
     end
     return ϕ

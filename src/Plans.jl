@@ -143,4 +143,25 @@ forward_transform!(out::AbstractMatrix, p::DirectSumPlan{T,V,2}, x::AbstractMatr
 inverse_transform!(out::AbstractMatrix, p::DirectSumPlan{T,V,2}, x::AbstractMatrix) where {T,V} =
     _dft2!(out, x, p, true)
 
+# 3D separable: ping-pong between `out` and `scratch` so the result lands in `out`
+# (A → out [dim1], out → scratch [dim2], scratch → out [dim3]).
+function _dft3!(out, x, p::DirectSumPlan{T,V,3}, inverse::Bool) where {T,V}
+    n1, n2, n3 = p.dims
+    sc = p.scratch
+    @inbounds for j3 in 1:n3, j2 in 1:n2
+        _dft1!(view(out, :, j2, j3), view(x, :, j2, j3), p.twiddle[1], n1, inverse)
+    end
+    @inbounds for j3 in 1:n3, j1 in 1:n1
+        _dft1!(view(sc, j1, :, j3), view(out, j1, :, j3), p.twiddle[2], n2, inverse)
+    end
+    @inbounds for j2 in 1:n2, j1 in 1:n1
+        _dft1!(view(out, j1, j2, :), view(sc, j1, j2, :), p.twiddle[3], n3, inverse)
+    end
+    return out
+end
+forward_transform!(out::AbstractArray{<:Any,3}, p::DirectSumPlan{T,V,3}, x::AbstractArray{<:Any,3}) where {T,V} =
+    _dft3!(out, x, p, false)
+inverse_transform!(out::AbstractArray{<:Any,3}, p::DirectSumPlan{T,V,3}, x::AbstractArray{<:Any,3}) where {T,V} =
+    _dft3!(out, x, p, true)
+
 end # module Plans

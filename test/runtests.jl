@@ -447,6 +447,49 @@ Test.@testset "2D Scattering Transform Tests" begin
     Test.@test size(S2) == (J * L, J * L)
 end
 
+Test.@testset "3D volumetric scattering transform" begin
+    N = (16, 16, 16)
+    J = 2
+    n_orient = 6
+    st = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2)
+    vol = randn(N...)
+    coeffs = st(vol)
+
+    Test.@test isapprox(ScatteringTransforms.zeroth_order(coeffs), Statistics.mean(vol); atol=1e-10)
+    S1 = ScatteringTransforms.first_order(coeffs)
+    Test.@test length(S1) == J * n_orient
+    Test.@test all(S1 .>= 0)
+    S2 = ScatteringTransforms.second_order(coeffs)
+    Test.@test size(S2) == (J * n_orient, J * n_orient)
+    Test.@test Statistics.maximum(S2) > 0
+
+    # second-order paths are scale-increasing only
+    meta = st.filter_bank.meta
+    PG = ScatteringTransforms.PathGraph
+    for p in PG.order_range(st.tree, 2)
+        i1, i2 = PG.path_indices(st.tree, p)
+        Test.@test meta[i2].scale > meta[i1].scale
+    end
+
+    # in-core direct sum matches the FFTW fast path in 3D
+    st_d = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=:direct)
+    st_f = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=:fftw)
+    Test.@test isapprox(ScatteringTransforms.first_order(st_d(vol)),
+                        ScatteringTransforms.first_order(st_f(vol)); rtol=1e-6)
+    Test.@test isapprox(ScatteringTransforms.second_order(st_d(vol)),
+                        ScatteringTransforms.second_order(st_f(vol)); rtol=1e-6)
+end
+
+Test.@testset "3D Morlet wavelet: analytic + zero-mean" begin
+    N = (16, 16, 16)
+    dirs = ScatteringTransforms.Filters.fibonacci_directions(6, Float64)
+    m = ScatteringTransforms.Morlet3D(N, 1, dirs[1])
+    ψ = ScatteringTransforms.frequency_response(m)
+    Test.@test size(ψ) == N
+    Test.@test abs(ψ[1, 1, 1]) < 1e-10            # zero mean (DC)
+    Test.@test all(isfinite, ψ)
+end
+
 Test.@testset "Translation invariance (approximate)" begin
     N = 256
     J = 4

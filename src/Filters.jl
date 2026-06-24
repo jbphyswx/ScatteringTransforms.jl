@@ -6,8 +6,9 @@ module Filters
 Implements Morlet wavelets in the frequency domain for FFT-based convolutions.
 """
 
-export Morlet1D, Morlet2D
+export Morlet1D, Morlet2D, Morlet3D
 export frequency_response, gaussian_window, plane_wave
+export fibonacci_directions
 
 """
     Morlet1D{T<:Real}
@@ -187,6 +188,100 @@ function frequency_response(m::Morlet2D{T}) where T<:Real
     end
     
     return Ψ
+end
+
+"""
+    Morlet3D{T<:Real}
+
+3D oriented Morlet wavelet in the frequency domain, a bump centered at `k₀ n̂` for a unit
+direction `n̂` on the sphere, with an anisotropic Gaussian envelope (std `σ∥` along `n̂`,
+`σ⊥ = σ∥/elongation` perpendicular) and analytic on the half-space `k·n̂ ≥ 0`.
+
+# Fields
+- `center_freq::T`: `|k₀|`
+- `sigma_par::T`, `sigma_perp::T`: real-space envelope widths along / perpendicular to `n̂`
+- `direction::NTuple{3,T}`: unit orientation `n̂`
+- `beta::T`: zero-mean correction
+- `N::NTuple{3,Int}`: grid dimensions
+"""
+struct Morlet3D{T<:Real}
+    center_freq::T
+    sigma_par::T
+    sigma_perp::T
+    direction::NTuple{3,T}
+    beta::T
+    N::NTuple{3,Int}
+
+    function Morlet3D{T}(N::NTuple{3,Int}, j::Int, direction::NTuple{3,Real};
+                         sigma0::T=T(0.8), elongation::T=T(4.0)) where T<:Real
+        scale = T(2.0)^j
+        sigma_par = sigma0 * scale
+        sigma_perp = sigma_par / elongation
+        k0 = T(3π) / (T(4) * scale)
+        # normalize the direction
+        nx, ny, nz = T(direction[1]), T(direction[2]), T(direction[3])
+        nrm = Base.sqrt(nx^2 + ny^2 + nz^2)
+        n̂ = (nx / nrm, ny / nrm, nz / nrm)
+        β = exp(-(sigma_par * k0)^2 / T(2))
+        new{T}(k0, sigma_par, sigma_perp, n̂, β, N)
+    end
+end
+
+Morlet3D(N::NTuple{3,Int}, j::Int, direction; kwargs...) =
+    Morlet3D{Float64}(N, j, direction; kwargs...)
+
+"""
+    frequency_response(m::Morlet3D{T}) -> Array{Complex{T},3}
+
+3D frequency response `Ψ(kx,ky,kz)` of an oriented Morlet wavelet.
+"""
+function frequency_response(m::Morlet3D{T}) where T<:Real
+    Nz, Ny, Nx = m.N
+    k0 = m.center_freq
+    σpar2 = m.sigma_par^2
+    σperp2 = m.sigma_perp^2
+    nx, ny, nz = m.direction
+    β = m.beta
+    inv2 = inv(T(2))
+
+    Ψ = Array{Complex{T},3}(undef, Nz, Ny, Nx)
+    @inbounds for ix in 1:Nx
+        kx = T(_fftfreq(Nx, ix - 1)) * T(2π)
+        for iy in 1:Ny
+            ky = T(_fftfreq(Ny, iy - 1)) * T(2π)
+            for iz in 1:Nz
+                kz = T(_fftfreq(Nz, iz - 1)) * T(2π)
+                kpar = kx * nx + ky * ny + kz * nz
+                if kpar < 0
+                    Ψ[iz, iy, ix] = zero(Complex{T})
+                else
+                    kperp2 = kx^2 + ky^2 + kz^2 - kpar^2
+                    env = exp(-((kpar - k0)^2 * σpar2 + kperp2 * σperp2) * inv2)
+                    cen = exp(-(kpar^2 * σpar2 + kperp2 * σperp2) * inv2)
+                    Ψ[iz, iy, ix] = Complex{T}(env - β * cen)
+                end
+            end
+        end
+    end
+    return Ψ
+end
+
+"""
+    fibonacci_directions(n, ::Type{T}=Float64) -> Vector{NTuple{3,T}}
+
+`n` near-uniform unit directions on the sphere (Fibonacci spiral), used as 3D wavelet
+orientations.
+"""
+function fibonacci_directions(n::Int, ::Type{T}=Float64) where {T<:Real}
+    ϕ = T(π) * (T(3) - Base.sqrt(T(5)))   # golden angle
+    dirs = Vector{NTuple{3,T}}(undef, n)
+    @inbounds for i in 0:(n - 1)
+        z = T(1) - T(2) * (T(i) + T(0.5)) / T(n)
+        r = Base.sqrt(max(zero(T), T(1) - z^2))
+        θ = ϕ * T(i)
+        dirs[i + 1] = (r * Base.cos(θ), r * Base.sin(θ), z)
+    end
+    return dirs
 end
 
 """

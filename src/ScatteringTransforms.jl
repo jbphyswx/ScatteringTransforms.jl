@@ -47,6 +47,7 @@ include("PathGraph.jl")
 include("ScatteringFields.jl")
 include("Scattering1D.jl")
 include("Scattering2D.jl")
+include("Scattering3D.jl")
 include("Reductions.jl")
 
 # Import submodules using X: X pattern
@@ -60,14 +61,20 @@ using .PathGraph: PathGraph
 using .ScatteringFields: ScatteringFields
 using .Scattering1D: Scattering1D
 using .Scattering2D: Scattering2D
+using .Scattering3D: Scattering3D
 using .Coefficients: Coefficients
 using .Reductions: Reductions
 
 # Re-export key types from submodules (using X: X pattern)
 const ScatteringTransform1D = Scattering1D.ScatteringTransform1D
 const ScatteringTransform2D = Scattering2D.ScatteringTransform2D
+const ScatteringTransform3D = Scattering3D.ScatteringTransform3D
 const FilterBank1D = FilterBanks.FilterBank1D
 const FilterBank2D = FilterBanks.FilterBank2D
+const FilterBank3D = FilterBanks.FilterBank3D
+const Morlet3D = Filters.Morlet3D
+const build_filter_bank3d = FilterBanks.build_filter_bank3d
+const scattering_transform3d! = Scattering3D.scattering_transform3d!
 const WaveletMeta = FilterBanks.WaveletMeta
 const ScatteringTree = PathGraph.ScatteringTree
 # Backend taxonomy
@@ -173,13 +180,14 @@ end
 function plot_filter_bank end
 function plot_coefficients end
 
-export ScatteringTransform1D, ScatteringTransform2D
-export FilterBank1D, FilterBank2D
+export ScatteringTransform1D, ScatteringTransform2D, ScatteringTransform3D
+export FilterBank1D, FilterBank2D, FilterBank3D
+export build_filter_bank3d, scattering_transform3d!
 export WaveletMeta, ScatteringTree
 export SerialCPU, ThreadedCPU, GPUBackend, AutoBackend, Distributed, MPI
 export Line1D, Plane2D, Volume3D, Sphere
 export DirectSumPlan, AbstractScatteringPlan, forward_transform!, inverse_transform!
-export Morlet1D, Morlet2D
+export Morlet1D, Morlet2D, Morlet3D
 export ScatteringCoefficients1D, ScatteringCoefficients2D
 export zeroth_order, first_order, second_order
 export flatten1d, flatten2d
