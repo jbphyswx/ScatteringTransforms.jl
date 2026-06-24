@@ -7,6 +7,7 @@ using ExplicitImports: ExplicitImports as EI
 # Use the required import style: using X: X
 using ScatteringTransforms: ScatteringTransforms
 using FFTW: FFTW
+using OhMyThreads: OhMyThreads
 using Statistics: Statistics
 
 # Run Aqua quality tests first
@@ -26,6 +27,7 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
         :ScatteringTransformsFFTWExt,
         :ScatteringTransformsKernelAbstractionsExt,
         :ScatteringTransformsNUFSHTExt,
+        :ScatteringTransformsOhMyThreadsExt,
     )
         ext = Base.get_extension(ScatteringTransforms, extname)
         ext === nothing && continue
@@ -491,6 +493,23 @@ Test.@testset "Batched transforms reuse the plan and match per-signal results" b
     for b in 1:4
         Test.@test isapprox(B2[:, b], ScatteringTransforms.flatten2d(st2(view(X2, :, :, b))); rtol=1e-10)
     end
+end
+
+Test.@testset "Threaded batch (OhMyThreads) matches serial batch" begin
+    # ThreadedCPU parallelizes scattering_batch over the batch; each task uses its own
+    # workspace, so results must be identical to the serial batch.
+    N = 96
+    J = 4
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    X = randn(N, 6)
+    serial = ScatteringTransforms.scattering_batch(st, X)
+    threaded = ScatteringTransforms.scattering_batch(ScatteringTransforms.ThreadedCPU(), st, X)
+    Test.@test threaded ≈ serial
+
+    st2 = ScatteringTransforms.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
+    X2 = randn(24, 24, 5)
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.ThreadedCPU(), st2, X2) ≈
+               ScatteringTransforms.scattering_batch(st2, X2)
 end
 
 Test.@testset "Spectral plans: in-core direct sum matches FFTW fast path" begin

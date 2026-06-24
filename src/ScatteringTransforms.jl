@@ -155,6 +155,15 @@ function scattering_batch(st::ScatteringTransform2D, X::AbstractArray{<:Any,3})
     return out
 end
 
+# Backend-dispatched batched transforms. Serial runs in-process; ThreadedCPU/Distributed/MPI
+# methods are added by the corresponding extensions (per-task/per-worker workspace).
+scattering_batch(::Backends.SerialCPU, st, X) = scattering_batch(st, X)
+function scattering_batch(b::Backends.AbstractBackend, st, X)
+    throw(ArgumentError(
+        "scattering_batch on backend $(typeof(b)) is not loaded — run `using OhMyThreads` " *
+        "(ThreadedCPU), `using Distributed` (Distributed), or `using MPI` (MPI)."))
+end
+
 # Plotting stubs (implemented in ScatteringTransformsCairoMakieExt)
 function plot_filter_bank end
 function plot_coefficients end

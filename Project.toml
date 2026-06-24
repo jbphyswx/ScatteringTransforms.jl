@@ -13,6 +13,7 @@ FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
+OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 
 [extensions]
 ScatteringTransformsCUDAExt = "CUDA"
@@ -20,6 +21,7 @@ ScatteringTransformsCairoMakieExt = "CairoMakie"
 ScatteringTransformsFFTWExt = "FFTW"
 ScatteringTransformsKernelAbstractionsExt = "KernelAbstractions"
 ScatteringTransformsNUFSHTExt = ["NUFSHT", "FastSphericalHarmonics"]
+ScatteringTransformsOhMyThreadsExt = "OhMyThreads"
 
 [compat]
 CUDA = "5"
@@ -29,6 +31,7 @@ FastSphericalHarmonics = "1"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1"
 NUFSHT = "0.1"
+OhMyThreads = "0.7, 0.8"
 julia = "1.11"
 
 [workspace]
