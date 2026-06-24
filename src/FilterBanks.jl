@@ -14,12 +14,60 @@ using ..Filters: Filters
 
 export FilterBank1D, FilterBank2D, FilterBank3D
 export build_filter_bank1d, build_filter_bank2d, build_filter_bank3d
-export averaging_filter
 export WaveletMeta
 
 # Inline fftfreq for a single 0-indexed bin — no allocation.
 # Mirrors FFTW.fftfreq(N)[k+1].
 @inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
+
+"""
+    _complement_lowpass(wavelets) -> averaging filter φ
+
+Build the scaling function (low-pass averaging filter) as the *complement* of the wavelet
+energy: `|φ(ω)|² = max(0, 1 − Σⱼ|ψⱼ(ω)|²)`. This makes the Littlewood–Paley sum
+`Σⱼ|ψⱼ|² + |φ|² ≡ 1` a (near) tight frame, so the transform is non-expansive (no frequency is
+amplified). The DC bin is pinned to `φ(0)=1` exactly (the wavelets are zero-mean there), which
+keeps the localized-field spatial mean equal to the globally-averaged coefficient.
+Works for 1D/2D/3D filter arrays.
+"""
+function _complement_lowpass(wavelets::Vector{A}) where {T, A<:AbstractArray{Complex{T}}}
+    ϕ = similar(first(wavelets))
+    @inbounds for i in eachindex(ϕ)
+        s = zero(T)
+        for ψ in wavelets
+            s += abs2(ψ[i])
+        end
+        ϕ[i] = Complex{T}(sqrt(max(zero(T), one(T) - s)))
+    end
+    ϕ[firstindex(ϕ)] = one(Complex{T})   # exact DC = 1 (preserves mean ⇔ averaged-coefficient)
+    return ϕ
+end
+
+"""
+    _tight_frame_lowpass!(wavelets) -> averaging filter φ
+
+Globally rescale `wavelets` (in place) so that `max_ω Σⱼ|ψⱼ(ω)|² = 1` — making the transform
+non-expansive — then return the complement low-pass φ, giving a tight frame with
+Littlewood–Paley sum `Σⱼ|ψⱼ|² + |φ|² ≡ 1`. The rescale is a single global constant, so it does
+not change the *relative* coefficient structure.
+"""
+function _tight_frame_lowpass!(wavelets::Vector{A}) where {T, A<:AbstractArray{Complex{T}}}
+    maxs = zero(T)
+    @inbounds for i in eachindex(first(wavelets))
+        s = zero(T)
+        for ψ in wavelets
+            s += abs2(ψ[i])
+        end
+        maxs = max(maxs, s)
+    end
+    if maxs > zero(T)
+        c = inv(sqrt(maxs))
+        for ψ in wavelets
+            ψ .*= c
+        end
+    end
+    return _complement_lowpass(wavelets)
+end
 
 """
     WaveletMeta{T}
@@ -103,30 +151,10 @@ function build_filter_bank1d(N::Int, J::Int; Q::Int=1, T::Type{<:Real}=Float64)
         end
     end
     
-    # Build averaging filter with same element type
-    ϕ = averaging_filter(N, J, T)
-    
+    # Low-pass = complement of the wavelet energy (tight-frame Littlewood-Paley ≈ 1)
+    ϕ = _tight_frame_lowpass!(wavelets)
+
     return FilterBank1D{T,V}(wavelets, ϕ, meta, J, Q)
-end
-
-"""
-    averaging_filter(N::Int, J::Int, ::Type{T}=Float64) -> Vector{Complex{T}}
-
-Build low-pass averaging filter (father wavelet / scaling function).
-Element type T allows Float32/Float64.
-"""
-function averaging_filter(N::Int, J::Int, ::Type{T}=Float64) where {T<:Real}
-    xi_J  = T(0.5) / T(2.0)^(J - 1)
-    sigma = xi_J * T(0.8)
-    inv2  = inv(T(2))
-    inv_s = inv(sigma)
-    
-    ϕ = Vector{Complex{T}}(undef, N)
-    @inbounds for i in 1:N
-        ω = T(_fftfreq(N, i - 1))
-        ϕ[i] = Complex{T}(exp(-(ω * inv_s)^2 * inv2))
-    end
-    return ϕ
 end
 
 """
@@ -189,34 +217,10 @@ function build_filter_bank2d(N::NTuple{2,Int}, J::Int; L::Int=8, T::Type{<:Real}
         end
     end
     
-    # 2D averaging filter with same element type
-    ϕ = averaging_filter2d(N, J, T)
-    
+    # Low-pass = complement of the wavelet energy (tight-frame Littlewood-Paley ≈ 1)
+    ϕ = _tight_frame_lowpass!(wavelets)
+
     return FilterBank2D{T,M}(wavelets, ϕ, meta, J, L)
-end
-
-"""
-    averaging_filter2d(N::NTuple{2,Int}, J::Int, ::Type{T}=Float64) -> Matrix{Complex{T}}
-
-Build 2D low-pass averaging filter.
-"""
-function averaging_filter2d(N::NTuple{2,Int}, J::Int, ::Type{T}=Float64) where {T<:Real}
-    Ny, Nx = N
-    xi_J  = T(0.5) / T(2.0)^(J - 1)
-    sigma = xi_J * T(0.8)
-    inv2  = inv(T(2))
-    inv_s = inv(sigma)
-    
-    ϕ = Matrix{Complex{T}}(undef, Ny, Nx)
-    @inbounds for ix in 1:Nx
-        kx = T(_fftfreq(Nx, ix - 1))
-        for iy in 1:Ny
-            ky = T(_fftfreq(Ny, iy - 1))
-            k  = sqrt(kx^2 + ky^2)
-            ϕ[iy, ix] = Complex{T}(exp(-(k * inv_s)^2 * inv2))
-        end
-    end
-    return ϕ
 end
 
 """
@@ -254,35 +258,9 @@ function build_filter_bank3d(N::NTuple{3,Int}, J::Int; n_orient::Int=6, T::Type{
             push!(meta, WaveletMeta{T}(j, 0, o - 1, T(j), morlet.center_freq, zero(T)))
         end
     end
-    ϕ = averaging_filter3d(N, J, T)
+    # Low-pass = complement of the wavelet energy (tight-frame Littlewood-Paley ≈ 1)
+    ϕ = _tight_frame_lowpass!(wavelets)
     return FilterBank3D{T,A}(wavelets, ϕ, meta, J, n_orient)
-end
-
-"""
-    averaging_filter3d(N::NTuple{3,Int}, J::Int, ::Type{T}=Float64) -> Array{Complex{T},3}
-
-Build a radially-symmetric 3D low-pass averaging filter.
-"""
-function averaging_filter3d(N::NTuple{3,Int}, J::Int, ::Type{T}=Float64) where {T<:Real}
-    Nz, Ny, Nx = N
-    xi_J  = T(0.5) / T(2.0)^(J - 1)
-    sigma = xi_J * T(0.8)
-    inv2  = inv(T(2))
-    inv_s = inv(sigma)
-
-    ϕ = Array{Complex{T},3}(undef, Nz, Ny, Nx)
-    @inbounds for ix in 1:Nx
-        kx = T(_fftfreq(Nx, ix - 1))
-        for iy in 1:Ny
-            ky = T(_fftfreq(Ny, iy - 1))
-            for iz in 1:Nz
-                kz = T(_fftfreq(Nz, iz - 1))
-                k = sqrt(kx^2 + ky^2 + kz^2)
-                ϕ[iz, iy, ix] = Complex{T}(exp(-(k * inv_s)^2 * inv2))
-            end
-        end
-    end
-    return ϕ
 end
 
 end # module FilterBanks

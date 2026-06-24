@@ -128,6 +128,19 @@ Test.@testset "1D Morlet Wavelet Mathematical Properties" begin
     end
 end
 
+Test.@testset "Filter bank is a tight frame (Littlewood-Paley ≡ 1)" begin
+    # |φ(ω)|² + Σⱼ|ψⱼ(ω)|² ≡ 1: non-expansive, no frequency amplified.
+    for (N, J, Q) in ((1024, 6, 1), (512, 4, 2))
+        fb = ScatteringTransforms.build_filter_bank1d(N, J; Q=Q)
+        Nh = N ÷ 2
+        lp = abs2.(fb.averaging[1:Nh]) .+ sum(abs2.(ψ[1:Nh]) for ψ in fb.wavelets)
+        Test.@test maximum(abs, lp .- 1) < 1e-2
+    end
+    fb2 = ScatteringTransforms.build_filter_bank2d((64, 64), 3; L=8)
+    lp2 = abs2.(fb2.averaging) .+ sum(abs2.(ψ) for ψ in fb2.wavelets)
+    Test.@test maximum(abs, lp2 .- 1) < 1e-2
+end
+
 Test.@testset "1D Filter Bank Tests" begin
     N = 256
     J = 4
