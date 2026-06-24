@@ -13,10 +13,17 @@ Fast, generic wavelet scattering transforms in Julia.
   (enumerated once into a `ScatteringTree`).
 - **Reduced descriptors**: normalized (`S1/S0`, `S2/S1`), log, and 2D sparsity `s₂₁` /
   anisotropy `s₂₂` (`compute_shape_sparsity`).
+- **Reconstruction**: exact linear wavelet-frame inverse (`wavelet_transform`/`iwavelet`), phase
+  retrieval (`reconstruct_phase`), and gradient-descent `synthesize` from coefficients
+  (DifferentiationInterface extension; any `ADTypes` backend, e.g. `AutoMooncake`).
+- **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
+  monogenic amplitude + continuous orientation/phase (`monogenic_components`); spherical
+  `spherical_monogenic_scattering` on S² (spin-0 identity, no spin-1 synthesis needed).
 - **Pluggable spectral backend**: dependency-free direct-sum default; `using FFTW` switches on
-  an `O(N log N)` fast path automatically (`spectral = :auto | :direct | :fftw`).
+  an `O(N log N)` fast path automatically
+  (`spectral = AutoSpectral() | DirectSumBackend() | FFTBackend()`).
 - **Batching & threading**: `scattering_batch` reuses one plan/workspace; `using OhMyThreads`
-  enables `scattering_batch(ThreadedCPU(), …)`.
+  enables `scattering_batch(ThreadedBackend(), …)`.
 - **Generic & type-stable**: `Float32`/`Float64`, autodiff-friendly, GPU-array-ready hot path,
   in-place `!` methods over pre-allocated buffers.
 
@@ -95,6 +102,27 @@ texture from an isotropic one.
 
 ![Reductions](docs/src/assets/reductions.png)
 
+### Reconstruction & synthesis
+The complex (pre-modulus) wavelet layer is exactly invertible (`iwavelet`, machine precision);
+from the scattering *coefficients*, `synthesize` (DifferentiationInterface + an AD backend)
+descends `‖S(x̂)−S(x)‖²` to draw a new sample with matching multiscale statistics — 1D and 2D.
+
+![Reconstruction & synthesis (1D)](docs/src/assets/reconstruction_synthesis.png)
+![Reconstruction & synthesis (2D)](docs/src/assets/reconstruction_2d.png)
+
+### Monogenic (Riesz) scattering
+The rotation-covariant monogenic amplitude replaces the oriented modulus; `monogenic_components`
+recovers the local amplitude envelope and a **continuous** orientation (a radial pinwheel here),
+not quantized orientation bins.
+
+![Monogenic analysis](docs/src/assets/monogenic.png)
+
+### Spherical scattering
+On S² (scattered points, via NUFSHT): analytic and monogenic transforms, the latter computing the
+spin-1 Riesz energy with spin-0 transforms via a Bochner identity.
+
+![Spherical scattering](docs/src/assets/spherical_scattering.png)
+
 ### Spectral backends
 The in-core direct-sum default is dependency-free but `O(N²)`; loading `FFTW` switches on an
 `O(N log N)` fast path automatically (≈100–1000× faster), with identical results.
@@ -111,9 +139,11 @@ The in-core direct-sum default is dependency-free but `O(N²)`; loading `FFTW` s
 
 See the [examples/](examples/) directory:
 
-- `basic_usage.jl` - Getting started with 1D and 2D scattering
+- `basic_usage.jl` - 1D/2D/3D scattering, localized field, reductions, batching/threading
 - `zero_allocation_streaming.jl` - High-performance streaming for large datasets
-- `gpu_acceleration.jl` - GPU-ready type system demonstration
+- `backends.jl` - spectral (direct-sum vs FFTW) and compute (serial/threaded/GPU) backends
+- `synthesis_and_inverse.jl` - exact inverse, phase retrieval, and coefficient synthesis
+- `monogenic.jl` - monogenic (Riesz) scattering: amplitude envelope + continuous orientation
 
 Run examples:
 ```bash

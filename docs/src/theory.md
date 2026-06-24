@@ -72,13 +72,51 @@ For analysis it is common to reduce the raw coefficients (`Reductions` module, a
 - **shape / anisotropy** `s₂₂ = ⟨S₂\cos 2Δθ⟩/⟨S₂⟩` — the second angular harmonic, `≈ 0` for
   isotropic fields and nonzero for oriented structure.
 
+## Reconstruction
+
+There is **no exact analytic inverse** of the scattering transform — the modulus discards the
+local phase of each wavelet coefficient. Three reconstruction levels are available:
+
+1. **Exact linear wavelet-frame inverse** (`wavelet_transform` / `iwavelet`). The *complex*,
+   pre-modulus layer `x ⋆ ψ_λ` plus the low-pass `x ⋆ φ` is exactly invertible: because the bank
+   is a tight frame (`Σ_λ|\hatψ_λ|² + |\hatφ|² ≡ 1`), the dual frame is itself and
+   ```math
+   x = \sum_\lambda (x\star\psi_\lambda)\star\psi_\lambda^\ast + (x\star\phi)\star\phi^\ast ,
+   ```
+   recovered to machine precision (1D/2D/3D).
+2. **Phase retrieval** (`reconstruct_phase`) from the first-order moduli `|x ⋆ ψ_λ|` alone, via
+   Gerchberg–Saxton alternating projections (reconstruct with the exact inverse, re-impose the
+   target magnitudes, repeat); determined up to a global sign (Waldspurger & Mallat 2015).
+3. **Gradient-descent synthesis** (`synthesize`, in the DifferentiationInterface extension) from
+   the scattering coefficients themselves: from noise, minimize `‖S(\hat x) − S(x)‖²`
+   (Bruna & Mallat microcanonical models). This yields a new *sample* with matching multiscale
+   statistics — not the original field — and is differentiated through the mutation-free
+   `scattering(st, x)` by any `ADTypes` backend (e.g. `AutoMooncake()`).
+
+## Monogenic (Riesz) scattering
+
+`MonogenicScattering` replaces the oriented analytic modulus with the rotation-covariant
+**monogenic amplitude**. From an *isotropic* band-pass `ψ_j` (radial in frequency, real,
+zero-mean) and the Riesz multipliers `R_d(k) = -i\,k_d/|k|` (`Σ_d|R_d|²=1` off-DC):
+
+```math
+A_j = \sqrt{\,(x\star\psi_j)^2 + \textstyle\sum_d (x\star R_d\psi_j)^2\,},
+```
+
+which also yields a local *phase* and continuous *orientation* (`monogenic_components`), recovered
+without quantizing into discrete orientation bins. On the sphere (`spherical_monogenic_scattering`,
+NUFSHT extension) the Riesz operator `R = ð∘(-Δ_S)^{-1/2}` is harmonic-diagonal; the Riesz energy
+`|U^R_j|² = |∇_S g_j|²` (with `g_j=(-Δ_S)^{-1/2}` of the band) is evaluated with **spin-0**
+transforms only, via the identity `|∇_S g|² = ½Δ_S(g²) − g\,Δ_S g`.
+
 ## Computation
 
 Convolutions are done in the spectral domain. The core ships a dependency-free **direct-sum
-DFT** default; loading `FFTW` selects an `O(N\log N)` fast path automatically (`spectral=:auto`).
-Batches reuse one plan (`scattering_batch`), and `using OhMyThreads` enables a multithreaded
-batched transform (`ThreadedCPU`). The hot path is written with broadcasts/reductions so it also
-runs on GPU arrays.
+DFT** default; loading `FFTW` selects an `O(N\log N)` fast path automatically
+(`spectral = AutoSpectral()`). Batches reuse one plan (`scattering_batch`), and `using OhMyThreads`
+enables a multithreaded batched transform (`ThreadedBackend`). The hot path is written with
+broadcasts/reductions so it also runs on GPU arrays. The mutation-free `scattering(st, x)` is the
+autodiff-friendly counterpart used by synthesis.
 
 ## Applications
 
@@ -96,3 +134,10 @@ structure beyond the power spectrum is informative.
   structures in the ISM. *A&A*.
 - Cheng, T. Y., & Ménard, B. (2021). How to quantify fields or textures? A guide to the
   scattering transform. [arXiv:2112.01288](https://arxiv.org/pdf/2112.01288).
+- Waldspurger, I., & Mallat, S. (2015). Phase retrieval for the Cauchy wavelet transform / wavelet
+  transform modulus.
+- Bruna, J., & Mallat, S. (2018). Multiscale sparse microcanonical models.
+  [arXiv:1801.02013](https://arxiv.org/abs/1801.02013).
+- Felsberg, M., & Sommer, G. (2001). The monogenic signal. *IEEE Trans. Signal Process.*, 49(12).
+- Unser, M., Sage, D., & Van De Ville, D. (2009). Multiresolution monogenic signal analysis using
+  the Riesz–Laplace wavelet transform. *IEEE Trans. Image Process.*, 18(11).

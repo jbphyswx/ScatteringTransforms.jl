@@ -9,7 +9,31 @@ ScatteringTransforms.Scattering3D.ScatteringTransform3D
 ScatteringTransforms.Scattering1D.scattering_transform!
 ScatteringTransforms.Scattering2D.scattering_transform2d!
 ScatteringTransforms.Scattering3D.scattering_transform3d!
+ScatteringTransforms.ScatteringCore.scattering
 ScatteringTransforms.spherical_scattering
+```
+
+## Reconstruction & synthesis
+
+```@docs
+ScatteringTransforms.Inverse.wavelet_transform
+ScatteringTransforms.Inverse.iwavelet
+ScatteringTransforms.Inverse.reconstruct_phase
+ScatteringTransforms.synthesize
+ScatteringTransforms.scattering_loss
+```
+
+## Monogenic (Riesz) scattering
+
+```@docs
+ScatteringTransforms.Monogenic.MonogenicScattering
+ScatteringTransforms.Monogenic.MonogenicFilterBank
+ScatteringTransforms.Monogenic.build_monogenic_bank
+ScatteringTransforms.Monogenic.riesz_multipliers
+ScatteringTransforms.Monogenic.monogenic_amplitude
+ScatteringTransforms.Monogenic.monogenic_components
+ScatteringTransforms.spherical_monogenic_scattering
+ScatteringTransforms.spherical_monogenic_components
 ```
 
 ## Localized (Mallat) field
@@ -87,6 +111,8 @@ ScatteringTransforms.Plans.AbstractScatteringPlan
 ScatteringTransforms.Plans.DirectSumPlan
 ScatteringTransforms.Plans.forward_transform!
 ScatteringTransforms.Plans.inverse_transform!
+ScatteringTransforms.Plans.forward_transform
+ScatteringTransforms.Plans.inverse_transform
 ScatteringTransforms.Plans.make_plan
 ScatteringTransforms.ScatteringCore.wavelet_convolve!
 ScatteringTransforms.ScatteringCore.apply_modulus!

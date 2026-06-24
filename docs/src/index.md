@@ -23,9 +23,15 @@ are the same.
 - **Correct path structure**: second order over strictly coarser scales, all orientation pairs.
 - **Reduced descriptors**: `normalized_coefficients` (`S1/S0`, `S2/S1`), `log_coefficients`,
   and 2D sparsity `s₂₁` / anisotropy `s₂₂` (`compute_shape_sparsity`).
+- **Reconstruction**: exact linear wavelet-frame inverse (`wavelet_transform`/`iwavelet`),
+  phase retrieval (`reconstruct_phase`), and gradient-descent `synthesize` from coefficients
+  (DifferentiationInterface extension, any `ADTypes` backend).
+- **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
+  monogenic amplitude + continuous orientation/phase (`monogenic_components`), and
+  `spherical_monogenic_scattering` on S².
 - **Tight-frame filter bank**: `|φ|² + Σⱼ|ψⱼ|² ≡ 1` (non-expansive).
 - **Pluggable spectral backend**: in-core direct-sum default; `using FFTW` → `O(N log N)`
-  fast path (`spectral = :auto | :direct | :fftw`).
+  fast path (`spectral = AutoSpectral() | DirectSumBackend() | FFTBackend()`).
 - **Scale**: `scattering_batch` (one plan reused), `ThreadedBackend` (OhMyThreads),
   `DistributedBackend`/`MPIBackend` (parametric over the inner backend), `GPUBackend` (CUDA).
 - **Generic & type-stable**: `Float32`/`Float64`, autodiff-friendly, GPU-array-ready hot path.
@@ -61,6 +67,35 @@ B     = scattering_batch(st, randn(1024, 100)) # (coeffs × 100), one plan reuse
 ### Localized field and reductions
 ![Localized field](assets/localized_field.png)
 ![Reductions](assets/reductions.png)
+
+### Reconstruction & synthesis
+The complex (pre-modulus) wavelet layer is exactly invertible (`iwavelet`, machine precision);
+from the scattering *coefficients*, `synthesize` descends `‖S(x̂)−S(x)‖²` (via
+DifferentiationInterface) to draw a new sample with matching multiscale statistics — in 1D and 2D.
+
+```julia
+using DifferentiationInterface, Mooncake
+# exact linear inverse (machine precision)
+x̂ = iwavelet(st, wavelet_transform(st, signal))
+# coefficient synthesis from noise (a matching sample, not the original field)
+res = synthesize(st, signal; backend = AutoMooncake(), iters = 400)
+```
+
+![Reconstruction & synthesis (1D)](assets/reconstruction_synthesis.png)
+![Reconstruction & synthesis (2D)](assets/reconstruction_2d.png)
+
+### Monogenic (Riesz) scattering
+`MonogenicScattering` uses the rotation-covariant monogenic amplitude in place of the oriented
+modulus, and `monogenic_components` recovers the local amplitude envelope and a **continuous**
+orientation (not quantized into bins).
+
+![Monogenic analysis](assets/monogenic.png)
+
+### Spherical scattering
+On S² (scattered points, via NUFSHT) both the analytic and monogenic transforms are available;
+the monogenic Riesz energy is computed with spin-0 transforms via a Bochner identity.
+
+![Spherical scattering](assets/spherical_scattering.png)
 
 ## Backends & scale
 

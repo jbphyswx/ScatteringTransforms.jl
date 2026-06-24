@@ -4,7 +4,7 @@ Working examples for `ScatteringTransforms.jl`.
 
 ```bash
 cd examples
-julia --project=. -e 'using Pkg; Pkg.develop(path=".."); Pkg.instantiate()'
+julia --project=. -e 'using Pkg; Pkg.instantiate()'   # local package wired via [sources]
 julia --project=. basic_usage.jl        # use `-t4` to exercise threading
 ```
 
@@ -23,4 +23,16 @@ In-core direct-sum vs FFTW fast path (identical results, ~100–1000× faster); 
 `ThreadedBackend` batched transforms; GPU is exercised if a CUDA device is available and skipped
 gracefully otherwise.
 
-All three examples double as smoke tests (they `@test` their own invariants).
+## `synthesis_and_inverse.jl` — reconstruction
+The three reconstruction levels: the exact linear wavelet-frame inverse (`iwavelet ∘
+wavelet_transform`, machine precision); phase retrieval from first-order moduli
+(`reconstruct_phase`, Gerchberg–Saxton); and gradient-descent synthesis from the scattering
+coefficients (`synthesize`, via DifferentiationInterface + Mooncake), which produces a new
+sample with matching multiscale statistics.
+
+## `monogenic.jl` — monogenic (Riesz) scattering
+`MonogenicScattering` in 1D/2D/3D, the Riesz-multiplier partition of unity, and
+`monogenic_components` — the smooth amplitude envelope and the continuously-recovered local
+orientation/phase (vs the oriented-modulus transform).
+
+All five examples double as smoke tests (they `@test` their own invariants).

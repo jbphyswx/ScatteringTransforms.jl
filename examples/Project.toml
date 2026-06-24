@@ -1,10 +1,16 @@
 [deps]
-ScatteringTransforms = "68b593e8-16bb-4169-afcb-087dab360691"
+ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+Mooncake = "da2b9cff-9c12-43a0-ae48-6db2b0edb7d6"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
+ScatteringTransforms = "68b593e8-16bb-4169-afcb-087dab360691"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+ScatteringTransforms = {path = ".."}
 
 [compat]
 CairoMakie = "0.15"
