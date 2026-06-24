@@ -1,36 +1,28 @@
 # API Reference
 
-## 1D Scattering
-
-### Core Types
+## Transforms
 
 ```@docs
 ScatteringTransforms.Scattering1D.ScatteringTransform1D
-```
-
-### Functions
-
-```@docs
-ScatteringTransforms.Scattering1D.scattering_transform!
-ScatteringTransforms.Scattering1D.compute_S1!
-ScatteringTransforms.Scattering1D.compute_S2!
-```
-
-## 2D Scattering
-
-### Core Types
-
-```@docs
 ScatteringTransforms.Scattering2D.ScatteringTransform2D
+ScatteringTransforms.Scattering3D.ScatteringTransform3D
+ScatteringTransforms.Scattering1D.scattering_transform!
+ScatteringTransforms.Scattering2D.scattering_transform2d!
+ScatteringTransforms.Scattering3D.scattering_transform3d!
+ScatteringTransforms.spherical_scattering
 ```
 
-### Functions
+## Localized (Mallat) field
 
 ```@docs
-ScatteringTransforms.Scattering2D.compute_shape_sparsity
+ScatteringTransforms.ScatteringFields.scattering_field
+ScatteringTransforms.ScatteringFields.scattering_field!
+ScatteringTransforms.ScatteringFields.ScatteringField1D
+ScatteringTransforms.ScatteringFields.ScatteringField2D
+ScatteringTransforms.ScatteringFields.path_field
 ```
 
-## Coefficient Storage
+## Coefficients & reductions
 
 ```@docs
 ScatteringTransforms.Coefficients.ScatteringCoefficients1D
@@ -38,35 +30,65 @@ ScatteringTransforms.Coefficients.ScatteringCoefficients2D
 ScatteringTransforms.Coefficients.zeroth_order
 ScatteringTransforms.Coefficients.first_order
 ScatteringTransforms.Coefficients.second_order
-ScatteringTransforms.Coefficients.update_S0
 ScatteringTransforms.Coefficients.flatten1d
 ScatteringTransforms.Coefficients.flatten2d
+ScatteringTransforms.Coefficients.flatten_length
+ScatteringTransforms.Scattering2D.compute_shape_sparsity
+ScatteringTransforms.Reductions.normalized_coefficients
+ScatteringTransforms.Reductions.log_coefficients
 ```
 
-## Core Operations
+## Batching & backends
 
 ```@docs
-ScatteringTransforms.ScatteringCore.wavelet_convolve
-ScatteringTransforms.ScatteringCore.wavelet_convolve!
-ScatteringTransforms.ScatteringCore.apply_modulus
-ScatteringTransforms.ScatteringCore.apply_modulus!
-ScatteringTransforms.ScatteringCore.spatial_average
-ScatteringTransforms.ScatteringCore.ScatteringLayer
+ScatteringTransforms.scattering_batch
+ScatteringTransforms.Backends.SerialBackend
+ScatteringTransforms.Backends.ThreadedBackend
+ScatteringTransforms.Backends.GPUBackend
+ScatteringTransforms.Backends.DistributedBackend
+ScatteringTransforms.Backends.MPIBackend
+ScatteringTransforms.Backends.AutoBackend
+ScatteringTransforms.SubsampledScattering.SubsampledScattering1D
 ```
 
-## Filter Banks
+## Domains
+
+```@docs
+ScatteringTransforms.Domains.Line1D
+ScatteringTransforms.Domains.Plane2D
+ScatteringTransforms.Domains.Volume3D
+ScatteringTransforms.Domains.Sphere
+ScatteringTransforms.Domains.spatial_ndims
+```
+
+## Filter banks, filters & path graph
 
 ```@docs
 ScatteringTransforms.FilterBanks.FilterBank1D
 ScatteringTransforms.FilterBanks.FilterBank2D
+ScatteringTransforms.FilterBanks.FilterBank3D
+ScatteringTransforms.FilterBanks.WaveletMeta
 ScatteringTransforms.FilterBanks.build_filter_bank1d
 ScatteringTransforms.FilterBanks.build_filter_bank2d
-```
-
-## Filters
-
-```@docs
+ScatteringTransforms.FilterBanks.build_filter_bank3d
 ScatteringTransforms.Filters.Morlet1D
 ScatteringTransforms.Filters.Morlet2D
+ScatteringTransforms.Filters.Morlet3D
 ScatteringTransforms.Filters.frequency_response
+ScatteringTransforms.Filters.fibonacci_directions
+ScatteringTransforms.PathGraph.ScatteringTree
+ScatteringTransforms.PathGraph.build_tree
+```
+
+## Spectral plans & core operations
+
+```@docs
+ScatteringTransforms.Plans.AbstractScatteringPlan
+ScatteringTransforms.Plans.DirectSumPlan
+ScatteringTransforms.Plans.forward_transform!
+ScatteringTransforms.Plans.inverse_transform!
+ScatteringTransforms.Plans.make_plan
+ScatteringTransforms.ScatteringCore.wavelet_convolve!
+ScatteringTransforms.ScatteringCore.apply_modulus!
+ScatteringTransforms.ScatteringCore.spatial_average
 ```

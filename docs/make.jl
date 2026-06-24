@@ -1,33 +1,41 @@
-using Documenter
-using ScatteringTransforms
+using Documenter: Documenter
+using ScatteringTransforms                 # bare for @docs scope resolution
+using FFTW: FFTW                           # load the FFTW extension so the fast path is active
+using CairoMakie: CairoMakie               # load the plotting extension
 
-makedocs(
+Documenter.makedocs(
     sitename = "ScatteringTransforms.jl",
     format = Documenter.HTML(
         prettyurls = get(ENV, "CI", "false") == "true",
         canonical = "https://jbphyswx.github.io/ScatteringTransforms.jl",
-        assets = String["assets/style.css"],
     ),
     modules = [
         ScatteringTransforms,
+        ScatteringTransforms.Backends,
+        ScatteringTransforms.Domains,
+        ScatteringTransforms.Plans,
         ScatteringTransforms.Filters,
         ScatteringTransforms.FilterBanks,
+        ScatteringTransforms.PathGraph,
         ScatteringTransforms.ScatteringCore,
         ScatteringTransforms.Coefficients,
+        ScatteringTransforms.ScatteringFields,
         ScatteringTransforms.Scattering1D,
         ScatteringTransforms.Scattering2D,
+        ScatteringTransforms.Scattering3D,
+        ScatteringTransforms.SubsampledScattering,
+        ScatteringTransforms.Reductions,
     ],
     pages = [
         "Home" => "index.md",
         "Theory" => "theory.md",
         "API Reference" => "api.md",
     ],
-    repo = "https://github.com/jbphyswx/ScatteringTransforms.jl/blob/{commit}{path}#L{line}",
     authors = "Jordan Benjamin",
     warnonly = true,
 )
 
-deploydocs(
+Documenter.deploydocs(
     repo = "github.com/jbphyswx/ScatteringTransforms.jl",
     devbranch = "main",
 )

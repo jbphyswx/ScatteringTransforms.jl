@@ -50,32 +50,56 @@ norm   = normalized_coefficients(coeffs)           # s1 = S1/S0, s2 = S2/S1
 batch  = scattering_batch(st, randn(N, 100))       # (coeffs × 100), one plan reused
 
 using FFTW         # → automatic O(N log N) fast path
-using OhMyThreads  # → scattering_batch(ThreadedCPU(), st, X)
+using OhMyThreads  # → scattering_batch(ThreadedBackend(), st, X)
 ```
 
-## Wavelet & Scattering Visualizations
+## Why scattering? (the headline result)
 
-Here are the generated figures showcasing the 1D/2D wavelet tiling and scattering transform outputs:
+Two signals can have **identical power spectra** yet very different structure. The scattering
+transform tells them apart: an intermittent signal (sparse bursts) has strong **cross-scale
+coupling** `S₂/S₁`, while its phase-randomized Gaussian surrogate does not — even though their
+power spectra (and first-order `S₁`) are the same.
 
-### 1. 1D Wavelet Scattering
-Decomposition of a 1D pink noise signal with a low-frequency oscillation, showing first-order ($S_1$) and second-order ($S_2$) coefficients:
+![Discriminability](docs/src/assets/discriminability.png)
 
-![1D Scattering Example](docs/src/assets/1d_scattering_example.png)
+## Visualizations
 
-### 2. Frequency Tiling (Morlet Filter Bank)
-The frequency response of the 1D Morlet filter bank showing optimal overlapping frequency coverage across multiple scales:
+### Filter bank — a tight frame
+1D Morlet filter bank in the frequency domain. The Littlewood–Paley sum `|φ|² + Σⱼ|ψⱼ|²` is
+flat at **1** (a tight frame ⇒ the transform is non-expansive — no frequency is amplified).
 
 ![Morlet Filter Bank](docs/src/assets/filter_bank.png)
 
-### 3. 2D Wavelet Scattering
-Applying a 2D scattering transform to a multi-scale fractal texture, showing the orientation-scale decomposition and second-order coefficients:
+### 1D scattering
+A 1/f (turbulent) signal with its `S₀`, first-order `S₁(j)`, and second-order `S₂(j₁,j₂)`
+(only admissible strictly-coarser scale pairs are populated).
+
+![1D Scattering Example](docs/src/assets/1d_scattering_example.png)
+
+### 2D scattering
+A turbulent 2D field with `S₁` over scale × orientation and `S₂` over wavelet pairs. The `S₂`
+panel is a `(J·L)²` matrix whose only populated blocks are **strictly coarser scale pairs**
+(all orientation pairs); the same-scale diagonal blocks are empty by construction.
 
 ![2D Scattering Example](docs/src/assets/2d_scattering_example.png)
 
-### 4. Zero-Allocation Streaming Benchmarks
-Comparing the execution time of the zero-allocation API against the standard allocating API across different signal sizes:
+### Localized (Mallat) field
+`scattering_field` returns `S_p x = (|U_p x| ⋆ φ_J)↓` per path — energy localized in **scale
+and space** (here: two bursts at different scales light up different rows/positions).
 
-![Performance Comparison](docs/src/assets/performance_comparison.png)
+![Localized field](docs/src/assets/localized_field.png)
+
+### Reduced descriptors — anisotropy
+The shape reduction `s₂₂` (second angular harmonic of `S₂`) cleanly separates an oriented
+texture from an isotropic one.
+
+![Reductions](docs/src/assets/reductions.png)
+
+### Spectral backends
+The in-core direct-sum default is dependency-free but `O(N²)`; loading `FFTW` switches on an
+`O(N log N)` fast path automatically (≈100–1000× faster), with identical results.
+
+![Backend performance](docs/src/assets/backend_performance.png)
 
 ## Documentation
 

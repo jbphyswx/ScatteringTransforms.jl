@@ -20,6 +20,14 @@ using ..PathGraph: PathGraph
 
 export SubsampledScattering1D
 
+"""
+    SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=1, T=Float64, spectral=:auto)
+
+A 1D scattering transform with fast second order via intermediate subsampling: the first-order
+modulus envelope is decimated by `2^(scale - oversampling)` before the second wavelet transform
+(multi-resolution wavelet bank). Opt-in and approximate — a large `oversampling` reproduces the
+exact [`ScatteringTransform1D`](@ref); aggressive values trade a little accuracy for speed.
+"""
 struct SubsampledScattering1D{T, Tree<:PathGraph.ScatteringTree}
     N::Int
     J::Int

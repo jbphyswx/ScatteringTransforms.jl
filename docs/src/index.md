@@ -1,90 +1,87 @@
 # ScatteringTransforms.jl
 
-A fast, generic Julia implementation of the wavelet scattering transform for 1D signals and 2D images.
+A fast, generic Julia implementation of the wavelet scattering transform for **1D signals, 2D
+images, 3D volumes, and scalar fields on the sphere** — with averaged and localized outputs,
+reduced descriptors, a dependency-free default plus pluggable fast backends, batching, threading,
+distributed/MPI, and GPU.
+
+## Why scattering?
+
+Two signals can share an **identical power spectrum** yet differ structurally. Scattering
+distinguishes them: an intermittent signal has strong cross-scale coupling `S₂/S₁`, while its
+phase-randomized Gaussian surrogate does not — though their power spectra and first-order `S₁`
+are the same.
+
+![Discriminability](assets/discriminability.png)
 
 ## Features
 
-- **Fully generic**: Works with `Float32`, `Float64`, and automatic differentiation (ForwardDiff, Zygote)
-- **GPU-ready**: Compatible with CUDA arrays (`CuVector`, `CuMatrix`)
-- **Zero-allocation**: In-place operations with pre-allocated buffers for high-performance streaming
-- **Type-stable**: All functions are fully type-inferred for optimal performance
+- **Domains**: 1D, 2D (oriented Morlet), 3D (oriented 3D Morlet), and spherical (NUFSHT,
+  smooth difference-of-Gaussians bands).
+- **Two outputs**: globally-averaged coefficients `st(x)` and the localized (Mallat) field
+  `scattering_field(st, x) = (|U_p x| ⋆ φ_J)↓` (their spatial means agree by construction).
+- **Correct path structure**: second order over strictly coarser scales, all orientation pairs.
+- **Reduced descriptors**: `normalized_coefficients` (`S1/S0`, `S2/S1`), `log_coefficients`,
+  and 2D sparsity `s₂₁` / anisotropy `s₂₂` (`compute_shape_sparsity`).
+- **Tight-frame filter bank**: `|φ|² + Σⱼ|ψⱼ|² ≡ 1` (non-expansive).
+- **Pluggable spectral backend**: in-core direct-sum default; `using FFTW` → `O(N log N)`
+  fast path (`spectral = :auto | :direct | :fftw`).
+- **Scale**: `scattering_batch` (one plan reused), `ThreadedBackend` (OhMyThreads),
+  `DistributedBackend`/`MPIBackend` (parametric over the inner backend), `GPUBackend` (CUDA).
+- **Generic & type-stable**: `Float32`/`Float64`, autodiff-friendly, GPU-array-ready hot path.
 
-## Quick Start
-
-### 1D Scattering
-
-![1D Scattering Example](assets/1d_scattering_example.png)
-*Example: 1D signal with first-order (S1) and second-order (S2) scattering coefficients.*
-
-```julia
-using ScatteringTransforms
-
-# Create a signal
-N = 1024
-signal = randn(N)
-
-# Build scattering transform
-st = ScatteringTransform1D(N, 8; Q=1, max_order=2)
-
-# Compute coefficients
-coeffs = st(signal)
-
-# Access results
-@show coeffs.S0          # 0th order (average)
-@show coeffs.S1          # 1st order (scale amplitudes)
-@show coeffs.S2          # 2nd order (scale interactions)
-```
-
-### 2D Scattering
-
-![2D Scattering Example](assets/2d_scattering_example.png)
-*Example: 2D image with first-order and second-order scattering coefficients.*
+## Quick start
 
 ```julia
 using ScatteringTransforms
+using FFTW   # optional: switches on the O(N log N) fast path automatically
 
-# Create an image
-image = randn(256, 256)
+# 1D
+st = ScatteringTransform1D(1024, 8; Q=1, max_order=2)
+c  = st(randn(1024))
+zeroth_order(c); first_order(c); second_order(c)
 
-# Build 2D scattering transform with oriented wavelets
-st2d = ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
+# 2D / 3D
+c2 = ScatteringTransform2D((256, 256), 4; L=8)(randn(256, 256))
+c3 = ScatteringTransform3D((32, 32, 32), 3; n_orient=6)(randn(32, 32, 32))
 
-# Compute coefficients
-coeffs_2d = st2d(image)
+# localized field, reductions, batching
+field = scattering_field(st, randn(1024))      # per-path low-passed, subsampled maps
+red   = normalized_coefficients(c)             # s1 = S1/S0, s2 = S2/S1
+B     = scattering_batch(st, randn(1024, 100)) # (coeffs × 100), one plan reused
 ```
 
-## Zero-Allocation Streaming
+### Filter bank (tight frame)
+![Filter bank](assets/filter_bank.png)
 
-![Performance Comparison](assets/performance_comparison.png)
-*Performance: Zero-allocation approach scales to TB-size datasets with minimal memory pressure.*
+### 1D and 2D scattering
+![1D scattering](assets/1d_scattering_example.png)
+![2D scattering](assets/2d_scattering_example.png)
 
-For processing large datasets (e.g., 20TB of ocean data), use the in-place API:
+### Localized field and reductions
+![Localized field](assets/localized_field.png)
+![Reductions](assets/reductions.png)
 
-```julia
-# Pre-allocate once
-st = ScatteringTransform1D(N, 8; Q=1, max_order=2)
-coeffs = ScatteringCoefficients1D(length(st.filter_bank.wavelets), Float64; compute_S2=true)
+## Backends & scale
 
-# Stream through data with zero allocations
-for slice in dataset
-    coeffs = scattering_transform!(coeffs, st, slice)
-    process(coeffs)
-end
-```
+The in-core direct-sum transform is dependency-free; loading `FFTW` selects an `O(N log N)`
+fast path automatically (identical results). `scattering_batch` reuses one plan/workspace across
+a stack; `using OhMyThreads`, `using Distributed`, or `using MPI` enable
+`scattering_batch(ThreadedBackend(), …)`, `DistributedBackend(…)`, and `MPIBackend(…)`.
+
+![Backend performance](assets/backend_performance.png)
 
 ## Documentation
 
-- [Theory](theory.md) - Mathematical background on scattering transforms
-- [API Reference](api.md) - Complete function and type documentation
+- [Theory](theory.md) — mathematical background
+- [API Reference](api.md) — functions and types
 
 ## Citation
-
-If you use this package in your research, please cite:
 
 ```bibtex
 @software{scatteringtransforms_jl,
   author = {Benjamin, Jordan},
-  title = {ScatteringTransforms.jl: Fast wavelet scattering in Julia},
+  title = {ScatteringTransforms.jl: wavelet scattering in Julia},
   url = {https://github.com/jbphyswx/ScatteringTransforms.jl}
 }
 ```

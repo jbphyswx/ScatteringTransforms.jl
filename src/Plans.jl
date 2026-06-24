@@ -20,6 +20,13 @@ using LinearAlgebra: LinearAlgebra
 
 export AbstractScatteringPlan, DirectSumPlan, forward_transform!, inverse_transform!, make_plan
 
+"""
+    AbstractScatteringPlan
+
+Supertype for spectral transform plans. A plan implements [`forward_transform!`](@ref) and
+[`inverse_transform!`](@ref); the in-core default is [`DirectSumPlan`](@ref), with fast paths
+(FFTW, CUFFT) provided by extensions.
+"""
 abstract type AbstractScatteringPlan end
 
 """

@@ -75,6 +75,12 @@ function (st::ScatteringTransform3D)(volume::AbstractArray{<:Any,3})
     return scattering_transform3d!(coeffs, st, volume)
 end
 
+"""
+    scattering_transform3d!(coeffs, st, volume) -> coeffs
+
+In-place 3D volumetric scattering transform; fills `coeffs` (a scales×orientations container)
+and returns it with `S0` updated.
+"""
 function scattering_transform3d!(coeffs::Coefficients.ScatteringCoefficients2D,
                                  st::ScatteringTransform3D,
                                  volume::AbstractArray{<:Any,3})
