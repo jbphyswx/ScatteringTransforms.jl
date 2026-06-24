@@ -6,10 +6,19 @@ Fast, generic wavelet scattering transforms in Julia.
 
 ## Features
 
-- **Fully Generic**: Works with `Float32`, `Float64`, and automatic differentiation
-- **GPU-Ready**: Compatible with CUDA arrays (`CuVector`, `CuMatrix`)
-- **Zero-Allocation**: In-place operations with pre-allocated buffers
-- **Type-Stable**: Fully parametric types for optimal performance
+- **1D / 2D / 3D**: signals, images, and volumes with oriented Morlet wavelets.
+- **Two outputs**: globally-averaged coefficients (`st(x)`) and the localized (Mallat) field
+  `scattering_field(st, x) = (|U_p x| ⋆ φ_J) ↓ s` (their spatial means agree by construction).
+- **Correct path structure**: second order over strictly coarser scales, all orientation pairs
+  (enumerated once into a `ScatteringTree`).
+- **Reduced descriptors**: normalized (`S1/S0`, `S2/S1`), log, and 2D sparsity `s₂₁` /
+  anisotropy `s₂₂` (`compute_shape_sparsity`).
+- **Pluggable spectral backend**: dependency-free direct-sum default; `using FFTW` switches on
+  an `O(N log N)` fast path automatically (`spectral = :auto | :direct | :fftw`).
+- **Batching & threading**: `scattering_batch` reuses one plan/workspace; `using OhMyThreads`
+  enables `scattering_batch(ThreadedCPU(), …)`.
+- **Generic & type-stable**: `Float32`/`Float64`, autodiff-friendly, GPU-array-ready hot path,
+  in-place `!` methods over pre-allocated buffers.
 
 ## Quick Start
 
@@ -30,6 +39,18 @@ coeffs = st(signal)
 image = randn(256, 256)
 st2d = ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
 coeffs_2d = st2d(image)
+
+# 3D volumetric scattering
+st3d = ScatteringTransform3D((32, 32, 32), 3; n_orient=6, max_order=2)
+coeffs_3d = st3d(randn(32, 32, 32))
+
+# Localized (Mallat) field, reduced descriptors, batching
+field  = scattering_field(st, signal)              # per-path low-passed, subsampled maps
+norm   = normalized_coefficients(coeffs)           # s1 = S1/S0, s2 = S2/S1
+batch  = scattering_batch(st, randn(N, 100))       # (coeffs × 100), one plan reused
+
+using FFTW         # → automatic O(N log N) fast path
+using OhMyThreads  # → scattering_batch(ThreadedCPU(), st, X)
 ```
 
 ## Wavelet & Scattering Visualizations
