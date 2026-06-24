@@ -113,9 +113,7 @@ function scattering_transform2d!(coeffs::Coefficients.ScatteringCoefficients2D,
                                   st::ScatteringTransform2D,
                                   image::AbstractMatrix)
     # Zero-alloc real→complex: write into buffer_input
-    @inbounds @simd for i in eachindex(image)
-        st.buffer_input[i] = complex(image[i])
-    end
+    st.buffer_input .= complex.(image)
     
     # Zero-alloc FFT via mul! — store into buffer_signal_fft (preserved across passes)
     Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
@@ -168,9 +166,7 @@ function compute_S2_2d!(S2::AbstractMatrix, st::ScatteringTransform2D,
     
     # Pass 2: FFT each U1 into U1_fft_buffers (zero alloc via mul!)
     @inbounds for j1 in 1:num_w
-        @simd for i in eachindex(st.U1_buffers[j1])
-            st.buffer_input[i] = complex(st.U1_buffers[j1][i])
-        end
+        st.buffer_input .= complex.(st.U1_buffers[j1])
         Plans.forward_transform!(st.U1_fft_buffers[j1], st.plan, st.buffer_input)
     end
     
@@ -255,17 +251,13 @@ end
 # Reuses buffer_input/buffer_conv; leaves buffer_signal_fft (the preserved image FFT) intact.
 @inline function _lowpass_downsample!(dst, st::ScatteringTransform2D, U::AbstractMatrix, ds::Int)
     φ = st.filter_bank.averaging
-    @inbounds @simd for i in eachindex(U)
-        st.buffer_input[i] = complex(U[i])
-    end
+    st.buffer_input .= complex.(U)
     Plans.forward_transform!(st.buffer_conv, st.plan, st.buffer_input)     # U_fft -> buffer_conv
-    @inbounds @simd for i in eachindex(st.buffer_conv)
-        st.buffer_conv[i] *= φ[i]
-    end
+    st.buffer_conv .*= φ
     Plans.inverse_transform!(st.buffer_input, st.plan, st.buffer_conv)     # (U ⋆ φ) -> buffer_input
-    @inbounds for jx in 1:size(dst, 2), jy in 1:size(dst, 1)
-        dst[jy, jx] = real(st.buffer_input[(jy - 1) * ds + 1, (jx - 1) * ds + 1])
-    end
+    # Decimate by ds per dim via a strided view + broadcast (CPU + GPU compatible).
+    My, Mx = size(dst)
+    @views dst .= real.(st.buffer_input[1:ds:(1 + (My - 1) * ds), 1:ds:(1 + (Mx - 1) * ds)])
     return dst
 end
 
@@ -289,15 +281,11 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
     ds = field.subsample
     data = field.data
 
-    @inbounds @simd for i in eachindex(image)
-        st.buffer_input[i] = complex(image[i])
-    end
+    st.buffer_input .= complex.(image)
     Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
 
     # order 0 (root): (x ⋆ φ_J) ↓
-    @inbounds @simd for i in eachindex(image)
-        st.buffer_mod[i] = image[i]
-    end
+    copyto!(st.buffer_mod, image)
     root = first(PathGraph.order_range(tree, 0))
     _lowpass_downsample!(view(data, :, :, root), st, st.buffer_mod, ds)
 

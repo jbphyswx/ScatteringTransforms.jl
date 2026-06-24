@@ -49,10 +49,9 @@ function wavelet_convolve!(out::AbstractArray,
                           filter_fft::AbstractArray,
                           plan,
                           buffer::AbstractArray)
-    # In-place pointwise multiply: buffer = signal_fft .* filter_fft
-    @inbounds @simd for i in eachindex(signal_fft, filter_fft, buffer)
-        buffer[i] = signal_fft[i] * filter_fft[i]
-    end
+    # In-place pointwise multiply via broadcast: works on CPU Arrays AND GPU arrays
+    # (fuses to a single kernel), avoiding scalar indexing.
+    @. buffer = signal_fft * filter_fft
     Plans.inverse_transform!(out, plan, buffer)
     return out
 end
@@ -75,9 +74,9 @@ end
 In-place modulus. Stores |signal| in pre-allocated `out`. Zero allocation.
 """
 function apply_modulus!(out::AbstractArray, signal::AbstractArray)
-    @inbounds @simd for i in eachindex(out, signal)
-        out[i] = abs(signal[i])
-    end
+    # Broadcast: CPU + GPU compatible (no scalar indexing). On GPU arrays this fuses to one
+    # kernel; the KernelAbstractions extension provides an explicit-kernel override.
+    @. out = abs(signal)
     return out
 end
 
