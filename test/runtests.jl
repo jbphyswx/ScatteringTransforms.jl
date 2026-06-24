@@ -566,6 +566,30 @@ Test.@testset "Batched transforms reuse the plan and match per-signal results" b
     end
 end
 
+Test.@testset "Intermediate subsampling: exact at large oversampling, ≈ exact at small" begin
+    N = 256
+    J = 5
+    signal = randn(N)
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    exact = st(signal)
+
+    # Large oversampling ⇒ no decimation ⇒ identical to the exact transform.
+    sub_off = ScatteringTransforms.SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=J)
+    c_off = sub_off(signal)
+    Test.@test ScatteringTransforms.first_order(c_off) ≈ ScatteringTransforms.first_order(exact)
+    Test.@test ScatteringTransforms.second_order(c_off) ≈ ScatteringTransforms.second_order(exact)
+    Test.@test ScatteringTransforms.zeroth_order(c_off) ≈ ScatteringTransforms.zeroth_order(exact)
+
+    # Aggressive subsampling ⇒ S1 identical (full res), S2 close (decimated envelope).
+    sub_on = ScatteringTransforms.SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=1)
+    c_on = sub_on(signal)
+    Test.@test ScatteringTransforms.first_order(c_on) ≈ ScatteringTransforms.first_order(exact)
+    S2e = ScatteringTransforms.second_order(exact)
+    S2s = ScatteringTransforms.second_order(c_on)
+    denom = sum(abs2, S2e)
+    Test.@test sum(abs2, S2s .- S2e) / denom < 0.05    # within ~5% relative energy
+end
+
 Test.@testset "Threaded batch (OhMyThreads) matches serial batch" begin
     # ThreadedBackend parallelizes scattering_batch over the batch; each task uses its own
     # workspace, so results must be identical to the serial batch.

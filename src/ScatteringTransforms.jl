@@ -48,6 +48,7 @@ include("ScatteringFields.jl")
 include("Scattering1D.jl")
 include("Scattering2D.jl")
 include("Scattering3D.jl")
+include("SubsampledScattering.jl")
 include("Reductions.jl")
 
 # Import submodules using X: X pattern
@@ -62,6 +63,7 @@ using .ScatteringFields: ScatteringFields
 using .Scattering1D: Scattering1D
 using .Scattering2D: Scattering2D
 using .Scattering3D: Scattering3D
+using .SubsampledScattering: SubsampledScattering
 using .Coefficients: Coefficients
 using .Reductions: Reductions
 
@@ -69,6 +71,7 @@ using .Reductions: Reductions
 const ScatteringTransform1D = Scattering1D.ScatteringTransform1D
 const ScatteringTransform2D = Scattering2D.ScatteringTransform2D
 const ScatteringTransform3D = Scattering3D.ScatteringTransform3D
+const SubsampledScattering1D = SubsampledScattering.SubsampledScattering1D
 const FilterBank1D = FilterBanks.FilterBank1D
 const FilterBank2D = FilterBanks.FilterBank2D
 const FilterBank3D = FilterBanks.FilterBank3D
@@ -212,7 +215,7 @@ spherical_scattering(args...; kwargs...) = throw(ArgumentError(
 function plot_filter_bank end
 function plot_coefficients end
 
-export ScatteringTransform1D, ScatteringTransform2D, ScatteringTransform3D
+export ScatteringTransform1D, ScatteringTransform2D, ScatteringTransform3D, SubsampledScattering1D
 export FilterBank1D, FilterBank2D, FilterBank3D
 export build_filter_bank3d, scattering_transform3d!
 export WaveletMeta, ScatteringTree
