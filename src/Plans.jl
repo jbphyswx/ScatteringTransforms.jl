@@ -19,6 +19,7 @@ so the transform engine never references FFTW/CUDA directly.
 using LinearAlgebra: LinearAlgebra
 
 export AbstractScatteringPlan, DirectSumPlan, forward_transform!, inverse_transform!, make_plan
+export forward_transform, inverse_transform
 export AbstractSpectralBackend, DirectSumBackend, FFTBackend, AutoSpectral
 
 """
@@ -43,6 +44,31 @@ function forward_transform! end
 In-place inverse (ifft-convention, `1/N`-scaled) spectral transform.
 """
 function inverse_transform! end
+
+"""
+    forward_transform(plan, x) -> X̂
+    inverse_transform(plan, x) -> x
+
+Non-mutating, allocating, element-type-generic spectral transforms — the autodiff-friendly
+counterparts of the in-place `forward_transform!`/`inverse_transform!`. They never touch the
+plan's preallocated (`Complex{Float64}`-pinned) scratch buffers and never mutate their inputs,
+so they accept `ForwardDiff.Dual`/`Float32`/etc. inputs and are differentiable by reverse-mode
+backends (Mooncake/Zygote). Used by the non-mutating `scattering(st, x)` synthesis path; the
+in-place `!` versions remain the production hot path.
+
+The in-core [`DirectSumPlan`](@ref) implements these as dense per-axis DFT matrix-multiplies
+(`W*x`) — differentiable by *every* AD backend with no special rules, but `O(N²)`; the FFTW
+extension provides an `O(N log N)` method (`plan * x`, differentiable via `AbstractFFTs`
+ChainRules). For large synthesis problems, load `using FFTW`.
+"""
+function forward_transform end
+
+"""
+    inverse_transform(plan, x) -> x
+
+See [`forward_transform`](@ref).
+"""
+function inverse_transform end
 
 """
     fftw_plan(T, dims)
@@ -184,5 +210,64 @@ forward_transform!(out::AbstractArray{<:Any,3}, p::DirectSumPlan{T,V,3}, x::Abst
     _dft3!(out, x, p, false)
 inverse_transform!(out::AbstractArray{<:Any,3}, p::DirectSumPlan{T,V,3}, x::AbstractArray{<:Any,3}) where {T,V} =
     _dft3!(out, x, p, true)
+
+# ---------------------------------------------------------------------------
+# Non-mutating, autodiff-friendly direct-sum transforms (dense DFT matrix per axis).
+# Built from the read-only twiddle table each call; slow (O(N²)) but pure and differentiable.
+# ---------------------------------------------------------------------------
+
+# Dense per-axis DFT matrix W[k,n] = exp(∓2πi (k-1)(n-1)/N) from the twiddle table (no 1/N here;
+# the inverse scaling is applied once over all axes by the caller). W is symmetric in (k,n).
+function _dft_matrix(tw::AbstractVector{Complex{T}}, N::Int, inverse::Bool) where {T}
+    return [inverse ? conj(tw[((k - 1) * (n - 1)) % N + 1]) : tw[((k - 1) * (n - 1)) % N + 1]
+            for k in 1:N, n in 1:N]
+end
+
+# Apply a 1D operator matrix F along dimension `d` of a 3D array via permute/reshape/matmul.
+# (2,1,3) and (3,2,1) are involutions, so the same perm restores the layout.
+function _apply_along(F::AbstractMatrix, A::AbstractArray{<:Any,3}, d::Int)
+    if d == 1
+        sz = size(A)
+        return reshape(F * reshape(A, sz[1], :), sz...)
+    end
+    perm = d == 2 ? (2, 1, 3) : (3, 2, 1)
+    Ap = permutedims(A, perm)
+    sz = size(Ap)
+    R = reshape(F * reshape(Ap, sz[1], :), sz...)
+    return permutedims(R, perm)
+end
+
+function forward_transform(p::DirectSumPlan{T,V,1}, x::AbstractVector) where {T,V}
+    return _dft_matrix(p.twiddle[1], p.dims[1], false) * x
+end
+function inverse_transform(p::DirectSumPlan{T,V,1}, x::AbstractVector) where {T,V}
+    return (_dft_matrix(p.twiddle[1], p.dims[1], true) * x) .* inv(T(p.dims[1]))
+end
+
+function forward_transform(p::DirectSumPlan{T,V,2}, x::AbstractMatrix) where {T,V}
+    F1 = _dft_matrix(p.twiddle[1], p.dims[1], false)
+    F2 = _dft_matrix(p.twiddle[2], p.dims[2], false)
+    return F1 * x * transpose(F2)
+end
+function inverse_transform(p::DirectSumPlan{T,V,2}, x::AbstractMatrix) where {T,V}
+    F1 = _dft_matrix(p.twiddle[1], p.dims[1], true)
+    F2 = _dft_matrix(p.twiddle[2], p.dims[2], true)
+    return (F1 * x * transpose(F2)) .* inv(T(p.dims[1] * p.dims[2]))
+end
+
+function forward_transform(p::DirectSumPlan{T,V,3}, x::AbstractArray{<:Any,3}) where {T,V}
+    y = x
+    for d in 1:3
+        y = _apply_along(_dft_matrix(p.twiddle[d], p.dims[d], false), y, d)
+    end
+    return y
+end
+function inverse_transform(p::DirectSumPlan{T,V,3}, x::AbstractArray{<:Any,3}) where {T,V}
+    y = x
+    for d in 1:3
+        y = _apply_along(_dft_matrix(p.twiddle[d], p.dims[d], true), y, d)
+    end
+    return y .* inv(T(prod(p.dims)))
+end
 
 end # module Plans

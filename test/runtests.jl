@@ -12,6 +12,9 @@ using Distributed: Distributed
 using MPI: MPI
 using NUFSHT: NUFSHT
 using Statistics: Statistics
+using DifferentiationInterface: DifferentiationInterface as DI
+using ADTypes: AutoMooncake
+import Mooncake
 
 # Run Aqua quality tests first
 Test.@testset "Aqua.jl quality tests" begin
@@ -27,6 +30,7 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
     for extname in (
         :ScatteringTransformsCUDAExt,
         :ScatteringTransformsCairoMakieExt,
+        :ScatteringTransformsDifferentiationInterfaceExt,
         :ScatteringTransformsFFTWExt,
         :ScatteringTransformsKernelAbstractionsExt,
         :ScatteringTransformsNUFSHTExt,
@@ -521,6 +525,37 @@ Test.@testset "Spherical scattering (NUFSHT, smooth difference-of-Gaussians band
     Test.@test all(isfinite, res.S1)
 end
 
+Test.@testset "Spherical MONOGENIC scattering (Riesz amplitude via spin-0 Bochner identity)" begin
+    lmax = 24
+    J = 3
+    M = 800
+    # Deterministic, well-distributed Fibonacci-sphere points (the scattered-adjoint SHT is much
+    # more accurate on a quasi-uniform set than on i.i.d. random points).
+    gr = (sqrt(5) - 1) / 2
+    θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φ = [2π * mod(k * gr, 1) for k in 1:M]
+    st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J)
+    res = st(randn(M))
+    Test.@test length(res.S1) == J
+    Test.@test all(res.S1 .>= 0)              # monogenic amplitude is non-negative
+    Test.@test all(isfinite, res.S1)
+    Test.@test size(res.S2) == (J, J)
+    for j1 in 1:J, j2 in j1:J                 # second order only for strictly coarser j2 < j1
+        Test.@test res.S2[j1, j2] == 0
+    end
+    Test.@test any(res.S2[j1, j2] > 0 for j1 in 1:J for j2 in 1:(j1 - 1))
+
+    # Rotation covariance about z: a smooth field and its φ-rotation give matching coefficients.
+    α = 0.7
+    f = cos.(θ) .^ 2 .- 1/3 .+ 0.5 .* sin.(θ) .* cos.(φ)
+    fα = cos.(θ) .^ 2 .- 1/3 .+ 0.5 .* sin.(θ) .* cos.(φ .+ α)
+    r0 = st(f); rα = st(fα)
+    Test.@test maximum(abs.(r0.S1 .- rα.S1)) / maximum(abs.(r0.S1)) < 0.05
+
+    # Pointwise orientation/phase on S² is not implemented yet (needs spin-1; tracked).
+    Test.@test_throws ErrorException ScatteringTransforms.spherical_monogenic_components(st, f, 1)
+end
+
 Test.@testset "3D Morlet wavelet: analytic + zero-mean" begin
     N = (16, 16, 16)
     dirs = ScatteringTransforms.Filters.fibonacci_directions(6, Float64)
@@ -796,6 +831,190 @@ Test.@testset "Reduced descriptors: sparsity, shape (anisotropy), normalize, log
     lc = ScatteringTransforms.log_coefficients(ca)
     Test.@test all(isfinite, lc.logS1)
     Test.@test length(lc.logS1) == length(S1a)
+end
+
+Test.@testset "Non-mutating scattering(st,x) matches the in-place st(x) (1D/2D/3D)" begin
+    # The autodiff-friendly forward must reproduce the production (mutating) transform exactly.
+    let
+        N, J = 64, 4
+        x = randn(N)
+        for spec in (ScatteringTransforms.DirectSumBackend(), ScatteringTransforms.FFTBackend())
+            st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=2, max_order=2, spectral=spec)
+            cm = st(x); cs = ScatteringTransforms.scattering(st, x)
+            Test.@test ScatteringTransforms.zeroth_order(cm) ≈ ScatteringTransforms.zeroth_order(cs)
+            Test.@test ScatteringTransforms.first_order(cm) ≈ ScatteringTransforms.first_order(cs)
+            Test.@test ScatteringTransforms.second_order(cm) ≈ ScatteringTransforms.second_order(cs)
+        end
+    end
+    let
+        st = ScatteringTransforms.ScatteringTransform2D((16, 16), 2; L=4, max_order=2)
+        x = randn(16, 16)
+        cm = st(x); cs = ScatteringTransforms.scattering(st, x)
+        Test.@test ScatteringTransforms.first_order(cm) ≈ ScatteringTransforms.first_order(cs)
+        Test.@test ScatteringTransforms.second_order(cm) ≈ ScatteringTransforms.second_order(cs)
+    end
+    let
+        st = ScatteringTransforms.ScatteringTransform3D((8, 8, 8), 2; n_orient=6, max_order=2)
+        x = randn(8, 8, 8)
+        cm = st(x); cs = ScatteringTransforms.scattering(st, x)
+        Test.@test ScatteringTransforms.first_order(cm) ≈ ScatteringTransforms.first_order(cs)
+        Test.@test ScatteringTransforms.second_order(cm) ≈ ScatteringTransforms.second_order(cs)
+    end
+    # Element-type genericity: Float32 in -> Float32 out through the non-mutating path.
+    let
+        st = ScatteringTransforms.ScatteringTransform1D(32, 3; Q=1, max_order=2, T=Float32)
+        cs = ScatteringTransforms.scattering(st, randn(Float32, 32))
+        Test.@test eltype(ScatteringTransforms.first_order(cs)) == Float32
+    end
+end
+
+Test.@testset "Autodiff through scattering(st,x): Mooncake gradient matches finite differences" begin
+    N, J = 32, 3
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2,
+                                                    spectral=ScatteringTransforms.DirectSumBackend())
+    xt = randn(N)
+    target = ScatteringTransforms.scattering(st, xt)
+    t1 = ScatteringTransforms.first_order(target)
+    t2 = ScatteringTransforms.second_order(target)
+    loss(x) = sum(abs2, ScatteringTransforms.first_order(ScatteringTransforms.scattering(st, x)) .- t1) +
+              sum(abs2, ScatteringTransforms.second_order(ScatteringTransforms.scattering(st, x)) .- t2)
+
+    backend = AutoMooncake()
+    x0 = randn(N)
+    prep = DI.prepare_gradient(loss, backend, x0)
+    val, grad = DI.value_and_gradient(loss, prep, backend, x0)
+    Test.@test all(isfinite, grad)
+    Test.@test val ≈ loss(x0)
+
+    # Directional finite-difference check.
+    d = randn(N); h = 1e-6
+    fd = (loss(x0 .+ h .* d) - loss(x0 .- h .* d)) / (2h)
+    Test.@test isapprox(sum(grad .* d), fd; rtol=1e-3, atol=1e-8)
+end
+
+Test.@testset "Exact linear wavelet-frame inverse: iwavelet ∘ wavelet_transform ≈ id (1D/2D/3D)" begin
+    let
+        N, J = 128, 5
+        x = randn(N)
+        st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=1)
+        xr = ScatteringTransforms.iwavelet(st, ScatteringTransforms.wavelet_transform(st, x))
+        Test.@test xr ≈ x  rtol=1e-9
+    end
+    let
+        N, J = (32, 32), 3
+        x = randn(N)
+        st = ScatteringTransforms.ScatteringTransform2D(N, J; L=4, max_order=1)
+        xr = ScatteringTransforms.iwavelet(st, ScatteringTransforms.wavelet_transform(st, x))
+        Test.@test xr ≈ x  rtol=1e-9
+    end
+    let
+        N, J = (16, 16, 16), 2
+        x = randn(N)
+        st = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=6, max_order=1)
+        xr = ScatteringTransforms.iwavelet(st, ScatteringTransforms.wavelet_transform(st, x))
+        Test.@test xr ≈ x  rtol=1e-9
+    end
+end
+
+Test.@testset "Phase retrieval (Gerchberg–Saxton): reconstructed moduli match target" begin
+    N, J = 128, 6
+    x = randn(N)
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=2, max_order=1)
+    wt = ScatteringTransforms.wavelet_transform(st, x)
+    moduli = [abs.(w) for w in wt.wavelet]
+    xhat = ScatteringTransforms.reconstruct_phase(st, moduli; iters=400, init=randn(N))
+    wt2 = ScatteringTransforms.wavelet_transform(st, xhat)
+    num = sqrt(sum(sum(abs2, abs.(w2) .- m) for (w2, m) in zip(wt2.wavelet, moduli)))
+    den = sqrt(sum(sum(abs2, m) for m in moduli))
+    Test.@test num / den < 0.15      # alternating projections drive the modulus error down
+end
+
+Test.@testset "Gradient-descent synthesis (DifferentiationInterface ext, Mooncake)" begin
+    # synthesize: from noise, descend ‖S(x̂) − S(target)‖² so the coefficients converge.
+    N, J = 48, 4
+    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2,
+                                                    spectral=ScatteringTransforms.DirectSumBackend())
+    xtarget = cumsum(randn(N)); xtarget .-= sum(xtarget) / N
+    res = ScatteringTransforms.synthesize(st, xtarget;
+                                          backend=AutoMooncake(), init=randn(N), iters=150, lr=0.05)
+    Test.@test length(res.losses) == 150
+    Test.@test all(isfinite, res.field)
+    Test.@test res.losses[end] < res.losses[1] / 5           # objective drops substantially
+
+    # Synthesized coefficients approach the target's.
+    ct = ScatteringTransforms.scattering(st, xtarget)
+    cs = ScatteringTransforms.scattering(st, res.field)
+    rel = sqrt(sum(abs2, ScatteringTransforms.first_order(cs) .- ScatteringTransforms.first_order(ct))) /
+          sqrt(sum(abs2, ScatteringTransforms.first_order(ct)))
+    Test.@test rel < 0.1
+
+    # Target may also be passed as a precomputed coefficient container.
+    res2 = ScatteringTransforms.synthesize(st, ct; backend=AutoMooncake(), init=randn(N), iters=20)
+    Test.@test res2.losses[end] < res2.losses[1]
+end
+
+Test.@testset "Monogenic (Riesz) scattering: partition, tight frame, transforms" begin
+    # Riesz multipliers partition unity off the DC bin: Σ_d |R_d(k)|² = 1, and vanish at DC.
+    for dims in ((32,), (16, 16), (8, 8, 8))
+        R = ScatteringTransforms.riesz_multipliers(dims, Float64)
+        s = sum(abs2.(Rd) for Rd in R)
+        Test.@test s[1] == 0                              # DC
+        offdc = [s[i] for i in CartesianIndices(dims) if i != first(CartesianIndices(dims))]
+        Test.@test maximum(abs.(offdc .- 1)) < 1e-12
+    end
+
+    # Isotropic bank is a tight frame: Σ_j |ψ̂_j|² + |φ̂|² ≡ 1.
+    let
+        fb = ScatteringTransforms.build_monogenic_bank((32, 32), 3; Q=1)
+        s = abs2.(fb.averaging)
+        for ψ in fb.wavelets
+            s = s .+ abs2.(ψ)
+        end
+        Test.@test maximum(abs.(s .- 1)) < 1e-12
+    end
+
+    # 1D/2D/3D transforms run, finite, correct coefficient counts; Float32 preserved.
+    for (dims, J, n) in (((128,), 5, 5), ((32, 32), 3, 3), ((16, 16, 16), 2, 2))
+        st = ScatteringTransforms.MonogenicScattering(dims, J; Q=1, max_order=2)
+        c = st(randn(dims...))
+        Test.@test length(ScatteringTransforms.first_order(c)) == n
+        Test.@test all(isfinite, ScatteringTransforms.first_order(c))
+        Test.@test all(isfinite, ScatteringTransforms.second_order(c))
+    end
+    let
+        stf = ScatteringTransforms.MonogenicScattering((32, 32), 2; Q=1, max_order=2, T=Float32)
+        cf = stf(randn(Float32, 32, 32))
+        Test.@test eltype(ScatteringTransforms.first_order(cf)) == Float32
+    end
+end
+
+Test.@testset "Monogenic: rotation invariance + continuous orientation recovery" begin
+    # Averaged monogenic coefficients are rotation-invariant (90° rotation is exact on a grid).
+    let
+        M, J = 64, 3
+        f = [sin(2π * 3 * i / M) + 0.5 * cos(2π * 5 * j / M) for i in 0:M-1, j in 0:M-1] .+
+            0.1 .* randn(M, M)
+        st = ScatteringTransforms.MonogenicScattering((M, M), J; Q=1, max_order=2)
+        c0 = st(f); c90 = st(rotr90(f))
+        rel = maximum(abs.(ScatteringTransforms.first_order(c0) .- ScatteringTransforms.first_order(c90))) /
+              maximum(abs.(ScatteringTransforms.first_order(c0)))
+        Test.@test rel < 1e-6
+    end
+    # The Riesz vector recovers a plane wave's orientation (continuously, not quantized).
+    let
+        M, θ, n = 64, 0.6, 8
+        kx, ky = cos(θ), sin(θ)
+        f = [cos(2π * n * (kx * i + ky * j) / M) for i in 0:M-1, j in 0:M-1]
+        st = ScatteringTransforms.MonogenicScattering((M, M), 5; Q=1, max_order=1)
+        best = argmax([sum(abs2, ScatteringTransforms.monogenic_components(st, f, jj).bandpass) for jj in 1:5])
+        comp = ScatteringTransforms.monogenic_components(st, f, best)
+        r1, r2, amp = comp.riesz[1], comp.riesz[2], comp.amplitude
+        mask = amp .> 0.5 * maximum(amp)
+        c2 = sum((r1[k]^2 - r2[k]^2) for k in CartesianIndices(f) if mask[k])
+        s2 = sum((2 * r1[k] * r2[k]) for k in CartesianIndices(f) if mask[k])
+        est = mod(atan(s2, c2) / 2, π)                    # orientation is defined mod π
+        Test.@test min(abs(est - θ), π - abs(est - θ)) < 0.05
+    end
 end
 
 end # module

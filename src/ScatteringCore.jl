@@ -17,7 +17,24 @@ using ..Plans: Plans
 
 export wavelet_convolve, wavelet_convolve!
 export apply_modulus, apply_modulus!, spatial_average
+export scattering
 export ScatteringLayer
+
+"""
+    scattering(st, x) -> ScatteringCoefficients
+
+Non-mutating, allocation-tolerant, element-type-generic scattering transform — the
+autodiff-friendly counterpart of the in-place callable `st(x)`. It composes the non-mutating
+[`Plans.forward_transform`](@ref)/[`Plans.inverse_transform`](@ref) with broadcast modulus and
+mean (no preallocated workspace, no `mul!`), so gradients flow through it via
+DifferentiationInterface (Mooncake/Zygote/Enzyme) and it accepts `Dual`/`Float32` inputs. It
+returns the same coefficient container as `st(x)` and matches it numerically. Methods are added
+for the 1D/2D/3D transforms in their respective submodules.
+
+Use `st(x)` (mutating, zero-alloc) for production forward passes; use `scattering(st, x)` when
+you need to differentiate the forward map (e.g. gradient-descent synthesis).
+"""
+function scattering end
 
 """
     wavelet_convolve(signal_fft, filter_fft, plan)

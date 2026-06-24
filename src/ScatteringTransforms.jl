@@ -50,6 +50,8 @@ include("Scattering2D.jl")
 include("Scattering3D.jl")
 include("SubsampledScattering.jl")
 include("Reductions.jl")
+include("Monogenic.jl")
+include("Inverse.jl")
 
 # Import submodules using X: X pattern
 using .Backends: Backends
@@ -66,6 +68,8 @@ using .Scattering3D: Scattering3D
 using .SubsampledScattering: SubsampledScattering
 using .Coefficients: Coefficients
 using .Reductions: Reductions
+using .Monogenic: Monogenic
+using .Inverse: Inverse
 
 # Re-export key types from submodules (using X: X pattern)
 const ScatteringTransform1D = Scattering1D.ScatteringTransform1D
@@ -97,6 +101,9 @@ const DirectSumPlan = Plans.DirectSumPlan
 const AbstractScatteringPlan = Plans.AbstractScatteringPlan
 const forward_transform! = Plans.forward_transform!
 const inverse_transform! = Plans.inverse_transform!
+const forward_transform = Plans.forward_transform
+const inverse_transform = Plans.inverse_transform
+const scattering = ScatteringCore.scattering
 # Spectral backend selectors (type-dispatched, not symbols)
 const AbstractSpectralBackend = Plans.AbstractSpectralBackend
 const DirectSumBackend = Plans.DirectSumBackend
@@ -129,6 +136,17 @@ const compute_S2_2d! = Scattering2D.compute_S2_2d!
 const compute_shape_sparsity = Scattering2D.compute_shape_sparsity
 const normalized_coefficients = Reductions.normalized_coefficients
 const log_coefficients = Reductions.log_coefficients
+# Reconstruction (Inverse.jl): exact linear wavelet-frame inverse + phase retrieval
+const wavelet_transform = Inverse.wavelet_transform
+const iwavelet = Inverse.iwavelet
+const reconstruct_phase = Inverse.reconstruct_phase
+# Monogenic (Riesz) scattering — isotropic bank + monogenic amplitude (1D/2D/3D)
+const MonogenicScattering = Monogenic.MonogenicScattering
+const MonogenicFilterBank = Monogenic.MonogenicFilterBank
+const build_monogenic_bank = Monogenic.build_monogenic_bank
+const riesz_multipliers = Monogenic.riesz_multipliers
+const monogenic_amplitude = Monogenic.monogenic_amplitude
+const monogenic_components = Monogenic.monogenic_components
 
 # ============================================================================
 # Batched transforms — process a stack of signals/images reusing one plan + workspace
@@ -216,6 +234,80 @@ using smooth difference-of-Gaussians band-pass wavelets. Requires `using NUFSHT`
 spherical_scattering(args...; kwargs...) = throw(ArgumentError(
     "spherical scattering requires the NUFSHT extension — run `using NUFSHT`."))
 
+# Spherical *monogenic* scattering on S² (scattered points); method added by the NUFSHT extension.
+"""
+    spherical_monogenic_scattering(pts_theta, pts_phi, lmax, J; max_order=2)
+
+Build a **monogenic** spherical scattering transform for a scalar field at scattered points
+`(θ, φ)` on S². The nonlinearity is the spherical monogenic amplitude
+`A_j = √(U⁰_j² + |U^R_j|²)`, where `U⁰_j` is the difference-of-Gaussians band-pass and `U^R_j` is
+the spin-1 Riesz field `R = ð∘(−Δ_S)^{-1/2}`. The Riesz energy `|U^R_j|² = |∇_S g_j|²` (with
+`g_j = (−Δ_S)^{-1/2} U⁰_j`) is evaluated using only spin-0 spherical-harmonic transforms via the
+identity `|∇_S g|² = ½ Δ_S(g²) − g Δ_S g`, so no spin-weighted synthesis is required. Requires
+`using NUFSHT`.
+"""
+spherical_monogenic_scattering(args...; kwargs...) = throw(ArgumentError(
+    "spherical monogenic scattering requires the NUFSHT extension — run `using NUFSHT`."))
+
+"""
+    spherical_monogenic_components(st, field, j)
+
+Pointwise spherical monogenic decomposition (band-pass field, spin-1 Riesz *vector*, amplitude,
+phase, orientation) at scale `j` — the S² analogue of the planar [`monogenic_components`](@ref).
+
+!!! warning "Not implemented yet"
+    This requires **spin-1 (spin-weighted) synthesis at scattered points**, which NUFSHT does not
+    yet expose (the spin-0 surface-gradient shortcut recovers the amplitude exactly but gives
+    unreliable orientation). The amplitude-only [`spherical_monogenic_scattering`](@ref) is
+    complete and does not depend on this. Tracked: ScatteringTransforms.jl#1 (and upstream
+    NUFSHT.jl#1, for which FastSphericalHarmonics already provides the spin-weighted primitives).
+"""
+function spherical_monogenic_components(args...; kwargs...)
+    error("`spherical_monogenic_components` (pointwise orientation/phase on S²) is not implemented " *
+          "yet — it needs spin-1 scattered synthesis in NUFSHT. See ScatteringTransforms.jl#1 and " *
+          "NUFSHT.jl#1. The amplitude-only `spherical_monogenic_scattering` is available now.")
+end
+
+"""
+    scattering_loss(c, target) -> Real
+
+Default [`synthesize`](@ref) objective: the normalized squared error between the coefficient
+container `c` and the `target`, summed over the first- and (when present) second-order
+coefficients, `‖S₁(c)−S₁(t)‖² + ‖S₂(c)−S₂(t)‖²` divided by the target energy. Differentiable in
+`c`, so it composes with `scattering(st, ·)` under autodiff.
+"""
+function scattering_loss(c, target)
+    s1c = first_order(c)
+    s1t = first_order(target)
+    num = sum(abs2, s1c .- s1t)
+    den = sum(abs2, s1t)
+    s2t = second_order(target)
+    if !isempty(s2t)
+        num = num + sum(abs2, second_order(c) .- s2t)
+        den = den + sum(abs2, s2t)
+    end
+    return num / (den + eps(float(real(eltype(s1t)))))
+end
+
+# Gradient-descent synthesis from scattering coefficients (method added by the
+# DifferentiationInterface extension; the differentiable forward is `scattering(st, x)`).
+"""
+    synthesize(st, target; backend, init=nothing, iters=500, lr=0.05, loss=normalized_l2) -> (; field, losses)
+
+Reconstruct a field whose scattering coefficients match `target` by gradient descent
+(Bruna & Mallat microcanonical synthesis): starting from `init` (random by default), minimize
+`loss(scattering(st, x̂), target)` with Adam. `target` may be a precomputed coefficient container
+or a field (its coefficients are taken first). The gradient is obtained through
+DifferentiationInterface, so `backend` is any `ADTypes` backend (e.g. `AutoMooncake()`); the
+synthesized result is a *sample* with matching statistics, not the exact original (the modulus
+discards local phase). Requires `using DifferentiationInterface` and an AD backend package.
+"""
+function synthesize(args...; kwargs...)
+    throw(ArgumentError(
+        "`synthesize` requires the DifferentiationInterface extension and an AD backend — run " *
+        "`using DifferentiationInterface` and e.g. `using Mooncake`, then pass `backend = AutoMooncake()`."))
+end
+
 # Plotting stubs (implemented in ScatteringTransformsCairoMakieExt)
 function plot_filter_bank end
 function plot_coefficients end
@@ -227,6 +319,7 @@ export WaveletMeta, ScatteringTree
 export SerialBackend, ThreadedBackend, GPUBackend, AutoBackend, DistributedBackend, MPIBackend
 export Line1D, Plane2D, Volume3D, Sphere
 export DirectSumPlan, AbstractScatteringPlan, forward_transform!, inverse_transform!
+export forward_transform, inverse_transform, scattering
 export AbstractSpectralBackend, DirectSumBackend, FFTBackend, AutoSpectral
 export Morlet1D, Morlet2D, Morlet3D
 export ScatteringCoefficients1D, ScatteringCoefficients2D
@@ -241,7 +334,11 @@ export scattering_field, scattering_field!
 export ScatteringField1D, ScatteringField2D, path_field
 export compute_S1_2d!, compute_S2_2d!
 export compute_shape_sparsity, normalized_coefficients, log_coefficients
-export spherical_scattering
+export wavelet_transform, iwavelet, reconstruct_phase
+export MonogenicScattering, MonogenicFilterBank, build_monogenic_bank
+export riesz_multipliers, monogenic_amplitude, monogenic_components
+export spherical_scattering, spherical_monogenic_scattering, spherical_monogenic_components
+export synthesize, scattering_loss
 export plot_filter_bank, plot_coefficients
 
 # Precompile the hot paths (using the dependency-free direct-sum backend, so no weakdep is

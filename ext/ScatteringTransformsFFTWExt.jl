@@ -36,4 +36,10 @@ Plans.forward_transform!(out::AbstractArray, p::FFTWScatteringPlan, x::AbstractA
 Plans.inverse_transform!(out::AbstractArray, p::FFTWScatteringPlan, x::AbstractArray) =
     (LinearAlgebra.mul!(out, p.inv, x); out)
 
+# Non-mutating, autodiff-friendly fast path: `plan * x` allocates and is differentiable via the
+# `AbstractFFTs` ChainRules (reverse-mode Mooncake/Zygote). The primal must be `Complex{Float64}`
+# (the planned eltype), so this serves reverse-mode synthesis; `Dual` inputs need the direct sum.
+Plans.forward_transform(p::FFTWScatteringPlan, x::AbstractArray) = p.fwd * x
+Plans.inverse_transform(p::FFTWScatteringPlan, x::AbstractArray) = p.inv * x
+
 end # module ScatteringTransformsFFTWExt

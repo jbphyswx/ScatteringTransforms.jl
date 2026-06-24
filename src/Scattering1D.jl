@@ -281,4 +281,46 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
     return field
 end
 
+# ============================================================================
+# Non-mutating, autodiff-friendly forward (Part A): composes the non-mutating spectral
+# transforms with broadcast modulus + mean. No preallocated workspace, no in-place writes —
+# so it differentiates cleanly through DifferentiationInterface and accepts Dual/Float32 inputs.
+# Numerically matches the in-place `st(signal)`.
+# ============================================================================
+
+function ScatteringCore.scattering(st::ScatteringTransform1D, signal::AbstractVector)
+    plan = st.plan
+    fb = st.filter_bank
+    tree = st.tree
+    n = length(fb.wavelets)
+
+    Xf = Plans.forward_transform(plan, complex.(signal))
+    # First-order moduli |x ⋆ ψ_j| and their means S1[j].
+    U1 = map(ψ -> abs.(Plans.inverse_transform(plan, Xf .* ψ)), fb.wavelets)
+    S1 = map(u -> sum(u) / length(u), U1)
+    S0 = sum(signal) / length(signal)
+
+    if st.max_order >= 2 && length(tree.by_order) >= 3
+        U1f = map(u -> Plans.forward_transform(plan, complex.(u)), U1)
+        r2 = PathGraph.order_range(tree, 2)
+        s2vals = map(collect(r2)) do p
+            idx = PathGraph.path_indices(tree, p)
+            m = abs.(Plans.inverse_transform(plan, U1f[idx[1]] .* fb.wavelets[idx[2]]))
+            sum(m) / length(m)
+        end
+        # Route path-aligned values into the dense (j1,j2) S2 matrix. `pos` is plain-integer
+        # bookkeeping (outside the differentiable path); the comprehension just reads s2vals.
+        pos = zeros(Int, n, n)
+        for (k, p) in enumerate(r2)
+            idx = PathGraph.path_indices(tree, p)
+            pos[idx[1], idx[2]] = k
+        end
+        Tc = eltype(s2vals)
+        S2 = [pos[j1, j2] == 0 ? zero(Tc) : s2vals[pos[j1, j2]] for j1 in 1:n, j2 in 1:n]
+    else
+        S2 = Matrix{eltype(S1)}(undef, 0, 0)
+    end
+    return Coefficients.ScatteringCoefficients1D(S1, S2; S0=S0)
+end
+
 end # module Scattering1D
