@@ -11,9 +11,7 @@ Workspace buffers (buffer_input, buffer_conv, buffer_mod, U1_buffers,
 U1_fft_buffers) are pre-allocated in the struct constructor.
 """
 
-using FFTW: FFTW
-using LinearAlgebra: LinearAlgebra
-
+using ..Plans: Plans
 using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Coefficients: Coefficients
@@ -37,7 +35,7 @@ export compute_shape_sparsity
 # Fields
 - `filter_bank`: Pre-computed 2D filter bank
 - `max_order::Int`: Maximum scattering order (1 or 2)
-- `fft_plan`, `ifft_plan`: Pre-planned 2D FFT/IFFT (used via `mul!`)
+- `plan`: spectral transform plan (in-core direct sum by default; FFTW fast path if loaded)
 - `buffer_input`: Complex matrix for real→complex promotion (zero alloc)
 - `buffer_signal_fft`: Preserved copy of signal FFT (buffer_conv gets overwritten)
 - `buffer_conv`: Complex matrix for IFFT output
@@ -45,12 +43,11 @@ export compute_shape_sparsity
 - `U1_buffers`: Real matrices for first-order moduli (one per wavelet)
 - `U1_fft_buffers`: Complex matrices for FFT of U1 (one per wavelet)
 """
-struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T},FP,IP,Tree<:PathGraph.ScatteringTree}
+struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T},P<:Plans.AbstractScatteringPlan,Tree<:PathGraph.ScatteringTree}
     filter_bank::FilterBanks.FilterBank2D{T,M}   # carry the matrix-type param M (was abstract {T})
     tree::Tree      # admissible scattering paths (source of truth for second-order)
     max_order::Int
-    fft_plan::FP    # concrete plan type param — no dynamic dispatch on mul!
-    ifft_plan::IP
+    plan::P         # spectral transform plan (direct-sum default, FFTW fast path); concrete type param
 
     buffer_input::M
     buffer_signal_fft::M
@@ -62,15 +59,15 @@ struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T
     function ScatteringTransform2D(N::NTuple{2,Int}, J::Int;
                                    L::Int=8,
                                    max_order::Int=2,
-                                   T::Type=Float64)
+                                   T::Type=Float64,
+                                   spectral::Symbol=:auto)
         filter_bank = FilterBanks.build_filter_bank2d(N, J; L=L, T=T)
         tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
 
-        # Pre-plan 2D FFTs; mul!(out, plan, src) is zero-allocation
+        # Spectral plan: in-core direct sum by default, FFTW fast path if loaded.
+        plan = Plans.make_plan(spectral, T, N)
+
         dummy = zeros(Complex{T}, N)
-        fft_plan  = FFTW.plan_fft(dummy)
-        ifft_plan = FFTW.plan_ifft(dummy)
-        
         num_w = length(filter_bank.wavelets)
         buffer_input      = similar(dummy)
         buffer_signal_fft = similar(dummy)
@@ -85,8 +82,8 @@ struct ScatteringTransform2D{T,M<:AbstractMatrix{Complex{T}},R<:AbstractMatrix{T
             U1_fft_buffers = Matrix{Complex{T}}[]
         end
         
-        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(fft_plan), typeof(ifft_plan), typeof(tree)}(
-            filter_bank, tree, max_order, fft_plan, ifft_plan,
+        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(plan), typeof(tree)}(
+            filter_bank, tree, max_order, plan,
             buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
             U1_buffers, U1_fft_buffers
         )
@@ -121,7 +118,7 @@ function scattering_transform2d!(coeffs::Coefficients.ScatteringCoefficients2D,
     end
     
     # Zero-alloc FFT via mul! — store into buffer_signal_fft (preserved across passes)
-    LinearAlgebra.mul!(st.buffer_signal_fft, st.fft_plan, st.buffer_input)
+    Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
     
     # S1: first order — buffer_signal_fft intact; compute_S1_2d! writes into buffer_conv
     compute_S1_2d!(coeffs.S1, st, st.buffer_signal_fft)
@@ -145,7 +142,7 @@ function compute_S1_2d!(S1::AbstractVector, st::ScatteringTransform2D,
                          image_fft::AbstractMatrix)
     @inbounds for (j, ψ_fft) in enumerate(st.filter_bank.wavelets)
         ScatteringCore.wavelet_convolve!(st.buffer_conv, image_fft, ψ_fft,
-                                          st.ifft_plan, st.buffer_input)
+                                          st.plan, st.buffer_input)
         ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
         S1[j] = ScatteringCore.spatial_average(st.buffer_mod)
     end
@@ -165,7 +162,7 @@ function compute_S2_2d!(S2::AbstractMatrix, st::ScatteringTransform2D,
     # Pass 1: first-order moduli into U1_buffers
     @inbounds for (j1, ψ1_fft) in enumerate(st.filter_bank.wavelets)
         ScatteringCore.wavelet_convolve!(st.buffer_conv, image_fft, ψ1_fft,
-                                          st.ifft_plan, st.buffer_input)
+                                          st.plan, st.buffer_input)
         ScatteringCore.apply_modulus!(st.U1_buffers[j1], st.buffer_conv)
     end
     
@@ -174,7 +171,7 @@ function compute_S2_2d!(S2::AbstractMatrix, st::ScatteringTransform2D,
         @simd for i in eachindex(st.U1_buffers[j1])
             st.buffer_input[i] = complex(st.U1_buffers[j1][i])
         end
-        LinearAlgebra.mul!(st.U1_fft_buffers[j1], st.fft_plan, st.buffer_input)
+        Plans.forward_transform!(st.U1_fft_buffers[j1], st.plan, st.buffer_input)
     end
     
     # Pass 3: second-order scattering over the ADMISSIBLE paths only. The constraint is
@@ -187,7 +184,7 @@ function compute_S2_2d!(S2::AbstractMatrix, st::ScatteringTransform2D,
         j1, j2 = idx[1], idx[2]
         ψ2_fft = st.filter_bank.wavelets[j2]
         ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1], ψ2_fft,
-                                          st.ifft_plan, st.buffer_input)
+                                          st.plan, st.buffer_input)
         ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
         S2[j1, j2] = ScatteringCore.spatial_average(st.buffer_mod)
     end
@@ -256,11 +253,11 @@ end
     @inbounds @simd for i in eachindex(U)
         st.buffer_input[i] = complex(U[i])
     end
-    LinearAlgebra.mul!(st.buffer_conv, st.fft_plan, st.buffer_input)        # U_fft -> buffer_conv
+    Plans.forward_transform!(st.buffer_conv, st.plan, st.buffer_input)     # U_fft -> buffer_conv
     @inbounds @simd for i in eachindex(st.buffer_conv)
         st.buffer_conv[i] *= φ[i]
     end
-    LinearAlgebra.mul!(st.buffer_input, st.ifft_plan, st.buffer_conv)       # (U ⋆ φ) -> buffer_input
+    Plans.inverse_transform!(st.buffer_input, st.plan, st.buffer_conv)     # (U ⋆ φ) -> buffer_input
     @inbounds for jx in 1:size(dst, 2), jy in 1:size(dst, 1)
         dst[jy, jx] = real(st.buffer_input[(jy - 1) * ds + 1, (jx - 1) * ds + 1])
     end
@@ -290,7 +287,7 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
     @inbounds @simd for i in eachindex(image)
         st.buffer_input[i] = complex(image[i])
     end
-    LinearAlgebra.mul!(st.buffer_signal_fft, st.fft_plan, st.buffer_input)
+    Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
 
     # order 0 (root): (x ⋆ φ_J) ↓
     @inbounds @simd for i in eachindex(image)
@@ -303,7 +300,7 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
     @inbounds for p in PathGraph.order_range(tree, 1)
         j = PathGraph.path_indices(tree, p)[1]
         ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft,
-            st.filter_bank.wavelets[j], st.ifft_plan, st.buffer_input)
+            st.filter_bank.wavelets[j], st.plan, st.buffer_input)
         ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
         _lowpass_downsample!(view(data, :, :, p), st, st.buffer_mod, ds)
     end
@@ -313,20 +310,20 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
         num_w = length(st.filter_bank.wavelets)
         @inbounds for (j1, ψ1_fft) in enumerate(st.filter_bank.wavelets)
             ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft, ψ1_fft,
-                st.ifft_plan, st.buffer_input)
+                st.plan, st.buffer_input)
             ScatteringCore.apply_modulus!(st.U1_buffers[j1], st.buffer_conv)
         end
         @inbounds for j1 in 1:num_w
             @simd for i in eachindex(st.U1_buffers[j1])
                 st.buffer_input[i] = complex(st.U1_buffers[j1][i])
             end
-            LinearAlgebra.mul!(st.U1_fft_buffers[j1], st.fft_plan, st.buffer_input)
+            Plans.forward_transform!(st.U1_fft_buffers[j1], st.plan, st.buffer_input)
         end
         @inbounds for p in PathGraph.order_range(tree, 2)
             idx = PathGraph.path_indices(tree, p)
             j1, j2 = idx[1], idx[2]
             ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1],
-                st.filter_bank.wavelets[j2], st.ifft_plan, st.buffer_input)
+                st.filter_bank.wavelets[j2], st.plan, st.buffer_input)
             ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
             _lowpass_downsample!(view(data, :, :, p), st, st.buffer_mod, ds)
         end

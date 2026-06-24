@@ -6,10 +6,8 @@ module Scattering1D
 Implements first- and second-order 1D scattering transforms.
 """
 
-using FFTW: FFTW
-using LinearAlgebra: LinearAlgebra
-
 # Import sibling modules
+using ..Plans: Plans
 using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Coefficients: Coefficients
@@ -27,8 +25,7 @@ export scattering_transform!, compute_S1!, compute_S2!
 # Fields
 - `filter_bank::FilterBanks.FilterBank1D{T,V}`: Pre-computed filter bank
 - `max_order::Int`: Maximum scattering order (1 or 2)
-- `fft_plan`: Pre-planned FFT (via `mul!`)
-- `ifft_plan`: Pre-planned IFFT (via `mul!`)
+- `plan`: spectral transform plan (in-core direct sum by default; FFTW fast path if loaded)
 - `buffer_input`: Complex buffer for real→complex cast of input (zero alloc)
 - `buffer_signal_fft`: Complex buffer holding the FFT of the input signal (preserved across S1/S2 passes)
 - `buffer_conv`: Complex buffer for convolution output (IFFT result)
@@ -36,12 +33,11 @@ export scattering_transform!, compute_S1!, compute_S2!
 - `U1_buffers`: Vector of real buffers for S2 computation (one per wavelet)
 - `U1_fft_buffers`: Vector of complex buffers for FFT of U1 (one per wavelet)
 """
-struct ScatteringTransform1D{T,V<:AbstractVector{Complex{T}},M<:AbstractVector{T},FP,IP,Tree<:PathGraph.ScatteringTree}
+struct ScatteringTransform1D{T,V<:AbstractVector{Complex{T}},M<:AbstractVector{T},P<:Plans.AbstractScatteringPlan,Tree<:PathGraph.ScatteringTree}
     filter_bank::FilterBanks.FilterBank1D{T,V}
     tree::Tree      # admissible scattering paths (source of truth for second-order)
     max_order::Int
-    fft_plan::FP    # concrete plan type param — no dynamic dispatch on mul!
-    ifft_plan::IP
+    plan::P         # spectral transform plan (direct-sum default, FFTW fast path); concrete type param
 
     # Workspace buffers for zero-allocation transforms
     buffer_input::V       # Complex buffer for real→complex promotion of input
@@ -51,26 +47,25 @@ struct ScatteringTransform1D{T,V<:AbstractVector{Complex{T}},M<:AbstractVector{T
     U1_buffers::Vector{M}    # Real buffers for S2 first-order moduli
     U1_fft_buffers::Vector{V}  # Complex buffers for FFT of each U1
     
-    function ScatteringTransform1D(N::Int, J::Int; 
-                                   Q::Int=1, 
+    function ScatteringTransform1D(N::Int, J::Int;
+                                   Q::Int=1,
                                    max_order::Int=2,
-                                   T::Type=Float64)
+                                   T::Type=Float64,
+                                   spectral::Symbol=:auto)
         filter_bank = FilterBanks.build_filter_bank1d(N, J; Q=Q, T=T)
         tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
 
-        # Pre-plan FFTs using plan_fft / plan_ifft
-        # mul!(out, plan, src) writes result directly into out — zero allocation
-        dummy = zeros(Complex{T}, N)
-        fft_plan  = FFTW.plan_fft(dummy)
-        ifft_plan = FFTW.plan_ifft(dummy)
-        
+        # Spectral plan: in-core direct sum by default, FFTW fast path if loaded.
+        plan = Plans.make_plan(spectral, T, (N,))
+
         # Pre-allocate workspace buffers
+        dummy = zeros(Complex{T}, N)
         num_w = length(filter_bank.wavelets)
         buffer_input      = similar(dummy)   # for real→complex of input
         buffer_signal_fft = similar(dummy)   # preserved copy of signal FFT
         buffer_conv       = similar(dummy)   # convolution / ifft output
         buffer_mod        = Vector{T}(undef, N)
-        
+
         # Only allocate U1 / U1_fft buffers if S2 is needed
         if max_order >= 2
             U1_buffers     = [Vector{T}(undef, N) for _ in 1:num_w]
@@ -79,9 +74,9 @@ struct ScatteringTransform1D{T,V<:AbstractVector{Complex{T}},M<:AbstractVector{T
             U1_buffers     = Vector{T}[]
             U1_fft_buffers = Vector{Complex{T}}[]
         end
-        
-        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(fft_plan), typeof(ifft_plan), typeof(tree)}(
-            filter_bank, tree, max_order, fft_plan, ifft_plan,
+
+        new{T, typeof(buffer_conv), typeof(buffer_mod), typeof(plan), typeof(tree)}(
+            filter_bank, tree, max_order, plan,
             buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
             U1_buffers, U1_fft_buffers
         )
@@ -121,7 +116,7 @@ function scattering_transform!(coeffs::Coefficients.ScatteringCoefficients1D,
     end
     
     # Zero-alloc FFT: mul!(out, plan, src) writes FFT(buffer_input) into buffer_signal_fft
-    LinearAlgebra.mul!(st.buffer_signal_fft, st.fft_plan, st.buffer_input)
+    Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
     
     # S1: First order — passes buffer_signal_fft as signal_fft.
     # NOTE: compute_S1! will overwrite buffer_conv but NOT buffer_signal_fft.
@@ -149,7 +144,7 @@ function compute_S1!(S1::AbstractVector, st::ScatteringTransform1D,
     @inbounds for (j, ψ_fft) in enumerate(st.filter_bank.wavelets)
         # buffer_input = scratch for multiply; buffer_conv = IFFT output (non-aliased)
         ScatteringCore.wavelet_convolve!(st.buffer_conv, signal_fft, ψ_fft, 
-                                          st.ifft_plan, st.buffer_input)
+                                          st.plan, st.buffer_input)
         
         # In-place modulus into buffer_mod
         ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
@@ -174,7 +169,7 @@ function compute_S2!(S2::AbstractMatrix, st::ScatteringTransform1D,
     # Pass 1: compute first-order moduli |x ★ ψ_j1| into U1_buffers
     @inbounds for (j1, ψ1_fft) in enumerate(st.filter_bank.wavelets)
         ScatteringCore.wavelet_convolve!(st.buffer_conv, signal_fft, ψ1_fft, 
-                                          st.ifft_plan, st.buffer_input)
+                                          st.plan, st.buffer_input)
         ScatteringCore.apply_modulus!(st.U1_buffers[j1], st.buffer_conv)
     end
     
@@ -184,7 +179,7 @@ function compute_S2!(S2::AbstractMatrix, st::ScatteringTransform1D,
         @simd for i in eachindex(st.U1_buffers[j1])
             st.buffer_input[i] = complex(st.U1_buffers[j1][i])
         end
-        LinearAlgebra.mul!(st.U1_fft_buffers[j1], st.fft_plan, st.buffer_input)
+        Plans.forward_transform!(st.U1_fft_buffers[j1], st.plan, st.buffer_input)
     end
 
     # Pass 3: second-order scattering over the ADMISSIBLE paths (j_eff strictly increasing),
@@ -196,7 +191,7 @@ function compute_S2!(S2::AbstractMatrix, st::ScatteringTransform1D,
         ψ2_fft = st.filter_bank.wavelets[j2]
         # buffer_input = multiply scratch; buffer_conv = IFFT output
         ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1], ψ2_fft,
-                                          st.ifft_plan, st.buffer_input)
+                                          st.plan, st.buffer_input)
         ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
         S2[j1, j2] = ScatteringCore.spatial_average(st.buffer_mod)
     end
@@ -228,11 +223,11 @@ end
     @inbounds @simd for i in eachindex(U)
         st.buffer_input[i] = complex(U[i])
     end
-    LinearAlgebra.mul!(st.buffer_conv, st.fft_plan, st.buffer_input)        # U_fft -> buffer_conv
+    Plans.forward_transform!(st.buffer_conv, st.plan, st.buffer_input)     # U_fft -> buffer_conv
     @inbounds @simd for i in eachindex(st.buffer_conv)
         st.buffer_conv[i] *= φ[i]
     end
-    LinearAlgebra.mul!(st.buffer_input, st.ifft_plan, st.buffer_conv)       # (U ⋆ φ) -> buffer_input
+    Plans.inverse_transform!(st.buffer_input, st.plan, st.buffer_conv)     # (U ⋆ φ) -> buffer_input
     @inbounds for k in 1:length(dst)
         dst[k] = real(st.buffer_input[(k - 1) * ds + 1])
     end
@@ -262,7 +257,7 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
     @inbounds @simd for i in eachindex(signal)
         st.buffer_input[i] = complex(signal[i])
     end
-    LinearAlgebra.mul!(st.buffer_signal_fft, st.fft_plan, st.buffer_input)
+    Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
 
     # order 0 (root): (x ⋆ φ_J) ↓
     @inbounds @simd for i in eachindex(signal)
@@ -275,7 +270,7 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
     @inbounds for p in PathGraph.order_range(tree, 1)
         j = PathGraph.path_indices(tree, p)[1]
         ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft,
-            st.filter_bank.wavelets[j], st.ifft_plan, st.buffer_input)
+            st.filter_bank.wavelets[j], st.plan, st.buffer_input)
         ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
         _lowpass_downsample!(view(data, :, p), st, st.buffer_mod, ds)
     end
@@ -285,20 +280,20 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
         num_w = length(st.filter_bank.wavelets)
         @inbounds for (j1, ψ1_fft) in enumerate(st.filter_bank.wavelets)
             ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft, ψ1_fft,
-                st.ifft_plan, st.buffer_input)
+                st.plan, st.buffer_input)
             ScatteringCore.apply_modulus!(st.U1_buffers[j1], st.buffer_conv)
         end
         @inbounds for j1 in 1:num_w
             @simd for i in eachindex(st.U1_buffers[j1])
                 st.buffer_input[i] = complex(st.U1_buffers[j1][i])
             end
-            LinearAlgebra.mul!(st.U1_fft_buffers[j1], st.fft_plan, st.buffer_input)
+            Plans.forward_transform!(st.U1_fft_buffers[j1], st.plan, st.buffer_input)
         end
         @inbounds for p in PathGraph.order_range(tree, 2)
             idx = PathGraph.path_indices(tree, p)
             j1, j2 = idx[1], idx[2]
             ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1],
-                st.filter_bank.wavelets[j2], st.ifft_plan, st.buffer_input)
+                st.filter_bank.wavelets[j2], st.plan, st.buffer_input)
             ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
             _lowpass_downsample!(view(data, :, p), st, st.buffer_mod, ds)
         end

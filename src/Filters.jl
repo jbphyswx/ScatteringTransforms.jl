@@ -6,9 +6,6 @@ module Filters
 Implements Morlet wavelets in the frequency domain for FFT-based convolutions.
 """
 
-using FFTW: FFTW
-using LinearAlgebra: LinearAlgebra
-
 export Morlet1D, Morlet2D
 export frequency_response, gaussian_window, plane_wave
 

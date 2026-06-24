@@ -7,55 +7,53 @@ Implements the fundamental building blocks: FFT-based convolution,
 modulus, and averaging operations.
 
 Design: All `!` functions are zero-allocation. Non-`!` wrappers allocate
-and delegate to the `!` versions. Use `mul!` with FFTW plans so the
-plan's `*` operator (which allocates a fresh output array) is never called
-in the hot path.
+and delegate to the `!` versions. Spectral transforms go through the plan
+interface (`Plans.inverse_transform!`), so the engine is agnostic to whether
+the backing transform is the in-core direct sum, FFTW, CUFFT, etc.
 """
 
-using FFTW: FFTW
 using LinearAlgebra: LinearAlgebra
+using ..Plans: Plans
 
 export wavelet_convolve, wavelet_convolve!
 export apply_modulus, apply_modulus!, spatial_average
 export ScatteringLayer
 
 """
-    wavelet_convolve(signal_fft, filter_fft, ifft_plan)
+    wavelet_convolve(signal_fft, filter_fft, plan)
 
-Perform wavelet convolution via frequency-domain multiplication.
+Perform wavelet convolution via frequency-domain multiplication then inverse transform.
 Allocates output. For zero-allocation hot paths, use `wavelet_convolve!`.
 """
-function wavelet_convolve(signal_fft::AbstractArray, 
+function wavelet_convolve(signal_fft::AbstractArray,
                           filter_fft::AbstractArray,
-                          ifft_plan)
+                          plan)
     out = similar(signal_fft)
     buffer = signal_fft .* filter_fft
-    LinearAlgebra.mul!(out, ifft_plan, buffer)
+    Plans.inverse_transform!(out, plan, buffer)
     return out
 end
 
 """
-    wavelet_convolve!(out, signal_fft, filter_fft, ifft_plan, buffer)
+    wavelet_convolve!(out, signal_fft, filter_fft, plan, buffer)
 
 Truly zero-allocation wavelet convolution.
 
-Multiplies `signal_fft .* filter_fft` into `buffer` in-place, then applies
-the IFFT plan via `mul!(out, ifft_plan, buffer)` — this writes directly into
-`out` without allocating a temporary array, unlike `ifft_plan * buffer`.
+Multiplies `signal_fft .* filter_fft` into `buffer` in-place, then applies the inverse spectral
+transform via `Plans.inverse_transform!(out, plan, buffer)` — writing directly into `out`.
 
 `out` and `buffer` must both be pre-allocated complex arrays of the same size.
 """
-function wavelet_convolve!(out::AbstractArray, 
-                          signal_fft::AbstractArray, 
+function wavelet_convolve!(out::AbstractArray,
+                          signal_fft::AbstractArray,
                           filter_fft::AbstractArray,
-                          ifft_plan,
+                          plan,
                           buffer::AbstractArray)
     # In-place pointwise multiply: buffer = signal_fft .* filter_fft
     @inbounds @simd for i in eachindex(signal_fft, filter_fft, buffer)
         buffer[i] = signal_fft[i] * filter_fft[i]
     end
-    # mul!(out, plan, src) writes IFFT(buffer) directly into out — zero allocation
-    LinearAlgebra.mul!(out, ifft_plan, buffer)
+    Plans.inverse_transform!(out, plan, buffer)
     return out
 end
 

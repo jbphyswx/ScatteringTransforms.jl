@@ -34,13 +34,11 @@ coeffs2d = st2d(image)
 """
 module ScatteringTransforms
 
-using FFTW: FFTW
-using LinearAlgebra: LinearAlgebra
-
 # Include core components (creates submodules)
 # Order matters: Coefficients must be before Scattering1D/Scattering2D
 include("Backends.jl")
 include("Domains.jl")
+include("Plans.jl")
 include("Filters.jl")
 include("FilterBanks.jl")
 include("ScatteringCore.jl")
@@ -53,6 +51,7 @@ include("Scattering2D.jl")
 # Import submodules using X: X pattern
 using .Backends: Backends
 using .Domains: Domains
+using .Plans: Plans
 using .Filters: Filters
 using .FilterBanks: FilterBanks
 using .ScatteringCore: ScatteringCore
@@ -81,6 +80,11 @@ const Line1D = Domains.Line1D
 const Plane2D = Domains.Plane2D
 const Volume3D = Domains.Volume3D
 const Sphere = Domains.Sphere
+# Spectral plans
+const DirectSumPlan = Plans.DirectSumPlan
+const AbstractScatteringPlan = Plans.AbstractScatteringPlan
+const forward_transform! = Plans.forward_transform!
+const inverse_transform! = Plans.inverse_transform!
 const ScatteringField1D = ScatteringFields.ScatteringField1D
 const ScatteringField2D = ScatteringFields.ScatteringField2D
 const path_field = ScatteringFields.path_field
@@ -112,6 +116,7 @@ export FilterBank1D, FilterBank2D
 export WaveletMeta, ScatteringTree
 export SerialCPU, ThreadedCPU, GPUBackend, AutoBackend, Distributed, MPI
 export Line1D, Plane2D, Volume3D, Sphere
+export DirectSumPlan, AbstractScatteringPlan, forward_transform!, inverse_transform!
 export Morlet1D, Morlet2D
 export ScatteringCoefficients1D, ScatteringCoefficients2D
 export zeroth_order, first_order, second_order

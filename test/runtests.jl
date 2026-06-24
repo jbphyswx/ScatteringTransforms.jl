@@ -23,6 +23,7 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
     for extname in (
         :ScatteringTransformsCUDAExt,
         :ScatteringTransformsCairoMakieExt,
+        :ScatteringTransformsFFTWExt,
         :ScatteringTransformsKernelAbstractionsExt,
         :ScatteringTransformsNUFSHTExt,
     )
@@ -466,6 +467,27 @@ Test.@testset "Translation invariance (approximate)" begin
     S1_2 = ScatteringTransforms.first_order(coeffs2)
     rel_diff = abs.(S1_1 .- S1_2) ./ (S1_1 .+ 1e-10)
     Test.@test all(rel_diff .< 0.1)  # Within 10% due to edge effects
+end
+
+Test.@testset "Spectral plans: in-core direct sum matches FFTW fast path" begin
+    # The slow in-core DirectSumPlan default and the FFTW extension fast path must agree.
+    N = 128
+    J = 4
+    signal = randn(N)
+    st_d = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=:direct)
+    st_f = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=:fftw)
+    cd, cf = st_d(signal), st_f(signal)
+    Test.@test isapprox(ScatteringTransforms.zeroth_order(cd), ScatteringTransforms.zeroth_order(cf); rtol=1e-6)
+    Test.@test isapprox(ScatteringTransforms.first_order(cd), ScatteringTransforms.first_order(cf); rtol=1e-6)
+    Test.@test isapprox(ScatteringTransforms.second_order(cd), ScatteringTransforms.second_order(cf); rtol=1e-6)
+
+    img = randn(32, 32)
+    s2d = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=:direct)
+    s2f = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=:fftw)
+    Test.@test isapprox(ScatteringTransforms.first_order(s2d(img)),
+                        ScatteringTransforms.first_order(s2f(img)); rtol=1e-6)
+    Test.@test isapprox(ScatteringTransforms.second_order(s2d(img)),
+                        ScatteringTransforms.second_order(s2f(img)); rtol=1e-6)
 end
 
 Test.@testset "1D localized field: mean equals averaged coefficient" begin
