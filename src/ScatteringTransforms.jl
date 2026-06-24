@@ -77,13 +77,13 @@ const build_filter_bank3d = FilterBanks.build_filter_bank3d
 const scattering_transform3d! = Scattering3D.scattering_transform3d!
 const WaveletMeta = FilterBanks.WaveletMeta
 const ScatteringTree = PathGraph.ScatteringTree
-# Backend taxonomy
-const SerialCPU = Backends.SerialCPU
-const ThreadedCPU = Backends.ThreadedCPU
+# Backend taxonomy (ecosystem names; DistributedBackend/MPIBackend parametric over inner backend)
+const SerialBackend = Backends.SerialBackend
+const ThreadedBackend = Backends.ThreadedBackend
 const GPUBackend = Backends.GPUBackend
 const AutoBackend = Backends.AutoBackend
-const Distributed = Backends.Distributed
-const MPI = Backends.MPI
+const DistributedBackend = Backends.DistributedBackend
+const MPIBackend = Backends.MPIBackend
 # Domain tags
 const Line1D = Domains.Line1D
 const Plane2D = Domains.Plane2D
@@ -167,13 +167,13 @@ function scattering_batch(st::ScatteringTransform2D, X::AbstractArray{<:Any,3})
     return out
 end
 
-# Backend-dispatched batched transforms. Serial runs in-process; ThreadedCPU/Distributed/MPI
-# methods are added by the corresponding extensions (per-task/per-worker workspace).
-scattering_batch(::Backends.SerialCPU, st, X) = scattering_batch(st, X)
-function scattering_batch(b::Backends.AbstractBackend, st, X)
+# Backend-dispatched batched transforms. Serial runs in-process; ThreadedBackend / Distributed /
+# MPI methods are added by the corresponding extensions (per-task/per-worker workspace).
+scattering_batch(::Backends.SerialBackend, st, X) = scattering_batch(st, X)
+function scattering_batch(b::Backends.AbstractExecutionBackend, st, X)
     throw(ArgumentError(
         "scattering_batch on backend $(typeof(b)) is not loaded — run `using OhMyThreads` " *
-        "(ThreadedCPU), `using Distributed` (Distributed), or `using MPI` (MPI)."))
+        "(ThreadedBackend), `using Distributed` (DistributedBackend), or `using MPI` (MPIBackend)."))
 end
 
 # Plotting stubs (implemented in ScatteringTransformsCairoMakieExt)
@@ -184,7 +184,7 @@ export ScatteringTransform1D, ScatteringTransform2D, ScatteringTransform3D
 export FilterBank1D, FilterBank2D, FilterBank3D
 export build_filter_bank3d, scattering_transform3d!
 export WaveletMeta, ScatteringTree
-export SerialCPU, ThreadedCPU, GPUBackend, AutoBackend, Distributed, MPI
+export SerialBackend, ThreadedBackend, GPUBackend, AutoBackend, DistributedBackend, MPIBackend
 export Line1D, Plane2D, Volume3D, Sphere
 export DirectSumPlan, AbstractScatteringPlan, forward_transform!, inverse_transform!
 export Morlet1D, Morlet2D, Morlet3D

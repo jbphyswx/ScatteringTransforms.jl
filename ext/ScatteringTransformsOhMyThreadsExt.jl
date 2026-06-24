@@ -1,7 +1,7 @@
 module ScatteringTransformsOhMyThreadsExt
 
 """
-    ScatteringTransformsOhMyThreadsExt — multithreaded batched transforms (ThreadedCPU)
+    ScatteringTransformsOhMyThreadsExt — multithreaded batched transforms (ThreadedBackend)
 
 Parallelizes `scattering_batch` over the batch dimension with OhMyThreads. Each task gets its
 own transform workspace (buffers + any plan scratch are mutated during a transform and are not
@@ -14,9 +14,9 @@ using OhMyThreads: OhMyThreads as OMT
 using ScatteringTransforms: ScatteringTransforms
 
 const ST = ScatteringTransforms
-const ThreadedCPU = ST.Backends.ThreadedCPU
+const ThreadedBackend = ST.Backends.ThreadedBackend
 
-function ST.scattering_batch(::ThreadedCPU, st::ST.ScatteringTransform1D, X::AbstractMatrix)
+function ST.scattering_batch(::ThreadedBackend, st::ST.ScatteringTransform1D, X::AbstractMatrix)
     N, B = size(X)
     nw = length(st.filter_bank.wavelets)
     T = real(eltype(st.filter_bank.averaging))
@@ -33,7 +33,7 @@ function ST.scattering_batch(::ThreadedCPU, st::ST.ScatteringTransform1D, X::Abs
     return out
 end
 
-function ST.scattering_batch(::ThreadedCPU, st::ST.ScatteringTransform2D, X::AbstractArray{<:Any,3})
+function ST.scattering_batch(::ThreadedBackend, st::ST.ScatteringTransform2D, X::AbstractArray{<:Any,3})
     Ny, Nx, B = size(X)
     T = real(eltype(st.filter_bank.averaging))
     coeff_proto = ST.Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.L, T;

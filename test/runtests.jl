@@ -539,19 +539,19 @@ Test.@testset "Batched transforms reuse the plan and match per-signal results" b
 end
 
 Test.@testset "Threaded batch (OhMyThreads) matches serial batch" begin
-    # ThreadedCPU parallelizes scattering_batch over the batch; each task uses its own
+    # ThreadedBackend parallelizes scattering_batch over the batch; each task uses its own
     # workspace, so results must be identical to the serial batch.
     N = 96
     J = 4
     st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
     X = randn(N, 6)
     serial = ScatteringTransforms.scattering_batch(st, X)
-    threaded = ScatteringTransforms.scattering_batch(ScatteringTransforms.ThreadedCPU(), st, X)
+    threaded = ScatteringTransforms.scattering_batch(ScatteringTransforms.ThreadedBackend(), st, X)
     Test.@test threaded ≈ serial
 
     st2 = ScatteringTransforms.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
     X2 = randn(24, 24, 5)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.ThreadedCPU(), st2, X2) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.ThreadedBackend(), st2, X2) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
 end
 

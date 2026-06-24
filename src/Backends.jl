@@ -3,31 +3,32 @@ module Backends
 """
     Backends.jl — Compute-backend taxonomy
 
-Two orthogonal concerns:
+Names mirror the jbphyswx ecosystem (`SerialBackend`, `ThreadedBackend`, `GPUBackend{B}`,
+`AutoBackend`), with two orthogonal concerns:
 
-- **Local compute backend** — what a single process/rank computes on:
-  `SerialCPU`, `ThreadedCPU` (OhMyThreads ext), `GPUBackend{B}` (CUDA / KernelAbstractions ext).
-- **Distribution wrapper** — how work is split across processes, *parametric over the inner
-  local backend*: `Distributed{Inner}` (Distributed ext), `MPI{Inner}` (MPI ext). MPI is not
-  CPU-only: with CUDA-aware MPI, `MPI{GPUBackend{CUDABackend}}` is a multi-GPU cluster. The
-  wrapper owns only "partition the batch / gather results"; `inner` owns the scatter compute.
+- **Local compute backend** — what one process/rank computes on: `SerialBackend`,
+  `ThreadedBackend` (OhMyThreads ext), `GPUBackend{B}` (CUDA / KernelAbstractions ext).
+- **Distribution wrapper** — how work is split across processes, **parametric over the inner
+  local backend**: `DistributedBackend{Inner}` (Distributed ext), `MPIBackend{Inner}` (MPI ext).
+  A flat (non-parametric) distributed backend cannot say what each worker runs on; the
+  parametric form makes `DistributedBackend{GPUBackend{CUDABackend}}` (multi-node multi-GPU) and
+  `MPIBackend{ThreadedBackend}` (hybrid) expressible. The wrapper owns only
+  "partition / gather"; `inner` owns the compute. (CUDA-aware MPI ⇒ MPI is not CPU-only.)
 
-`AutoBackend` resolves to the best available local backend at plan time.
-
-Heavy backend implementations live in extensions; this module only defines the dispatch types
-and a couple of helpers, so the core has no parallel/GPU dependencies.
+`AutoBackend` resolves to the best available local backend at plan time. Heavy backend
+implementations live in extensions; this module only defines dispatch types + a few helpers.
 """
 
-export AbstractBackend, SerialCPU, ThreadedCPU, GPUBackend, AutoBackend
-export Distributed, MPI, local_backend, is_distributed
+export AbstractExecutionBackend, SerialBackend, ThreadedBackend, GPUBackend, AutoBackend
+export DistributedBackend, MPIBackend, local_backend, is_distributed
 
-abstract type AbstractBackend end
+abstract type AbstractExecutionBackend end
 
 "Serial single-threaded CPU compute (always available, no extension needed)."
-struct SerialCPU <: AbstractBackend end
+struct SerialBackend <: AbstractExecutionBackend end
 
 "Multithreaded CPU compute (requires `using OhMyThreads`)."
-struct ThreadedCPU <: AbstractBackend end
+struct ThreadedBackend <: AbstractExecutionBackend end
 
 """
     GPUBackend{B}
@@ -35,48 +36,47 @@ struct ThreadedCPU <: AbstractBackend end
 GPU compute on backend object `B` (e.g. a `CUDABackend` / KernelAbstractions backend). Requires
 the corresponding extension (`using CUDA`).
 """
-struct GPUBackend{B} <: AbstractBackend
+struct GPUBackend{B} <: AbstractExecutionBackend
     backend::B
 end
 
 "Resolve to the best available local backend at plan time."
-struct AutoBackend <: AbstractBackend end
+struct AutoBackend <: AbstractExecutionBackend end
 
 """
-    Distributed{Inner}
+    DistributedBackend{Inner}
 
-Distribute the batch dimension across worker processes, each running `inner` locally. Requires
-`using Distributed`.
+Distribute work across worker processes, each running `inner` locally. Parametric over the inner
+local backend. Requires `using Distributed`.
 """
-struct Distributed{Inner<:AbstractBackend} <: AbstractBackend
+struct DistributedBackend{Inner<:AbstractExecutionBackend} <: AbstractExecutionBackend
     inner::Inner
 end
-Distributed() = Distributed(SerialCPU())   # 1-arg form is the auto-generated constructor
+DistributedBackend() = DistributedBackend(SerialBackend())   # 1-arg form is auto-generated
 
 """
-    MPI{Inner}
+    MPIBackend{Inner}
 
-Distribute the batch dimension across MPI ranks, each running `inner` locally. Requires
-`using MPI`. Not CPU-only — `MPI{GPUBackend{...}}` targets multi-GPU clusters.
+Distribute work across MPI ranks, each running `inner` locally. Parametric over the inner local
+backend. Requires `using MPI`. Not CPU-only — `MPIBackend{GPUBackend{...}}` targets multi-GPU.
 """
-struct MPI{Inner<:AbstractBackend} <: AbstractBackend
+struct MPIBackend{Inner<:AbstractExecutionBackend} <: AbstractExecutionBackend
     inner::Inner
 end
-MPI() = MPI(SerialCPU())   # 1-arg form is the auto-generated constructor
+MPIBackend() = MPIBackend(SerialBackend())   # 1-arg form is auto-generated
 
 """
-    local_backend(backend) -> AbstractBackend
+    local_backend(backend) -> AbstractExecutionBackend
 
-The per-process compute backend. For distribution wrappers this is the wrapped `inner`; for a
-plain local backend it is the backend itself.
+The per-process compute backend — `inner` for distribution wrappers, the backend itself otherwise.
 """
-local_backend(b::AbstractBackend) = b
-local_backend(b::Distributed) = b.inner
-local_backend(b::MPI) = b.inner
+local_backend(b::AbstractExecutionBackend) = b
+local_backend(b::DistributedBackend) = b.inner
+local_backend(b::MPIBackend) = b.inner
 
 "`true` if `backend` distributes work across processes."
-is_distributed(::AbstractBackend) = false
-is_distributed(::Distributed) = true
-is_distributed(::MPI) = true
+is_distributed(::AbstractExecutionBackend) = false
+is_distributed(::DistributedBackend) = true
+is_distributed(::MPIBackend) = true
 
 end # module Backends
