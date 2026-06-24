@@ -47,6 +47,7 @@ include("PathGraph.jl")
 include("ScatteringFields.jl")
 include("Scattering1D.jl")
 include("Scattering2D.jl")
+include("Reductions.jl")
 
 # Import submodules using X: X pattern
 using .Backends: Backends
@@ -60,6 +61,7 @@ using .ScatteringFields: ScatteringFields
 using .Scattering1D: Scattering1D
 using .Scattering2D: Scattering2D
 using .Coefficients: Coefficients
+using .Reductions: Reductions
 
 # Re-export key types from submodules (using X: X pattern)
 const ScatteringTransform1D = Scattering1D.ScatteringTransform1D
@@ -109,6 +111,9 @@ const scattering_transform!    = Scattering1D.scattering_transform!
 const scattering_transform2d!  = Scattering2D.scattering_transform2d!
 const compute_S1_2d! = Scattering2D.compute_S1_2d!
 const compute_S2_2d! = Scattering2D.compute_S2_2d!
+const compute_shape_sparsity = Scattering2D.compute_shape_sparsity
+const normalized_coefficients = Reductions.normalized_coefficients
+const log_coefficients = Reductions.log_coefficients
 
 # ============================================================================
 # Batched transforms — process a stack of signals/images reusing one plan + workspace
@@ -186,6 +191,7 @@ export flatten1d!, flatten2d!, flatten_length
 export scattering_field, scattering_field!
 export ScatteringField1D, ScatteringField2D, path_field
 export compute_S1_2d!, compute_S2_2d!
+export compute_shape_sparsity, normalized_coefficients, log_coefficients
 export plot_filter_bank, plot_coefficients
 
 end # module

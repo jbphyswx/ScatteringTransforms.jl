@@ -192,46 +192,51 @@ function compute_S2_2d!(S2::AbstractMatrix, st::ScatteringTransform2D,
 end
 
 """
-    compute_shape_sparsity(S1, S2, meta)
+    compute_shape_sparsity(S1, S2, meta) -> (; sparsity, shape)
 
-Compute reduced shape and sparsity statistics from scattering coefficients.
+Reduced second-order descriptors (in the spirit of the reduced wavelet scattering transform,
+Allys et al. 2019; Cheng & Ménard 2021), as `J × J` matrices over scale pairs `(j1, j2)` with
+`j2 > j1`:
 
-Following Skinner et al. (2025), these are:
-- s₂₁ (sparsity): ⟨S₂/S₁⟩ over orientations
-- s₂₂ (shape): ⟨S₂^∥ / S₂^⊥⟩ over orientations
+- `sparsity` (`s₂₁`): the orientation-averaged ratio `⟨S₂ / S₁⟩` — how much energy cascades
+  from scale `j1` to the coarser scale `j2` (large for sparse/intermittent fields).
+- `shape` (`s₂₂`): the **anisotropy** of the cascade — the normalized second angular harmonic
+  `⟨S₂ · cos(2 Δθ)⟩ / ⟨S₂⟩` over orientation pairs, where `Δθ = θ₂ − θ₁`. It is `≈ 0` for
+  statistically isotropic fields and departs from zero when the field has oriented structure.
 """
 function compute_shape_sparsity(S1::AbstractVector{T},
                                 S2::AbstractMatrix{T},
                                 meta::AbstractVector{<:FilterBanks.WaveletMeta}) where T<:Real
-    # Group by scales
     J = maximum(m.scale for m in meta) + 1
-    L = length(meta) ÷ J  # orientations per scale
-    
+
     sparsity = zeros(T, J, J)
     shape = zeros(T, J, J)
-    
-    for j1 in 0:J-1, j2 in 0:J-1
-        # Indices for this scale pair
+
+    for j1 in 0:(J - 1), j2 in 0:(J - 1)
+        j2 > j1 || continue
         idx1 = [i for (i, m) in enumerate(meta) if m.scale == j1]
         idx2 = [i for (i, m) in enumerate(meta) if m.scale == j2]
-        
-        # Sparsity: average of S2/S1 over orientations
-        if j2 > j1 && !isempty(idx1) && !isempty(idx2)
-            s21_sum = zero(T)
-            s21_count = 0
-            for i1 in idx1, i2 in idx2
-                if S1[i1] > 0
-                    s21_sum += S2[i1, i2] / S1[i1]
-                    s21_count += 1
-                end
+        (isempty(idx1) || isempty(idx2)) && continue
+
+        s21_sum = zero(T)
+        s21_count = 0
+        harm_num = zero(T)     # Σ S₂ cos(2Δθ)
+        harm_den = zero(T)     # Σ S₂
+        for i1 in idx1, i2 in idx2
+            s2 = S2[i1, i2]
+            if S1[i1] > 0
+                s21_sum += s2 / S1[i1]
+                s21_count += 1
             end
-            if s21_count > 0
-                sparsity[j1+1, j2+1] = s21_sum / s21_count
-            end
+            dθ = meta[i2].theta - meta[i1].theta
+            harm_num += s2 * cos(2 * dθ)
+            harm_den += s2
         end
+        s21_count > 0 && (sparsity[j1 + 1, j2 + 1] = s21_sum / s21_count)
+        harm_den > 0 && (shape[j1 + 1, j2 + 1] = harm_num / harm_den)
     end
-    
-    return (sparsity=sparsity, shape=shape)
+
+    return (sparsity = sparsity, shape = shape)
 end
 
 # ============================================================================

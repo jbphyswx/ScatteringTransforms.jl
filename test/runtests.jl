@@ -602,20 +602,42 @@ Test.@testset "2D localized field: mean equals averaged coefficient" begin
     Test.@test all(isfinite, sf2.data)
 end
 
-Test.@testset "compute_shape_sparsity: shape reduction (TODO Phase 6)" begin
-    # `compute_shape_sparsity` currently returns `shape` as all zeros — the anisotropy/shape
-    # reduction (RWST / Cheng-Ménard s22) is not yet implemented. Recorded as broken so the
-    # intent to implement it in Phase 6 is tracked and flips green when done.
+Test.@testset "Reduced descriptors: sparsity, shape (anisotropy), normalize, log" begin
     Ny, Nx = 64, 64
     J = 3
     L = 4
     st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
-    image = randn(Ny, Nx)
-    coeffs = st(image)
-    S1 = ScatteringTransforms.first_order(coeffs)
-    S2 = ScatteringTransforms.second_order(coeffs)
-    res = ScatteringTransforms.Scattering2D.compute_shape_sparsity(S1, S2, st.filter_bank.meta)
-    Test.@test_broken any(res.shape .!= 0)
+
+    # Anisotropic field (oriented stripes) -> nonzero shape; isotropic noise -> ~0 shape.
+    xs = range(0, 8π, length=Nx)'
+    aniso = repeat(sin.(xs), Ny, 1) .+ 0.01 .* randn(Ny, Nx)
+    ca = st(aniso)
+    ra = ScatteringTransforms.compute_shape_sparsity(ScatteringTransforms.first_order(ca),
+            ScatteringTransforms.second_order(ca), st.filter_bank.meta)
+    Test.@test any(ra.shape .!= 0)                # shape is implemented (was all-zero before)
+    Test.@test any(ra.sparsity .> 0)
+    Test.@test maximum(abs, ra.shape) > 0.05      # clear anisotropy signal
+
+    iso = randn(Ny, Nx)
+    ci = st(iso)
+    ri = ScatteringTransforms.compute_shape_sparsity(ScatteringTransforms.first_order(ci),
+            ScatteringTransforms.second_order(ci), st.filter_bank.meta)
+    # Isotropic noise: anisotropy averages down well below the oriented case.
+    Test.@test maximum(abs, ri.shape) < maximum(abs, ra.shape)
+
+    # Normalized + log reductions.
+    nc = ScatteringTransforms.normalized_coefficients(ca)
+    Test.@test nc.s1 ≈ ScatteringTransforms.first_order(ca) ./ ScatteringTransforms.zeroth_order(ca)
+    S1a = ScatteringTransforms.first_order(ca)
+    S2a = ScatteringTransforms.second_order(ca)
+    for j1 in axes(S2a, 1), j2 in axes(S2a, 2)
+        if S1a[j1] > 0
+            Test.@test nc.s2[j1, j2] ≈ S2a[j1, j2] / S1a[j1]
+        end
+    end
+    lc = ScatteringTransforms.log_coefficients(ca)
+    Test.@test all(isfinite, lc.logS1)
+    Test.@test length(lc.logS1) == length(S1a)
 end
 
 end # module
