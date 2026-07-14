@@ -28,7 +28,6 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
     Test.@test (EI.check_no_implicit_imports(ScatteringTransforms); true)
     Test.@test (EI.check_no_stale_explicit_imports(ScatteringTransforms); true)
     for extname in (
-        :ScatteringTransformsCUDAExt,
         :ScatteringTransformsCairoMakieExt,
         :ScatteringTransformsDifferentiationInterfaceExt,
         :ScatteringTransformsFFTWExt,
@@ -56,14 +55,14 @@ Test.@testset "Type stability (concrete struct fields + inferred transforms)" be
     # 2D filter-bank field (previously `FilterBank2D{T}` with the matrix param dropped).
     N = 256
     J = 4
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     for ft in fieldtypes(typeof(st))
         Test.@test isconcretetype(ft)
     end
     signal = randn(N)
     Test.@test (Test.@inferred st(signal); true)
 
-    st2 = ScatteringTransforms.ScatteringTransform2D((64, 64), 3; L=4, max_order=2)
+    st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((64, 64), 3; L=4, max_order=2)
     for ft in fieldtypes(typeof(st2))
         Test.@test isconcretetype(ft)
     end
@@ -71,10 +70,10 @@ Test.@testset "Type stability (concrete struct fields + inferred transforms)" be
     Test.@test (Test.@inferred st2(image); true)
 
     # Element type is preserved end-to-end (Float32 in -> Float32 out).
-    stf = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, T=Float32)
+    stf = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, T=Float32)
     cf = stf(Float32.(signal))
-    Test.@test eltype(ScatteringTransforms.first_order(cf)) == Float32
-    Test.@test ScatteringTransforms.zeroth_order(cf) isa Float32
+    Test.@test eltype(ScatteringTransforms.Coefficients.first_order(cf)) == Float32
+    Test.@test ScatteringTransforms.Coefficients.zeroth_order(cf) isa Float32
 end
 
 Test.@testset "1D Morlet Wavelet Mathematical Properties" begin
@@ -83,8 +82,8 @@ Test.@testset "1D Morlet Wavelet Mathematical Properties" begin
     Q = 1
     r = sqrt(0.5)
     
-    morlet = ScatteringTransforms.Morlet1D(N, j; Q=Q)
-    ψ = ScatteringTransforms.frequency_response(morlet)
+    morlet = ScatteringTransforms.Filters.Morlet1D(N, j; Q=Q)
+    ψ = ScatteringTransforms.Filters.frequency_response(morlet)
     freqs = FFTW.fftfreq(N)
     
     # Test 1: Center frequency matches expected formula
@@ -139,12 +138,12 @@ end
 Test.@testset "Filter bank is a tight frame (Littlewood-Paley ≡ 1)" begin
     # |φ(ω)|² + Σⱼ|ψⱼ(ω)|² ≡ 1: non-expansive, no frequency amplified.
     for (N, J, Q) in ((1024, 6, 1), (512, 4, 2))
-        fb = ScatteringTransforms.build_filter_bank1d(N, J; Q=Q)
+        fb = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=Q)
         Nh = N ÷ 2
         lp = abs2.(fb.averaging[1:Nh]) .+ sum(abs2.(ψ[1:Nh]) for ψ in fb.wavelets)
         Test.@test maximum(abs, lp .- 1) < 1e-2
     end
-    fb2 = ScatteringTransforms.build_filter_bank2d((64, 64), 3; L=8)
+    fb2 = ScatteringTransforms.FilterBanks.build_filter_bank2d((64, 64), 3; L=8)
     lp2 = abs2.(fb2.averaging) .+ sum(abs2.(ψ) for ψ in fb2.wavelets)
     Test.@test maximum(abs, lp2 .- 1) < 1e-2
 end
@@ -152,7 +151,7 @@ end
 Test.@testset "1D Filter Bank Tests" begin
     N = 256
     J = 4
-    bank = ScatteringTransforms.build_filter_bank1d(N, J; Q=1)
+    bank = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=1)
     
     Test.@test bank.J == J
     Test.@test bank.Q == 1
@@ -164,7 +163,7 @@ Test.@testset "1D Filter Bank with Q > 1 Fractional Center Frequencies" begin
     N = 256
     J = 3
     Q = 4
-    bank = ScatteringTransforms.build_filter_bank1d(N, J; Q=Q)
+    bank = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=Q)
     
     Test.@test bank.J == J
     Test.@test bank.Q == Q
@@ -191,10 +190,10 @@ Test.@testset "2D S2 Coefficients Zero-Initialization Verification" begin
     Ny, Nx = 64, 64
     J = 3
     L = 4
-    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
+    st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
     image = randn(Ny, Nx)
     coeffs = st(image)
-    S2 = ScatteringTransforms.second_order(coeffs)
+    S2 = ScatteringTransforms.Coefficients.second_order(coeffs)
 
     # Verify diagonal and lower triangle are exactly zero (due to zeros allocation fix)
     n = size(S2, 1)
@@ -218,7 +217,7 @@ Test.@testset "Path graph: 2D second order is scale-increasing (correctness fix)
     Ny, Nx = 64, 64
     J = 3
     L = 4
-    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
+    st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
     meta = st.filter_bank.meta
     tree = st.tree
 
@@ -234,7 +233,7 @@ Test.@testset "Path graph: 2D second order is scale-increasing (correctness fix)
 
     image = randn(Ny, Nx)
     coeffs = st(image)
-    S2 = ScatteringTransforms.second_order(coeffs)
+    S2 = ScatteringTransforms.Coefficients.second_order(coeffs)
     nw = J * L
     # Same-scale (incl. different-orientation) second-order entries are exactly zero.
     for i1 in 1:nw, i2 in 1:nw
@@ -251,21 +250,21 @@ Test.@testset "1D Scattering Transform Tests" begin
     N = 256
     J = 4
     
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     signal = randn(N)
     
     coeffs = st(signal)
     
     # Test S0 (average) - using accessor functions
-    Test.@test isapprox(ScatteringTransforms.zeroth_order(coeffs), Statistics.mean(signal), atol=1e-10)
+    Test.@test isapprox(ScatteringTransforms.Coefficients.zeroth_order(coeffs), Statistics.mean(signal), atol=1e-10)
     
     # Test S1 (first order)
-    S1 = ScatteringTransforms.first_order(coeffs)
+    S1 = ScatteringTransforms.Coefficients.first_order(coeffs)
     Test.@test length(S1) == J  # One coefficient per scale
     Test.@test all(S1 .>= 0)  # Modulus makes them non-negative
     
     # Test S2 (second order)
-    S2 = ScatteringTransforms.second_order(coeffs)
+    S2 = ScatteringTransforms.Coefficients.second_order(coeffs)
     Test.@test size(S2) == (J, J)
     
     # Test S2 has meaningful values (not all near-zero due to filter bug)
@@ -278,7 +277,7 @@ Test.@testset "Wavelet Center Frequencies" begin
     J = 6
     
     for j in 0:(J-1)
-        morlet = ScatteringTransforms.Morlet1D(N, j; Q=1)
+        morlet = ScatteringTransforms.Filters.Morlet1D(N, j; Q=1)
         expected_center = 0.5 / (2.0^j)  # xi = 0.5 * 2^(-j)
         
         # Center frequency should match expected value within tolerance
@@ -292,7 +291,7 @@ Test.@testset "Wavelet Constant-Q Property" begin
     
     Q_values = Float64[]
     for j in 0:(J-1)
-        morlet = ScatteringTransforms.Morlet1D(N, j; Q=1)
+        morlet = ScatteringTransforms.Filters.Morlet1D(N, j; Q=1)
         Q = morlet.center_freq / morlet.bandwidth
         Base.push!(Q_values, Q)
     end
@@ -308,8 +307,8 @@ Test.@testset "Wavelet Frequency Response Peak Location" begin
     N = 512
     
     for j in 0:3
-        morlet = ScatteringTransforms.Morlet1D(N, j; Q=1)
-        ψ = ScatteringTransforms.frequency_response(morlet)
+        morlet = ScatteringTransforms.Filters.Morlet1D(N, j; Q=1)
+        ψ = ScatteringTransforms.Filters.frequency_response(morlet)
         ψ_abs = abs.(ψ)
         
         freqs = FFTW.fftfreq(N)
@@ -325,7 +324,7 @@ end
 Test.@testset "Filter Bank Wavelet Energy" begin
     N = 256
     J = 4
-    bank = ScatteringTransforms.build_filter_bank1d(N, J; Q=1)
+    bank = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=1)
     
     # Each wavelet should have non-negligible energy
     # This is a regression test - previously bandwidth was wrong causing near-zero energy
@@ -340,8 +339,8 @@ Test.@testset "Wavelet Shape is Gaussian" begin
     N = 512
     
     for j in 0:3
-        morlet = ScatteringTransforms.Morlet1D(N, j; Q=1)
-        ψ = ScatteringTransforms.frequency_response(morlet)
+        morlet = ScatteringTransforms.Filters.Morlet1D(N, j; Q=1)
+        ψ = ScatteringTransforms.Filters.frequency_response(morlet)
         ψ_abs = abs.(ψ)
         freqs = FFTW.fftfreq(N)
         
@@ -366,9 +365,9 @@ end
 
 Test.@testset "2D Filter Tests" begin
     Ny, Nx = 64, 64
-    morlet = ScatteringTransforms.Morlet2D((Ny, Nx), 2, π/4; L=8)
+    morlet = ScatteringTransforms.Filters.Morlet2D((Ny, Nx), 2, π/4; L=8)
     
-    resp = ScatteringTransforms.frequency_response(morlet)
+    resp = ScatteringTransforms.Filters.frequency_response(morlet)
     Test.@test size(resp) == (Ny, Nx)
     Test.@test eltype(resp) == ComplexF64
     
@@ -411,7 +410,7 @@ Test.@testset "2D Wavelet Orientation and Scale Selectivity" begin
     Ny, Nx = 64, 64
     J = 3
     L = 8
-    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=1)
+    st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=1)
     
     # k0 for j=1 is 3π / (4 * 2^1) = 3π/8 ≈ 1.178.
     k0 = 3π / 8
@@ -425,7 +424,7 @@ Test.@testset "2D Wavelet Orientation and Scale Selectivity" begin
     plane_wave = cos.(k_wave .* (X .* cos(theta_wave) .+ Y .* sin(theta_wave)))
     
     coeffs = st(plane_wave)
-    S1 = ScatteringTransforms.first_order(coeffs)
+    S1 = ScatteringTransforms.Coefficients.first_order(coeffs)
     S1_matrix = reshape(S1, L, J) # L orientations x J scales
     
     # We expect the peak to be at:
@@ -443,7 +442,7 @@ Test.@testset "2D Filter Bank Tests" begin
     J = 3
     L = 4
     
-    bank = ScatteringTransforms.build_filter_bank2d(N, J; L=L)
+    bank = ScatteringTransforms.FilterBanks.build_filter_bank2d(N, J; L=L)
     
     Test.@test bank.J == J
     Test.@test bank.L == L
@@ -456,21 +455,21 @@ Test.@testset "2D Scattering Transform Tests" begin
     J = 3
     L = 4
     
-    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
+    st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
     image = randn(Ny, Nx)
     
     coeffs = st(image)
     
     # Test S0 exists
-    S0 = ScatteringTransforms.zeroth_order(coeffs)
+    S0 = ScatteringTransforms.Coefficients.zeroth_order(coeffs)
     Test.@test isa(S0, Float64)
     
     # Test S1
-    S1 = ScatteringTransforms.first_order(coeffs)
+    S1 = ScatteringTransforms.Coefficients.first_order(coeffs)
     Test.@test length(S1) == J * L
     
     # Test S2
-    S2 = ScatteringTransforms.second_order(coeffs)
+    S2 = ScatteringTransforms.Coefficients.second_order(coeffs)
     Test.@test size(S2) == (J * L, J * L)
 end
 
@@ -478,15 +477,15 @@ Test.@testset "3D volumetric scattering transform" begin
     N = (16, 16, 16)
     J = 2
     n_orient = 6
-    st = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2)
+    st = ScatteringTransforms.Scattering3D.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2)
     vol = randn(N...)
     coeffs = st(vol)
 
-    Test.@test isapprox(ScatteringTransforms.zeroth_order(coeffs), Statistics.mean(vol); atol=1e-10)
-    S1 = ScatteringTransforms.first_order(coeffs)
+    Test.@test isapprox(ScatteringTransforms.Coefficients.zeroth_order(coeffs), Statistics.mean(vol); atol=1e-10)
+    S1 = ScatteringTransforms.Coefficients.first_order(coeffs)
     Test.@test length(S1) == J * n_orient
     Test.@test all(S1 .>= 0)
-    S2 = ScatteringTransforms.second_order(coeffs)
+    S2 = ScatteringTransforms.Coefficients.second_order(coeffs)
     Test.@test size(S2) == (J * n_orient, J * n_orient)
     Test.@test Statistics.maximum(S2) > 0
 
@@ -499,22 +498,23 @@ Test.@testset "3D volumetric scattering transform" begin
     end
 
     # in-core direct sum matches the FFTW fast path in 3D
-    st_d = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=ScatteringTransforms.DirectSumBackend())
-    st_f = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=ScatteringTransforms.FFTBackend())
-    Test.@test isapprox(ScatteringTransforms.first_order(st_d(vol)),
-                        ScatteringTransforms.first_order(st_f(vol)); rtol=1e-6)
-    Test.@test isapprox(ScatteringTransforms.second_order(st_d(vol)),
-                        ScatteringTransforms.second_order(st_f(vol)); rtol=1e-6)
+    st_d = ScatteringTransforms.Scattering3D.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=ScatteringTransforms.Plans.DirectSumBackend())
+    st_f = ScatteringTransforms.Scattering3D.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=ScatteringTransforms.Plans.FFTBackend())
+    Test.@test isapprox(ScatteringTransforms.Coefficients.first_order(st_d(vol)),
+                        ScatteringTransforms.Coefficients.first_order(st_f(vol)); rtol=1e-6)
+    Test.@test isapprox(ScatteringTransforms.Coefficients.second_order(st_d(vol)),
+                        ScatteringTransforms.Coefficients.second_order(st_f(vol)); rtol=1e-6)
 end
 
 Test.@testset "Spherical scattering (NUFSHT, smooth difference-of-Gaussians bands)" begin
-    lmax = 24
+    lmax = 12
     J = 3
-    M = 400
-    θ = acos.(2 .* rand(M) .- 1)   # uniform in cos θ
-    φ = 2π .* rand(M)
+    M = 1000                      # ≳ (lmax+1)² = 169 so the exact CG analysis is well-determined
+    gr = (sqrt(5) - 1) / 2        # quasi-uniform Fibonacci-sphere points
+    θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φ = [2π * mod(k * gr, 1) for k in 1:M]
     st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J)
-    field = randn(M)
+    field = [cos(4 * θ[k]) + 0.6 * cos(3 * φ[k]) * sin(2 * θ[k]) - 0.4 * cos(2 * θ[k]) for k in 1:M]  # band-limited
     res = st(field)
 
     Test.@test res.S0 ≈ Statistics.mean(field)
@@ -530,16 +530,15 @@ Test.@testset "Spherical scattering (NUFSHT, smooth difference-of-Gaussians band
 end
 
 Test.@testset "Spherical MONOGENIC scattering (Riesz amplitude via spin-0 Bochner identity)" begin
-    lmax = 24
+    lmax = 12
     J = 3
-    M = 800
-    # Deterministic, well-distributed Fibonacci-sphere points (the scattered-adjoint SHT is much
-    # more accurate on a quasi-uniform set than on i.i.d. random points).
+    M = 1200                      # ≳ (lmax+1)² = 169 so the exact CG analysis is well-determined
+    # Deterministic, well-distributed Fibonacci-sphere points.
     gr = (sqrt(5) - 1) / 2
     θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
     φ = [2π * mod(k * gr, 1) for k in 1:M]
     st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J)
-    res = st(randn(M))
+    res = st([cos(4 * θ[k]) + 0.5 * sin(3 * θ[k]) * cos(2 * φ[k]) for k in 1:M])  # band-limited
     Test.@test length(res.S1) == J
     Test.@test all(res.S1 .>= 0)              # monogenic amplitude is non-negative
     Test.@test all(isfinite, res.S1)
@@ -556,15 +555,15 @@ Test.@testset "Spherical MONOGENIC scattering (Riesz amplitude via spin-0 Bochne
     r0 = st(f); rα = st(fα)
     Test.@test maximum(abs.(r0.S1 .- rα.S1)) / maximum(abs.(r0.S1)) < 0.05
 
-    # Pointwise orientation/phase on S² is not implemented yet (needs spin-1; tracked).
-    Test.@test_throws ErrorException ScatteringTransforms.spherical_monogenic_components(st, f, 1)
+    # Pointwise orientation/phase on S² (spin-1 Riesz vector) is validated in
+    # test_spherical_monogenic_components.jl.
 end
 
 Test.@testset "3D Morlet wavelet: analytic + zero-mean" begin
     N = (16, 16, 16)
     dirs = ScatteringTransforms.Filters.fibonacci_directions(6, Float64)
-    m = ScatteringTransforms.Morlet3D(N, 1, dirs[1])
-    ψ = ScatteringTransforms.frequency_response(m)
+    m = ScatteringTransforms.Filters.Morlet3D(N, 1, dirs[1])
+    ψ = ScatteringTransforms.Filters.frequency_response(m)
     Test.@test size(ψ) == N
     Test.@test abs(ψ[1, 1, 1]) < 1e-10            # zero mean (DC)
     Test.@test all(isfinite, ψ)
@@ -574,7 +573,7 @@ Test.@testset "Translation invariance (approximate)" begin
     N = 256
     J = 4
     
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=1)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=1)
     
     # Create a periodic signal
     x = range(0, 2π, length=N+1)[1:N]
@@ -588,8 +587,8 @@ Test.@testset "Translation invariance (approximate)" begin
     coeffs2 = st(signal_shifted)
     
     # S1 should be approximately translation invariant
-    S1_1 = ScatteringTransforms.first_order(coeffs1)
-    S1_2 = ScatteringTransforms.first_order(coeffs2)
+    S1_1 = ScatteringTransforms.Coefficients.first_order(coeffs1)
+    S1_2 = ScatteringTransforms.Coefficients.first_order(coeffs2)
     rel_diff = abs.(S1_1 .- S1_2) ./ (S1_1 .+ 1e-10)
     Test.@test all(rel_diff .< 0.1)  # Within 10% due to edge effects
 end
@@ -599,38 +598,38 @@ Test.@testset "Mutable S0 container → in-place update, truly zero-alloc stream
     # allocate nothing in steady state — the dispatch that powers zero-allocation streaming.
     N = 256
     J = 4
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     nw = length(st.filter_bank.wavelets)
-    coeffs = ScatteringTransforms.ScatteringCoefficients1D(Vector{Float64}(undef, nw), zeros(nw, nw); S0=[0.0])
+    coeffs = ScatteringTransforms.Coefficients.ScatteringCoefficients1D(Vector{Float64}(undef, nw), zeros(nw, nw); S0=[0.0])
     sig = randn(N)
-    r = ScatteringTransforms.scattering_transform!(coeffs, st, sig)
+    r = ScatteringTransforms.Scattering1D.scattering_transform!(coeffs, st, sig)
     Test.@test r === coeffs                                                  # mutated in place
-    Test.@test ScatteringTransforms.zeroth_order(coeffs) ≈ Statistics.mean(sig)
-    ScatteringTransforms.scattering_transform!(coeffs, st, sig)              # warm up
-    Test.@test (@allocated ScatteringTransforms.scattering_transform!(coeffs, st, sig)) == 0
+    Test.@test ScatteringTransforms.Coefficients.zeroth_order(coeffs) ≈ Statistics.mean(sig)
+    ScatteringTransforms.Scattering1D.scattering_transform!(coeffs, st, sig)              # warm up
+    Test.@test (@allocated ScatteringTransforms.Scattering1D.scattering_transform!(coeffs, st, sig)) == 0
 end
 
 Test.@testset "Batched transforms reuse the plan and match per-signal results" begin
     N = 128
     J = 4
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     X = randn(N, 5)
     B = ScatteringTransforms.scattering_batch(st, X)
     Test.@test size(B, 2) == 5
     for b in 1:5
-        Test.@test isapprox(B[:, b], ScatteringTransforms.flatten1d(st(view(X, :, b))); rtol=1e-10)
+        Test.@test isapprox(B[:, b], ScatteringTransforms.Coefficients.flatten1d(st(view(X, :, b))); rtol=1e-10)
     end
     # steady-state batch call allocates only the output + per-column scalar-S0 wrappers (no
     # per-signal workspace), i.e. far less than B independent transforms would.
     Test.@test (ScatteringTransforms.scattering_batch(st, X); true)
 
     # 2D
-    st2 = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2)
+    st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2)
     X2 = randn(32, 32, 4)
     B2 = ScatteringTransforms.scattering_batch(st2, X2)
     Test.@test size(B2, 2) == 4
     for b in 1:4
-        Test.@test isapprox(B2[:, b], ScatteringTransforms.flatten2d(st2(view(X2, :, :, b))); rtol=1e-10)
+        Test.@test isapprox(B2[:, b], ScatteringTransforms.Coefficients.flatten2d(st2(view(X2, :, :, b))); rtol=1e-10)
     end
 end
 
@@ -638,22 +637,22 @@ Test.@testset "Intermediate subsampling: exact at large oversampling, ≈ exact 
     N = 256
     J = 5
     signal = randn(N)
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     exact = st(signal)
 
     # Large oversampling ⇒ no decimation ⇒ identical to the exact transform.
-    sub_off = ScatteringTransforms.SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=J)
+    sub_off = ScatteringTransforms.SubsampledScattering.SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=J)
     c_off = sub_off(signal)
-    Test.@test ScatteringTransforms.first_order(c_off) ≈ ScatteringTransforms.first_order(exact)
-    Test.@test ScatteringTransforms.second_order(c_off) ≈ ScatteringTransforms.second_order(exact)
-    Test.@test ScatteringTransforms.zeroth_order(c_off) ≈ ScatteringTransforms.zeroth_order(exact)
+    Test.@test ScatteringTransforms.Coefficients.first_order(c_off) ≈ ScatteringTransforms.Coefficients.first_order(exact)
+    Test.@test ScatteringTransforms.Coefficients.second_order(c_off) ≈ ScatteringTransforms.Coefficients.second_order(exact)
+    Test.@test ScatteringTransforms.Coefficients.zeroth_order(c_off) ≈ ScatteringTransforms.Coefficients.zeroth_order(exact)
 
     # Aggressive subsampling ⇒ S1 identical (full res), S2 close (decimated envelope).
-    sub_on = ScatteringTransforms.SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=1)
+    sub_on = ScatteringTransforms.SubsampledScattering.SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=1)
     c_on = sub_on(signal)
-    Test.@test ScatteringTransforms.first_order(c_on) ≈ ScatteringTransforms.first_order(exact)
-    S2e = ScatteringTransforms.second_order(exact)
-    S2s = ScatteringTransforms.second_order(c_on)
+    Test.@test ScatteringTransforms.Coefficients.first_order(c_on) ≈ ScatteringTransforms.Coefficients.first_order(exact)
+    S2e = ScatteringTransforms.Coefficients.second_order(exact)
+    S2s = ScatteringTransforms.Coefficients.second_order(c_on)
     denom = sum(abs2, S2e)
     Test.@test sum(abs2, S2s .- S2e) / denom < 0.05    # within ~5% relative energy
 end
@@ -663,15 +662,15 @@ Test.@testset "Threaded batch (OhMyThreads) matches serial batch" begin
     # workspace, so results must be identical to the serial batch.
     N = 96
     J = 4
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     X = randn(N, 6)
     serial = ScatteringTransforms.scattering_batch(st, X)
-    threaded = ScatteringTransforms.scattering_batch(ScatteringTransforms.ThreadedBackend(), st, X)
+    threaded = ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.ThreadedBackend(), st, X)
     Test.@test threaded ≈ serial
 
-    st2 = ScatteringTransforms.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
+    st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
     X2 = randn(24, 24, 5)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.ThreadedBackend(), st2, X2) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.ThreadedBackend(), st2, X2) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
 end
 
@@ -681,14 +680,14 @@ Test.@testset "Distributed batch (single process) matches serial" begin
     # added workers, pmap runs locally and must equal the serial batch.
     N = 96
     J = 4
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     X = randn(N, 6)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.DistributedBackend(), st, X) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.DistributedBackend(), st, X) ≈
                ScatteringTransforms.scattering_batch(st, X)
 
-    st2 = ScatteringTransforms.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
+    st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
     X2 = randn(24, 24, 5)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.DistributedBackend(), st2, X2) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.DistributedBackend(), st2, X2) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
 end
 
@@ -699,13 +698,13 @@ Test.@testset "MPI batch (single rank) matches serial" begin
     MPI.Initialized() || MPI.Init()
     N = 96
     J = 4
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     X = randn(N, 6)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.MPIBackend(), st, X) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.MPIBackend(), st, X) ≈
                ScatteringTransforms.scattering_batch(st, X)
-    st2 = ScatteringTransforms.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
+    st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
     X2 = randn(24, 24, 5)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.MPIBackend(), st2, X2) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.MPIBackend(), st2, X2) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
 end
 
@@ -714,20 +713,20 @@ Test.@testset "Spectral plans: in-core direct sum matches FFTW fast path" begin
     N = 128
     J = 4
     signal = randn(N)
-    st_d = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ScatteringTransforms.DirectSumBackend())
-    st_f = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ScatteringTransforms.FFTBackend())
+    st_d = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ScatteringTransforms.Plans.DirectSumBackend())
+    st_f = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ScatteringTransforms.Plans.FFTBackend())
     cd, cf = st_d(signal), st_f(signal)
-    Test.@test isapprox(ScatteringTransforms.zeroth_order(cd), ScatteringTransforms.zeroth_order(cf); rtol=1e-6)
-    Test.@test isapprox(ScatteringTransforms.first_order(cd), ScatteringTransforms.first_order(cf); rtol=1e-6)
-    Test.@test isapprox(ScatteringTransforms.second_order(cd), ScatteringTransforms.second_order(cf); rtol=1e-6)
+    Test.@test isapprox(ScatteringTransforms.Coefficients.zeroth_order(cd), ScatteringTransforms.Coefficients.zeroth_order(cf); rtol=1e-6)
+    Test.@test isapprox(ScatteringTransforms.Coefficients.first_order(cd), ScatteringTransforms.Coefficients.first_order(cf); rtol=1e-6)
+    Test.@test isapprox(ScatteringTransforms.Coefficients.second_order(cd), ScatteringTransforms.Coefficients.second_order(cf); rtol=1e-6)
 
     img = randn(32, 32)
-    s2d = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=ScatteringTransforms.DirectSumBackend())
-    s2f = ScatteringTransforms.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=ScatteringTransforms.FFTBackend())
-    Test.@test isapprox(ScatteringTransforms.first_order(s2d(img)),
-                        ScatteringTransforms.first_order(s2f(img)); rtol=1e-6)
-    Test.@test isapprox(ScatteringTransforms.second_order(s2d(img)),
-                        ScatteringTransforms.second_order(s2f(img)); rtol=1e-6)
+    s2d = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=ScatteringTransforms.Plans.DirectSumBackend())
+    s2f = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=ScatteringTransforms.Plans.FFTBackend())
+    Test.@test isapprox(ScatteringTransforms.Coefficients.first_order(s2d(img)),
+                        ScatteringTransforms.Coefficients.first_order(s2f(img)); rtol=1e-6)
+    Test.@test isapprox(ScatteringTransforms.Coefficients.second_order(s2d(img)),
+                        ScatteringTransforms.Coefficients.second_order(s2f(img)); rtol=1e-6)
 end
 
 Test.@testset "1D localized field: mean equals averaged coefficient" begin
@@ -737,33 +736,33 @@ Test.@testset "1D localized field: mean equals averaged coefficient" begin
     PG = ScatteringTransforms.PathGraph
     N = 256
     J = 4
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     signal = randn(N)
     coeffs = st(signal)
-    sf = ScatteringTransforms.scattering_field(st, signal; subsample=1)
+    sf = ScatteringTransforms.ScatteringFields.scattering_field(st, signal; subsample=1)
     tree = st.tree
 
     root = first(PG.order_range(tree, 0))
-    Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, root)),
-                        ScatteringTransforms.zeroth_order(coeffs); atol=1e-10)
+    Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf, root)),
+                        ScatteringTransforms.Coefficients.zeroth_order(coeffs); atol=1e-10)
 
-    S1 = ScatteringTransforms.first_order(coeffs)
+    S1 = ScatteringTransforms.Coefficients.first_order(coeffs)
     for p in PG.order_range(tree, 1)
         j = PG.path_indices(tree, p)[1]
-        Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, p)), S1[j]; atol=1e-8)
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf, p)), S1[j]; atol=1e-8)
     end
 
-    S2 = ScatteringTransforms.second_order(coeffs)
+    S2 = ScatteringTransforms.Coefficients.second_order(coeffs)
     for p in PG.order_range(tree, 2)
         idx = PG.path_indices(tree, p)
         j1, j2 = idx[1], idx[2]
-        Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, p)), S2[j1, j2]; atol=1e-8)
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf, p)), S2[j1, j2]; atol=1e-8)
     end
 
     # Decimation: subsample=8 -> field length N/8, all finite. (The decimated mean is a
     # finite-sample estimate of the full mean, not exact, so we don't assert equality here;
     # the subsample=1 case above is the exact consistency check.)
-    sf8 = ScatteringTransforms.scattering_field(st, signal; subsample=8)
+    sf8 = ScatteringTransforms.ScatteringFields.scattering_field(st, signal; subsample=8)
     Test.@test size(sf8.data, 1) == N ÷ 8
     Test.@test all(isfinite, sf8.data)
 end
@@ -773,28 +772,28 @@ Test.@testset "2D localized field: mean equals averaged coefficient" begin
     Ny, Nx = 64, 64
     J = 3
     L = 4
-    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
+    st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
     image = randn(Ny, Nx)
     coeffs = st(image)
-    sf = ScatteringTransforms.scattering_field(st, image; subsample=1)
+    sf = ScatteringTransforms.ScatteringFields.scattering_field(st, image; subsample=1)
     tree = st.tree
 
     root = first(PG.order_range(tree, 0))
-    Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, root)),
-                        ScatteringTransforms.zeroth_order(coeffs); atol=1e-10)
-    S1 = ScatteringTransforms.first_order(coeffs)
+    Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf, root)),
+                        ScatteringTransforms.Coefficients.zeroth_order(coeffs); atol=1e-10)
+    S1 = ScatteringTransforms.Coefficients.first_order(coeffs)
     for p in PG.order_range(tree, 1)
         j = PG.path_indices(tree, p)[1]
-        Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, p)), S1[j]; atol=1e-8)
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf, p)), S1[j]; atol=1e-8)
     end
-    S2 = ScatteringTransforms.second_order(coeffs)
+    S2 = ScatteringTransforms.Coefficients.second_order(coeffs)
     for p in PG.order_range(tree, 2)
         idx = PG.path_indices(tree, p)
         j1, j2 = idx[1], idx[2]
-        Test.@test isapprox(Statistics.mean(ScatteringTransforms.path_field(sf, p)), S2[j1, j2]; atol=1e-8)
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf, p)), S2[j1, j2]; atol=1e-8)
     end
 
-    sf2 = ScatteringTransforms.scattering_field(st, image; subsample=2)
+    sf2 = ScatteringTransforms.ScatteringFields.scattering_field(st, image; subsample=2)
     Test.@test size(sf2.data) == (Ny ÷ 2, Nx ÷ 2, PG.npaths(tree))
     Test.@test all(isfinite, sf2.data)
 end
@@ -803,36 +802,36 @@ Test.@testset "Reduced descriptors: sparsity, shape (anisotropy), normalize, log
     Ny, Nx = 64, 64
     J = 3
     L = 4
-    st = ScatteringTransforms.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
+    st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2)
 
     # Anisotropic field (oriented stripes) -> nonzero shape; isotropic noise -> ~0 shape.
     xs = range(0, 8π, length=Nx)'
     aniso = repeat(sin.(xs), Ny, 1) .+ 0.01 .* randn(Ny, Nx)
     ca = st(aniso)
-    ra = ScatteringTransforms.compute_shape_sparsity(ScatteringTransforms.first_order(ca),
-            ScatteringTransforms.second_order(ca), st.filter_bank.meta)
+    ra = ScatteringTransforms.Scattering2D.compute_shape_sparsity(ScatteringTransforms.Coefficients.first_order(ca),
+            ScatteringTransforms.Coefficients.second_order(ca), st.filter_bank.meta)
     Test.@test any(ra.shape .!= 0)                # shape is implemented (was all-zero before)
     Test.@test any(ra.sparsity .> 0)
     Test.@test maximum(abs, ra.shape) > 0.05      # clear anisotropy signal
 
     iso = randn(Ny, Nx)
     ci = st(iso)
-    ri = ScatteringTransforms.compute_shape_sparsity(ScatteringTransforms.first_order(ci),
-            ScatteringTransforms.second_order(ci), st.filter_bank.meta)
+    ri = ScatteringTransforms.Scattering2D.compute_shape_sparsity(ScatteringTransforms.Coefficients.first_order(ci),
+            ScatteringTransforms.Coefficients.second_order(ci), st.filter_bank.meta)
     # Isotropic noise: anisotropy averages down well below the oriented case.
     Test.@test maximum(abs, ri.shape) < maximum(abs, ra.shape)
 
     # Normalized + log reductions.
-    nc = ScatteringTransforms.normalized_coefficients(ca)
-    Test.@test nc.s1 ≈ ScatteringTransforms.first_order(ca) ./ ScatteringTransforms.zeroth_order(ca)
-    S1a = ScatteringTransforms.first_order(ca)
-    S2a = ScatteringTransforms.second_order(ca)
+    nc = ScatteringTransforms.Reductions.normalized_coefficients(ca)
+    Test.@test nc.s1 ≈ ScatteringTransforms.Coefficients.first_order(ca) ./ ScatteringTransforms.Coefficients.zeroth_order(ca)
+    S1a = ScatteringTransforms.Coefficients.first_order(ca)
+    S2a = ScatteringTransforms.Coefficients.second_order(ca)
     for j1 in axes(S2a, 1), j2 in axes(S2a, 2)
         if S1a[j1] > 0
             Test.@test nc.s2[j1, j2] ≈ S2a[j1, j2] / S1a[j1]
         end
     end
-    lc = ScatteringTransforms.log_coefficients(ca)
+    lc = ScatteringTransforms.Reductions.log_coefficients(ca)
     Test.@test all(isfinite, lc.logS1)
     Test.@test length(lc.logS1) == length(S1a)
 end
@@ -842,46 +841,46 @@ Test.@testset "Non-mutating scattering(st,x) matches the in-place st(x) (1D/2D/3
     let
         N, J = 64, 4
         x = randn(N)
-        for spec in (ScatteringTransforms.DirectSumBackend(), ScatteringTransforms.FFTBackend())
-            st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=2, max_order=2, spectral=spec)
-            cm = st(x); cs = ScatteringTransforms.scattering(st, x)
-            Test.@test ScatteringTransforms.zeroth_order(cm) ≈ ScatteringTransforms.zeroth_order(cs)
-            Test.@test ScatteringTransforms.first_order(cm) ≈ ScatteringTransforms.first_order(cs)
-            Test.@test ScatteringTransforms.second_order(cm) ≈ ScatteringTransforms.second_order(cs)
+        for spec in (ScatteringTransforms.Plans.DirectSumBackend(), ScatteringTransforms.Plans.FFTBackend())
+            st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=2, max_order=2, spectral=spec)
+            cm = st(x); cs = ScatteringTransforms.ScatteringCore.scattering(st, x)
+            Test.@test ScatteringTransforms.Coefficients.zeroth_order(cm) ≈ ScatteringTransforms.Coefficients.zeroth_order(cs)
+            Test.@test ScatteringTransforms.Coefficients.first_order(cm) ≈ ScatteringTransforms.Coefficients.first_order(cs)
+            Test.@test ScatteringTransforms.Coefficients.second_order(cm) ≈ ScatteringTransforms.Coefficients.second_order(cs)
         end
     end
     let
-        st = ScatteringTransforms.ScatteringTransform2D((16, 16), 2; L=4, max_order=2)
+        st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((16, 16), 2; L=4, max_order=2)
         x = randn(16, 16)
-        cm = st(x); cs = ScatteringTransforms.scattering(st, x)
-        Test.@test ScatteringTransforms.first_order(cm) ≈ ScatteringTransforms.first_order(cs)
-        Test.@test ScatteringTransforms.second_order(cm) ≈ ScatteringTransforms.second_order(cs)
+        cm = st(x); cs = ScatteringTransforms.ScatteringCore.scattering(st, x)
+        Test.@test ScatteringTransforms.Coefficients.first_order(cm) ≈ ScatteringTransforms.Coefficients.first_order(cs)
+        Test.@test ScatteringTransforms.Coefficients.second_order(cm) ≈ ScatteringTransforms.Coefficients.second_order(cs)
     end
     let
-        st = ScatteringTransforms.ScatteringTransform3D((8, 8, 8), 2; n_orient=6, max_order=2)
+        st = ScatteringTransforms.Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient=6, max_order=2)
         x = randn(8, 8, 8)
-        cm = st(x); cs = ScatteringTransforms.scattering(st, x)
-        Test.@test ScatteringTransforms.first_order(cm) ≈ ScatteringTransforms.first_order(cs)
-        Test.@test ScatteringTransforms.second_order(cm) ≈ ScatteringTransforms.second_order(cs)
+        cm = st(x); cs = ScatteringTransforms.ScatteringCore.scattering(st, x)
+        Test.@test ScatteringTransforms.Coefficients.first_order(cm) ≈ ScatteringTransforms.Coefficients.first_order(cs)
+        Test.@test ScatteringTransforms.Coefficients.second_order(cm) ≈ ScatteringTransforms.Coefficients.second_order(cs)
     end
     # Element-type genericity: Float32 in -> Float32 out through the non-mutating path.
     let
-        st = ScatteringTransforms.ScatteringTransform1D(32, 3; Q=1, max_order=2, T=Float32)
-        cs = ScatteringTransforms.scattering(st, randn(Float32, 32))
-        Test.@test eltype(ScatteringTransforms.first_order(cs)) == Float32
+        st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(32, 3; Q=1, max_order=2, T=Float32)
+        cs = ScatteringTransforms.ScatteringCore.scattering(st, randn(Float32, 32))
+        Test.@test eltype(ScatteringTransforms.Coefficients.first_order(cs)) == Float32
     end
 end
 
 Test.@testset "Autodiff through scattering(st,x): Mooncake gradient matches finite differences" begin
     N, J = 32, 3
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2,
-                                                    spectral=ScatteringTransforms.DirectSumBackend())
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2,
+                                                    spectral=ScatteringTransforms.Plans.DirectSumBackend())
     xt = randn(N)
-    target = ScatteringTransforms.scattering(st, xt)
-    t1 = ScatteringTransforms.first_order(target)
-    t2 = ScatteringTransforms.second_order(target)
-    loss(x) = sum(abs2, ScatteringTransforms.first_order(ScatteringTransforms.scattering(st, x)) .- t1) +
-              sum(abs2, ScatteringTransforms.second_order(ScatteringTransforms.scattering(st, x)) .- t2)
+    target = ScatteringTransforms.ScatteringCore.scattering(st, xt)
+    t1 = ScatteringTransforms.Coefficients.first_order(target)
+    t2 = ScatteringTransforms.Coefficients.second_order(target)
+    loss(x) = sum(abs2, ScatteringTransforms.Coefficients.first_order(ScatteringTransforms.ScatteringCore.scattering(st, x)) .- t1) +
+              sum(abs2, ScatteringTransforms.Coefficients.second_order(ScatteringTransforms.ScatteringCore.scattering(st, x)) .- t2)
 
     backend = AutoMooncake()
     x0 = randn(N)
@@ -900,22 +899,22 @@ Test.@testset "Exact linear wavelet-frame inverse: iwavelet ∘ wavelet_transfor
     let
         N, J = 128, 5
         x = randn(N)
-        st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=1)
-        xr = ScatteringTransforms.iwavelet(st, ScatteringTransforms.wavelet_transform(st, x))
+        st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=1)
+        xr = ScatteringTransforms.Inverse.iwavelet(st, ScatteringTransforms.Inverse.wavelet_transform(st, x))
         Test.@test xr ≈ x  rtol=1e-9
     end
     let
         N, J = (32, 32), 3
         x = randn(N)
-        st = ScatteringTransforms.ScatteringTransform2D(N, J; L=4, max_order=1)
-        xr = ScatteringTransforms.iwavelet(st, ScatteringTransforms.wavelet_transform(st, x))
+        st = ScatteringTransforms.Scattering2D.ScatteringTransform2D(N, J; L=4, max_order=1)
+        xr = ScatteringTransforms.Inverse.iwavelet(st, ScatteringTransforms.Inverse.wavelet_transform(st, x))
         Test.@test xr ≈ x  rtol=1e-9
     end
     let
         N, J = (16, 16, 16), 2
         x = randn(N)
-        st = ScatteringTransforms.ScatteringTransform3D(N, J; n_orient=6, max_order=1)
-        xr = ScatteringTransforms.iwavelet(st, ScatteringTransforms.wavelet_transform(st, x))
+        st = ScatteringTransforms.Scattering3D.ScatteringTransform3D(N, J; n_orient=6, max_order=1)
+        xr = ScatteringTransforms.Inverse.iwavelet(st, ScatteringTransforms.Inverse.wavelet_transform(st, x))
         Test.@test xr ≈ x  rtol=1e-9
     end
 end
@@ -923,11 +922,11 @@ end
 Test.@testset "Phase retrieval (Gerchberg–Saxton): reconstructed moduli match target" begin
     N, J = 128, 6
     x = randn(N)
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=2, max_order=1)
-    wt = ScatteringTransforms.wavelet_transform(st, x)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=2, max_order=1)
+    wt = ScatteringTransforms.Inverse.wavelet_transform(st, x)
     moduli = [abs.(w) for w in wt.wavelet]
-    xhat = ScatteringTransforms.reconstruct_phase(st, moduli; iters=400, init=randn(N))
-    wt2 = ScatteringTransforms.wavelet_transform(st, xhat)
+    xhat = ScatteringTransforms.Inverse.reconstruct_phase(st, moduli; iters=400, init=randn(N))
+    wt2 = ScatteringTransforms.Inverse.wavelet_transform(st, xhat)
     num = sqrt(sum(sum(abs2, abs.(w2) .- m) for (w2, m) in zip(wt2.wavelet, moduli)))
     den = sqrt(sum(sum(abs2, m) for m in moduli))
     Test.@test num / den < 0.15      # alternating projections drive the modulus error down
@@ -936,8 +935,8 @@ end
 Test.@testset "Gradient-descent synthesis (DifferentiationInterface ext, Mooncake)" begin
     # synthesize: from noise, descend ‖S(x̂) − S(target)‖² so the coefficients converge.
     N, J = 48, 4
-    st = ScatteringTransforms.ScatteringTransform1D(N, J; Q=1, max_order=2,
-                                                    spectral=ScatteringTransforms.DirectSumBackend())
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2,
+                                                    spectral=ScatteringTransforms.Plans.DirectSumBackend())
     xtarget = cumsum(randn(N)); xtarget .-= sum(xtarget) / N
     res = ScatteringTransforms.synthesize(st, xtarget;
                                           backend=AutoMooncake(), init=randn(N), iters=150, lr=0.05)
@@ -946,10 +945,10 @@ Test.@testset "Gradient-descent synthesis (DifferentiationInterface ext, Mooncak
     Test.@test res.losses[end] < res.losses[1] / 5           # objective drops substantially
 
     # Synthesized coefficients approach the target's.
-    ct = ScatteringTransforms.scattering(st, xtarget)
-    cs = ScatteringTransforms.scattering(st, res.field)
-    rel = sqrt(sum(abs2, ScatteringTransforms.first_order(cs) .- ScatteringTransforms.first_order(ct))) /
-          sqrt(sum(abs2, ScatteringTransforms.first_order(ct)))
+    ct = ScatteringTransforms.ScatteringCore.scattering(st, xtarget)
+    cs = ScatteringTransforms.ScatteringCore.scattering(st, res.field)
+    rel = sqrt(sum(abs2, ScatteringTransforms.Coefficients.first_order(cs) .- ScatteringTransforms.Coefficients.first_order(ct))) /
+          sqrt(sum(abs2, ScatteringTransforms.Coefficients.first_order(ct)))
     Test.@test rel < 0.1
 
     # Target may also be passed as a precomputed coefficient container.
@@ -960,7 +959,7 @@ end
 Test.@testset "Monogenic (Riesz) scattering: partition, tight frame, transforms" begin
     # Riesz multipliers partition unity off the DC bin: Σ_d |R_d(k)|² = 1, and vanish at DC.
     for dims in ((32,), (16, 16), (8, 8, 8))
-        R = ScatteringTransforms.riesz_multipliers(dims, Float64)
+        R = ScatteringTransforms.Monogenic.riesz_multipliers(dims, Float64)
         s = sum(abs2.(Rd) for Rd in R)
         Test.@test s[1] == 0                              # DC
         offdc = [s[i] for i in CartesianIndices(dims) if i != first(CartesianIndices(dims))]
@@ -969,7 +968,7 @@ Test.@testset "Monogenic (Riesz) scattering: partition, tight frame, transforms"
 
     # Isotropic bank is a tight frame: Σ_j |ψ̂_j|² + |φ̂|² ≡ 1.
     let
-        fb = ScatteringTransforms.build_monogenic_bank((32, 32), 3; Q=1)
+        fb = ScatteringTransforms.Monogenic.build_monogenic_bank((32, 32), 3; Q=1)
         s = abs2.(fb.averaging)
         for ψ in fb.wavelets
             s = s .+ abs2.(ψ)
@@ -979,16 +978,16 @@ Test.@testset "Monogenic (Riesz) scattering: partition, tight frame, transforms"
 
     # 1D/2D/3D transforms run, finite, correct coefficient counts; Float32 preserved.
     for (dims, J, n) in (((128,), 5, 5), ((32, 32), 3, 3), ((16, 16, 16), 2, 2))
-        st = ScatteringTransforms.MonogenicScattering(dims, J; Q=1, max_order=2)
+        st = ScatteringTransforms.Monogenic.MonogenicScattering(dims, J; Q=1, max_order=2)
         c = st(randn(dims...))
-        Test.@test length(ScatteringTransforms.first_order(c)) == n
-        Test.@test all(isfinite, ScatteringTransforms.first_order(c))
-        Test.@test all(isfinite, ScatteringTransforms.second_order(c))
+        Test.@test length(ScatteringTransforms.Coefficients.first_order(c)) == n
+        Test.@test all(isfinite, ScatteringTransforms.Coefficients.first_order(c))
+        Test.@test all(isfinite, ScatteringTransforms.Coefficients.second_order(c))
     end
     let
-        stf = ScatteringTransforms.MonogenicScattering((32, 32), 2; Q=1, max_order=2, T=Float32)
+        stf = ScatteringTransforms.Monogenic.MonogenicScattering((32, 32), 2; Q=1, max_order=2, T=Float32)
         cf = stf(randn(Float32, 32, 32))
-        Test.@test eltype(ScatteringTransforms.first_order(cf)) == Float32
+        Test.@test eltype(ScatteringTransforms.Coefficients.first_order(cf)) == Float32
     end
 end
 
@@ -998,10 +997,10 @@ Test.@testset "Monogenic: rotation invariance + continuous orientation recovery"
         M, J = 64, 3
         f = [sin(2π * 3 * i / M) + 0.5 * cos(2π * 5 * j / M) for i in 0:M-1, j in 0:M-1] .+
             0.1 .* randn(M, M)
-        st = ScatteringTransforms.MonogenicScattering((M, M), J; Q=1, max_order=2)
+        st = ScatteringTransforms.Monogenic.MonogenicScattering((M, M), J; Q=1, max_order=2)
         c0 = st(f); c90 = st(rotr90(f))
-        rel = maximum(abs.(ScatteringTransforms.first_order(c0) .- ScatteringTransforms.first_order(c90))) /
-              maximum(abs.(ScatteringTransforms.first_order(c0)))
+        rel = maximum(abs.(ScatteringTransforms.Coefficients.first_order(c0) .- ScatteringTransforms.Coefficients.first_order(c90))) /
+              maximum(abs.(ScatteringTransforms.Coefficients.first_order(c0)))
         Test.@test rel < 1e-6
     end
     # The Riesz vector recovers a plane wave's orientation (continuously, not quantized).
@@ -1009,9 +1008,9 @@ Test.@testset "Monogenic: rotation invariance + continuous orientation recovery"
         M, θ, n = 64, 0.6, 8
         kx, ky = cos(θ), sin(θ)
         f = [cos(2π * n * (kx * i + ky * j) / M) for i in 0:M-1, j in 0:M-1]
-        st = ScatteringTransforms.MonogenicScattering((M, M), 5; Q=1, max_order=1)
-        best = argmax([sum(abs2, ScatteringTransforms.monogenic_components(st, f, jj).bandpass) for jj in 1:5])
-        comp = ScatteringTransforms.monogenic_components(st, f, best)
+        st = ScatteringTransforms.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1)
+        best = argmax([sum(abs2, ScatteringTransforms.Monogenic.monogenic_components(st, f, jj).bandpass) for jj in 1:5])
+        comp = ScatteringTransforms.Monogenic.monogenic_components(st, f, best)
         r1, r2, amp = comp.riesz[1], comp.riesz[2], comp.amplitude
         mask = amp .> 0.5 * maximum(amp)
         c2 = sum((r1[k]^2 - r2[k]^2) for k in CartesianIndices(f) if mask[k])
@@ -1020,5 +1019,20 @@ Test.@testset "Monogenic: rotation invariance + continuous orientation recovery"
         Test.@test min(abs(est - θ), π - abs(est - θ)) < 0.05
     end
 end
+
+# Structured-grid spherical scattering (fast SHT) — completes the grid-support matrix.
+include("test_spherical_sht.jl")
+
+# Scattered / nonuniform planar scattering (NUFFT) — completes the Cartesian side of the matrix.
+include("test_scattered_planar.jl")
+
+# Pointwise spherical monogenic orientation/phase (spin-1 synthesis, #1).
+include("test_spherical_monogenic_components.jl")
+
+# Allocation discipline: hot paths zero-alloc; allocating paths minimal + data-size-independent.
+include("test_allocs.jl")
+
+# Vendor-neutral GPU path on the KernelAbstractions CPU backend (no GPU hardware needed).
+include("test_gpu.jl")
 
 end # module
