@@ -16,7 +16,7 @@ using ScatteringTransforms: ScatteringTransforms
 const ST = ScatteringTransforms
 const ThreadedBackend = ST.Backends.ThreadedBackend
 
-function ST.scattering_batch(::ThreadedBackend, st::ST.ScatteringTransform1D, X::AbstractMatrix)
+function ST.scattering_batch(::ThreadedBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix)
     N, B = size(X)
     nw = length(st.filter_bank.wavelets)
     T = real(eltype(st.filter_bank.averaging))
@@ -33,7 +33,7 @@ function ST.scattering_batch(::ThreadedBackend, st::ST.ScatteringTransform1D, X:
     return out
 end
 
-function ST.scattering_batch(::ThreadedBackend, st::ST.ScatteringTransform2D, X::AbstractArray{<:Any,3})
+function ST.scattering_batch(::ThreadedBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3})
     Ny, Nx, B = size(X)
     T = real(eltype(st.filter_bank.averaging))
     coeff_proto = ST.Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.L, T;

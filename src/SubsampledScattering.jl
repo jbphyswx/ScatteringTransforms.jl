@@ -26,7 +26,8 @@ export SubsampledScattering1D
 A 1D scattering transform with fast second order via intermediate subsampling: the first-order
 modulus envelope is decimated by `2^(scale - oversampling)` before the second wavelet transform
 (multi-resolution wavelet bank). Opt-in and approximate — a large `oversampling` reproduces the
-exact [`ScatteringTransform1D`](@ref); aggressive values trade a little accuracy for speed.
+exact [`ScatteringTransform1D`](@ref ScatteringTransforms.Scattering1D.ScatteringTransform1D);
+aggressive values trade a little accuracy for speed.
 """
 struct SubsampledScattering1D{T, Tree<:PathGraph.ScatteringTree,
                               MV<:AbstractVector{FilterBanks.WaveletMeta{T}}, WF<:AbstractVector,

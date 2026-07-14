@@ -80,6 +80,18 @@ extension being loaded.
 function fftw_plan end
 
 """
+    abstractffts_plan(dummy_device_array; region=1:ndims(dummy_device_array))
+
+Vendor-neutral device FFT plan constructor. Declaration only — the sole method is provided by the
+KernelAbstractions extension, which builds forward/inverse plans via `AbstractFFTs.plan_fft` /
+`plan_ifft` on `dummy_device_array`. Because those dispatch on the array *type*, the same builder
+yields cuFFT (`CuArray`), rocFFT (`ROCArray`), or FFTW (plain `Array`) plans — so the GPU scattering
+path is device-agnostic. `region` selects the transformed dimensions (e.g. `(1, 2)` for a batched
+`(Ny, Nx, B)` stack, leaving the batch axis untouched).
+"""
+function abstractffts_plan end
+
+"""
     AbstractSpectralBackend
 
 Selects which spectral transform a transform uses: [`DirectSumBackend`](@ref) (in-core, always

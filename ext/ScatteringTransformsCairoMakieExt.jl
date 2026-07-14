@@ -10,7 +10,7 @@ const _ENERGY_CMAP = :dense
 const _NAN_COLOR = (:gray, 0.18)
 
 # Implement plot_filter_bank for 1D Filter Banks
-function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBank1D)
+function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBanks.FilterBank1D)
     MK = CairoMakie
     N = length(fb.averaging)
     Nhalf = N ÷ 2
@@ -58,7 +58,7 @@ function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBa
 end
 
 # Implement plot_filter_bank for 2D Filter Banks
-function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBank2D)
+function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBanks.FilterBank2D)
     Ny, Nx = size(fb.averaging)
     
     # Littlewood-Paley sum matrix
@@ -95,7 +95,7 @@ function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBa
 end
 
 # Implement plot_coefficients for 1D Coefficients
-function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.ScatteringCoefficients1D; signal=nothing)
+function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Coefficients.ScatteringCoefficients1D; signal=nothing)
     has_sig = !isnothing(signal)
     
     J_eff = c.n_wavelets
@@ -169,7 +169,7 @@ function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Scatteri
 end
 
 # Implement plot_coefficients for 2D Coefficients
-function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.ScatteringCoefficients2D; image=nothing)
+function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Coefficients.ScatteringCoefficients2D; image=nothing)
     has_img = !isnothing(image)
     J = c.n_scales
     L = c.n_orientations

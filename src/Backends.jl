@@ -7,7 +7,7 @@ Names mirror the jbphyswx ecosystem (`SerialBackend`, `ThreadedBackend`, `GPUBac
 `AutoBackend`), with two orthogonal concerns:
 
 - **Local compute backend** — what one process/rank computes on: `SerialBackend`,
-  `ThreadedBackend` (OhMyThreads ext), `GPUBackend{B}` (CUDA / KernelAbstractions ext).
+  `ThreadedBackend` (OhMyThreads ext), `GPUBackend{B}` (vendor-neutral KernelAbstractions ext).
 - **Distribution wrapper** — how work is split across processes, **parametric over the inner
   local backend**: `DistributedBackend{Inner}` (Distributed ext), `MPIBackend{Inner}` (MPI ext).
   A flat (non-parametric) distributed backend cannot say what each worker runs on; the
@@ -33,8 +33,11 @@ struct ThreadedBackend <: AbstractExecutionBackend end
 """
     GPUBackend{B}
 
-GPU compute on backend object `B` (e.g. a `CUDABackend` / KernelAbstractions backend). Requires
-the corresponding extension (`using CUDA`).
+GPU compute on KernelAbstractions backend object `B` — e.g. `KA.CPU()` (CPU-parity), or a vendor
+backend such as `CUDA.CUDABackend()` / `AMDGPU.ROCBackend()` / `oneAPI.oneAPIBackend()` /
+`Metal.MetalBackend()`. Activated by the vendor-neutral path in `ScatteringTransformsKernelAbstractionsExt`
+(`using KernelAbstractions, AbstractFFTs`); the device's own package (`using CUDA`, …) supplies the
+`KA.allocate` and `AbstractFFTs.plan_fft` methods at runtime. No CUDA-specific extension exists.
 """
 struct GPUBackend{B} <: AbstractExecutionBackend
     backend::B
