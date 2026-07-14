@@ -17,13 +17,21 @@ Fast, generic wavelet scattering transforms in Julia.
   retrieval (`reconstruct_phase`), and gradient-descent `synthesize` from coefficients
   (DifferentiationInterface extension; any `ADTypes` backend, e.g. `AutoMooncake`).
 - **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
-  monogenic amplitude + continuous orientation/phase (`monogenic_components`); spherical
-  `spherical_monogenic_scattering` on S² (spin-0 identity, no spin-1 synthesis needed).
+  monogenic amplitude + continuous orientation/phase (`monogenic_components`); on S²,
+  `spherical_monogenic_scattering` (amplitude via the spin-0 Bochner identity) plus
+  `spherical_monogenic_components` for pointwise orientation/phase (spin-1 Riesz vector, `using NUFSHT`).
+- **Grid-support matrix**: Cartesian × spherical, on uniform/structured and nonuniform/scattered
+  sampling — gridded `ScatteringTransform{1,2,3}D` (FFT), scattered-planar `scattered_planar_scattering`
+  (NUFFT, `using FINUFFT`), structured-sphere `structured_spherical_scattering` (fast SHT,
+  `using FastSphericalHarmonics`), and scattered-sphere `spherical_scattering` (NUFSHT).
 - **Pluggable spectral backend**: dependency-free direct-sum default; `using FFTW` switches on
   an `O(N log N)` fast path automatically
   (`spectral = AutoSpectral() | DirectSumBackend() | FFTBackend()`).
 - **Batching & threading**: `scattering_batch` reuses one plan/workspace; `using OhMyThreads`
   enables `scattering_batch(ThreadedBackend(), …)`.
+- **Vendor-neutral GPU**: `using KernelAbstractions, AbstractFFTs` + a device backend (e.g.
+  `using CUDA`) gives a device-resident transform via `GPUBackend(CUDA.CUDABackend())` and a
+  batched-throughput `scattering_batch(gpu, st, X)` — CUDA/ROCm/oneAPI/Metal, validated on `KA.CPU()`.
 - **Generic & type-stable**: `Float32`/`Float64`, autodiff-friendly, GPU-array-ready hot path,
   in-place `!` methods over pre-allocated buffers.
 
@@ -117,11 +125,27 @@ not quantized orientation bins.
 
 ![Monogenic analysis](docs/src/assets/monogenic.png)
 
+### Nonuniform / scattered planar grids (NUFFT)
+Off-lattice / gappy planar data (scattered `(x, y)` points) is scattered onto a uniform Fourier mode
+grid by a NUFFT (`scattered_planar_scattering`, `using FINUFFT`), where the ordinary Morlet wavelet
+bank lives; on a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` gives
+the exact band-limited (CG least-squares) inversion for irregular sampling.
+
+![Scattered planar scattering](docs/src/assets/scattered_planar.png)
+
 ### Spherical scattering
-On S² (scattered points, via NUFSHT): analytic and monogenic transforms, the latter computing the
-spin-1 Riesz energy with spin-0 transforms via a Bochner identity.
+On S², both **scattered points** (`spherical_scattering`, via NUFSHT) and a **structured**
+Clenshaw–Curtis grid (`structured_spherical_scattering`, via the fast SHT in FastSphericalHarmonics)
+give matching multi-scale coefficients:
 
 ![Spherical scattering](docs/src/assets/spherical_scattering.png)
+![Structured spherical scattering](docs/src/assets/structured_spherical.png)
+
+The monogenic *amplitude* computes the spin-1 Riesz energy from spin-0 transforms via a Bochner
+identity (no spin-1 synthesis needed); pointwise orientation/phase (`spherical_monogenic_components`)
+synthesizes the actual spin-1 Riesz tangent vector on S².
+
+![Spherical monogenic components](docs/src/assets/spherical_monogenic.png)
 
 ### Spectral backends
 The in-core direct-sum default is dependency-free but `O(N²)`; loading `FFTW` switches on an

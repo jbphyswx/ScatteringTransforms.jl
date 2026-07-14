@@ -37,18 +37,18 @@ end
 N, J = 256, 6
 sig = spectral_signal(N, -5/3)
 # FFTW fast path for the (AD-free) exact inverse and phase retrieval.
-st = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.FFTBackend())
+st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.FFTBackend())
 
 # ── 1. exact linear inverse ───────────────────────────────────────────────────
-wt = ST.wavelet_transform(st, sig)            # complex (pre-modulus) wavelet + low-pass fields
-xr = ST.iwavelet(st, wt)
+wt = ST.Inverse.wavelet_transform(st, sig)            # complex (pre-modulus) wavelet + low-pass fields
+xr = ST.Inverse.iwavelet(st, wt)
 inv_err = maximum(abs.(xr .- sig)) / maximum(abs.(sig))
 println("\n1. exact linear inverse:   rel. err = ", inv_err, "  (machine precision)")
 
 # ── 2. phase retrieval from first-order moduli ────────────────────────────────
 moduli = [abs.(w) for w in wt.wavelet]
-xhat = ST.reconstruct_phase(st, moduli; iters=400, init=randn(N))
-mod_hat = [abs.(w) for w in ST.wavelet_transform(st, xhat).wavelet]
+xhat = ST.Inverse.reconstruct_phase(st, moduli; iters=400, init=randn(N))
+mod_hat = [abs.(w) for w in ST.Inverse.wavelet_transform(st, xhat).wavelet]
 mod_relerr = sqrt(sum(sum(abs2, mh .- m) for (mh, m) in zip(mod_hat, moduli))) /
              sqrt(sum(sum(abs2, m) for m in moduli))
 println("2. phase retrieval:        modulus rel. err = ", round(mod_relerr; sigdigits=3),
@@ -57,11 +57,11 @@ println("2. phase retrieval:        modulus rel. err = ", round(mod_relerr; sigd
 # ── 3. gradient-descent synthesis from scattering coefficients ────────────────
 # Use the in-core direct-sum forward: it is differentiable by *every* AD backend with no special
 # rules (FFTW-fast-path reverse-mode AD needs the backend's FFT rules — see the docs).
-st_ad = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.DirectSumBackend())
+st_ad = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.DirectSumBackend())
 res = ST.synthesize(st_ad, sig; backend=AutoMooncake(), init=randn(N), iters=300, lr=0.05)
-cT, cS = ST.scattering(st_ad, sig), ST.scattering(st_ad, res.field)
-s1_relerr = sqrt(sum(abs2, ST.first_order(cS) .- ST.first_order(cT))) /
-            sqrt(sum(abs2, ST.first_order(cT)))
+cT, cS = ST.ScatteringCore.scattering(st_ad, sig), ST.ScatteringCore.scattering(st_ad, res.field)
+s1_relerr = sqrt(sum(abs2, ST.Coefficients.first_order(cS) .- ST.Coefficients.first_order(cT))) /
+            sqrt(sum(abs2, ST.Coefficients.first_order(cT)))
 println("3. coefficient synthesis:  loss ", round(res.losses[1]; sigdigits=3), " → ",
         round(res.losses[end]; sigdigits=3), ";  S₁ rel. err = ", round(s1_relerr; sigdigits=3))
 println("   (a matching sample, NOT the original field — the modulus discards local phase)")

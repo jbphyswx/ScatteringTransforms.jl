@@ -5,17 +5,20 @@ Supports 1D, 2D planar (gridded), and (via extension) 2D spherical scattering.
 
 ## Quick Start
 
+Symbols are accessed via fully-qualified submodule paths (the package does not re-export names into
+the top-level namespace — see `docs/src/api.md`); alias the package for brevity.
+
 ```julia
-using ScatteringTransforms
+using ScatteringTransforms: ScatteringTransforms as ST
 
 # 1D scattering (N = signal length, J = number of octaves)
 signal = randn(1024)
-st = ScatteringTransform1D(1024, 8; Q=1, max_order=2)
+st = ST.Scattering1D.ScatteringTransform1D(1024, 8; Q=1, max_order=2)
 coeffs = st(signal)
 
 # 2D planar scattering (N = image size, J = scales, L = orientations)
 image = randn(256, 256)
-st2d = ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
+st2d = ST.Scattering2D.ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
 coeffs2d = st2d(image)
 ```
 
@@ -51,6 +54,7 @@ include("Scattering3D.jl")
 include("SubsampledScattering.jl")
 include("Reductions.jl")
 include("Monogenic.jl")
+include("SphericalCore.jl")
 include("Inverse.jl")
 
 # Import submodules using X: X pattern
@@ -69,147 +73,98 @@ using .SubsampledScattering: SubsampledScattering
 using .Coefficients: Coefficients
 using .Reductions: Reductions
 using .Monogenic: Monogenic
+using .SphericalCore: SphericalCore
 using .Inverse: Inverse
 
-# Re-export key types from submodules (using X: X pattern)
-const ScatteringTransform1D = Scattering1D.ScatteringTransform1D
-const ScatteringTransform2D = Scattering2D.ScatteringTransform2D
-const ScatteringTransform3D = Scattering3D.ScatteringTransform3D
-const SubsampledScattering1D = SubsampledScattering.SubsampledScattering1D
-const FilterBank1D = FilterBanks.FilterBank1D
-const FilterBank2D = FilterBanks.FilterBank2D
-const FilterBank3D = FilterBanks.FilterBank3D
-const Morlet3D = Filters.Morlet3D
-const build_filter_bank3d = FilterBanks.build_filter_bank3d
-const scattering_transform3d! = Scattering3D.scattering_transform3d!
-const WaveletMeta = FilterBanks.WaveletMeta
-const ScatteringTree = PathGraph.ScatteringTree
-# Backend taxonomy (ecosystem names; DistributedBackend/MPIBackend parametric over inner backend)
-const SerialBackend = Backends.SerialBackend
-const ThreadedBackend = Backends.ThreadedBackend
-const GPUBackend = Backends.GPUBackend
-const AutoBackend = Backends.AutoBackend
-const DistributedBackend = Backends.DistributedBackend
-const MPIBackend = Backends.MPIBackend
-# Domain tags
-const Line1D = Domains.Line1D
-const Plane2D = Domains.Plane2D
-const Volume3D = Domains.Volume3D
-const Sphere = Domains.Sphere
-# Spectral plans
-const DirectSumPlan = Plans.DirectSumPlan
-const AbstractScatteringPlan = Plans.AbstractScatteringPlan
-const forward_transform! = Plans.forward_transform!
-const inverse_transform! = Plans.inverse_transform!
-const forward_transform = Plans.forward_transform
-const inverse_transform = Plans.inverse_transform
-const scattering = ScatteringCore.scattering
-# Spectral backend selectors (type-dispatched, not symbols)
-const AbstractSpectralBackend = Plans.AbstractSpectralBackend
-const DirectSumBackend = Plans.DirectSumBackend
-const FFTBackend = Plans.FFTBackend
-const AutoSpectral = Plans.AutoSpectral
-const ScatteringField1D = ScatteringFields.ScatteringField1D
-const ScatteringField2D = ScatteringFields.ScatteringField2D
-const path_field = ScatteringFields.path_field
-const scattering_field = ScatteringFields.scattering_field    # 1D + 2D methods added in submodules
-const scattering_field! = ScatteringFields.scattering_field!
-const Morlet1D = Filters.Morlet1D
-const Morlet2D = Filters.Morlet2D
-const ScatteringCoefficients1D = Coefficients.ScatteringCoefficients1D
-const ScatteringCoefficients2D = Coefficients.ScatteringCoefficients2D
-const frequency_response = Filters.frequency_response
-const build_filter_bank1d = FilterBanks.build_filter_bank1d
-const build_filter_bank2d = FilterBanks.build_filter_bank2d
-const zeroth_order = Coefficients.zeroth_order
-const first_order = Coefficients.first_order
-const second_order = Coefficients.second_order
-const flatten1d = Coefficients.flatten1d
-const flatten2d = Coefficients.flatten2d
-const flatten1d! = Coefficients.flatten1d!
-const flatten2d! = Coefficients.flatten2d!
-const flatten_length = Coefficients.flatten_length
-const scattering_transform!    = Scattering1D.scattering_transform!
-const scattering_transform2d!  = Scattering2D.scattering_transform2d!
-const compute_S1_2d! = Scattering2D.compute_S1_2d!
-const compute_S2_2d! = Scattering2D.compute_S2_2d!
-const compute_shape_sparsity = Scattering2D.compute_shape_sparsity
-const normalized_coefficients = Reductions.normalized_coefficients
-const log_coefficients = Reductions.log_coefficients
-# Reconstruction (Inverse.jl): exact linear wavelet-frame inverse + phase retrieval
-const wavelet_transform = Inverse.wavelet_transform
-const iwavelet = Inverse.iwavelet
-const reconstruct_phase = Inverse.reconstruct_phase
-# Monogenic (Riesz) scattering — isotropic bank + monogenic amplitude (1D/2D/3D)
-const MonogenicScattering = Monogenic.MonogenicScattering
-const MonogenicFilterBank = Monogenic.MonogenicFilterBank
-const build_monogenic_bank = Monogenic.build_monogenic_bank
-const riesz_multipliers = Monogenic.riesz_multipliers
-const monogenic_amplitude = Monogenic.monogenic_amplitude
-const monogenic_components = Monogenic.monogenic_components
 
 # ============================================================================
 # Batched transforms — process a stack of signals/images reusing one plan + workspace
 # ============================================================================
 
 """
-    scattering_batch(st::ScatteringTransform1D, X) -> Matrix
+    scattering_batch(st::Scattering1D.ScatteringTransform1D, X) -> Matrix
 
 Apply a 1D scattering transform to a batch of signals `X` of size `(N, B)` (signals as columns),
 returning a `(flatten_length, B)` matrix whose column `b` is `flatten1d(st(X[:, b]))`. The plan
 and all workspace buffers are reused across the batch (only the small scalar-S0 wrapper is
 re-allocated per column).
 """
-function scattering_batch(st::ScatteringTransform1D, X::AbstractMatrix)
-    N, B = size(X)
+function scattering_batch(st::Scattering1D.ScatteringTransform1D, X::AbstractMatrix)
+    T = eltype(st.filter_bank.averaging) |> real
+    nw = length(st.filter_bank.wavelets)
+    flen = Coefficients.flatten_length(
+        Coefficients.ScatteringCoefficients1D(nw, T; compute_S2 = st.max_order >= 2))
+    return scattering_batch!(Matrix{T}(undef, flen, size(X, 2)), st, X)
+end
+
+"""
+    scattering_batch!(out, st, X) -> out
+
+In-place counterpart of [`scattering_batch`](@ref): write the flattened coefficients of each column
+(1D) / slice (2D) of `X` into the preallocated `(flatten_length, B)` matrix `out`, reusing one plan +
+workspace across the batch. Backend-dispatched `!` methods (`scattering_batch!(out, backend, st, X)`)
+are added by the corresponding extensions.
+"""
+function scattering_batch!(out::AbstractMatrix, st::Scattering1D.ScatteringTransform1D, X::AbstractMatrix)
     nw = length(st.filter_bank.wavelets)
     T = eltype(st.filter_bank.averaging) |> real
-    coeffs = Coefficients.ScatteringCoefficients1D(nw, T; compute_S2 = st.max_order >= 2)
-    out = Matrix{T}(undef, Coefficients.flatten_length(coeffs), B)
-    @inbounds for b in 1:B
-        c = Scattering1D.scattering_transform!(coeffs, st, view(X, :, b))
-        Coefficients.flatten1d!(view(out, :, b), c)
+    # Mutable-S0 container so `scattering_transform!` updates in place — no per-column wrapper alloc.
+    S2 = st.max_order >= 2 ? zeros(T, nw, nw) : Matrix{T}(undef, 0, 0)
+    coeffs = Coefficients.ScatteringCoefficients1D(Vector{T}(undef, nw), S2; S0 = [zero(T)])
+    @inbounds for b in 1:size(X, 2)
+        Scattering1D.scattering_transform!(coeffs, st, view(X, :, b))
+        Coefficients.flatten1d!(view(out, :, b), coeffs)
     end
     return out
 end
 
 """
-    scattering_batch(st::ScatteringTransform2D, X) -> Matrix
+    scattering_batch(st::Scattering2D.ScatteringTransform2D, X) -> Matrix
 
 Apply a 2D scattering transform to a batch of images `X` of size `(Ny, Nx, B)`, returning a
 `(flatten_length, B)` matrix whose column `b` is `flatten2d(st(X[:, :, b]))`. Plan and workspace
 are reused across the batch.
 """
-function scattering_batch(st::ScatteringTransform2D, X::AbstractArray{<:Any,3})
-    Ny, Nx, B = size(X)
+function scattering_batch(st::Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3})
     T = eltype(st.filter_bank.averaging) |> real
-    coeffs = Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.L, T;
-                                                   compute_S2 = st.max_order >= 2)
-    out = Matrix{T}(undef, Coefficients.flatten_length(coeffs), B)
-    @inbounds for b in 1:B
-        c = Scattering2D.scattering_transform2d!(coeffs, st, view(X, :, :, b))
-        Coefficients.flatten2d!(view(out, :, b), c)
+    flen = Coefficients.flatten_length(
+        Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.L, T;
+                                              compute_S2 = st.max_order >= 2))
+    return scattering_batch!(Matrix{T}(undef, flen, size(X, 3)), st, X)
+end
+
+function scattering_batch!(out::AbstractMatrix, st::Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3})
+    T = eltype(st.filter_bank.averaging) |> real
+    J, L = st.filter_bank.J, st.filter_bank.L
+    n = J * L
+    # Mutable-S0 container so `scattering_transform2d!` updates in place — no per-slice wrapper alloc.
+    S2 = st.max_order >= 2 ? zeros(T, n, n) : Matrix{T}(undef, 0, 0)
+    coeffs = Coefficients.ScatteringCoefficients2D(Vector{T}(undef, n), S2;
+                                                   S0 = [zero(T)], n_scales = J, n_orientations = L)
+    @inbounds for b in 1:size(X, 3)
+        Scattering2D.scattering_transform2d!(coeffs, st, view(X, :, :, b))
+        Coefficients.flatten2d!(view(out, :, b), coeffs)
     end
     return out
 end
 
 # Serializable build spec for reconstructing a transform on a remote worker (FFTW/CUFFT plans
 # are not serializable, so distributed workers rebuild rather than receive the transform).
-_spectral_backend(st) = st.plan isa Plans.DirectSumPlan ? DirectSumBackend() : FFTBackend()
-transform_spec(st::ScatteringTransform1D) =
+_spectral_backend(st) = st.plan isa Plans.DirectSumPlan ? Plans.DirectSumBackend() : Plans.FFTBackend()
+transform_spec(st::Scattering1D.ScatteringTransform1D) =
     (kind = :st1d, N = length(st.buffer_mod), J = st.filter_bank.J, Q = st.filter_bank.Q,
      max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)), spectral = _spectral_backend(st))
-transform_spec(st::ScatteringTransform2D) =
+transform_spec(st::Scattering2D.ScatteringTransform2D) =
     (kind = :st2d, N = size(st.buffer_mod), J = st.filter_bank.J, L = st.filter_bank.L,
      max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)), spectral = _spectral_backend(st))
 
 function rebuild_transform(spec)
     if spec.kind === :st1d
-        return ScatteringTransform1D(spec.N, spec.J; Q = spec.Q, max_order = spec.max_order,
-                                     T = spec.T, spectral = spec.spectral)
+        return Scattering1D.ScatteringTransform1D(spec.N, spec.J; Q = spec.Q, max_order = spec.max_order,
+                                                  T = spec.T, spectral = spec.spectral)
     elseif spec.kind === :st2d
-        return ScatteringTransform2D(spec.N, spec.J; L = spec.L, max_order = spec.max_order,
-                                     T = spec.T, spectral = spec.spectral)
+        return Scattering2D.ScatteringTransform2D(spec.N, spec.J; L = spec.L, max_order = spec.max_order,
+                                                  T = spec.T, spectral = spec.spectral)
     else
         throw(ArgumentError("unknown transform spec kind $(spec.kind)"))
     end
@@ -221,8 +176,32 @@ scattering_batch(::Backends.SerialBackend, st, X) = scattering_batch(st, X)
 function scattering_batch(b::Backends.AbstractExecutionBackend, st, X)
     throw(ArgumentError(
         "scattering_batch on backend $(typeof(b)) is not loaded — run `using OhMyThreads` " *
-        "(ThreadedBackend), `using Distributed` (DistributedBackend), or `using MPI` (MPIBackend)."))
+        "(ThreadedBackend), `using Distributed` (DistributedBackend), `using MPI` (MPIBackend), or " *
+        "`using KernelAbstractions, AbstractFFTs` plus a device backend such as `using CUDA` " *
+        "(GPUBackend)."))
 end
+
+# Nonuniform / scattered planar scattering via NUFFT; method added by the FINUFFT extension.
+# Completes the Cartesian side of the grid-support matrix (#4a).
+"""
+    scattered_planar_scattering(x, y, ms, J; L=8, max_order=2, T=Float64, period=nothing,
+                                solve=false, weights=nothing, eps=..., maxiter=100, rtol=1e-8)
+
+Build a 2D planar scattering transform for a scalar field sampled at scattered points `(x, y)`, using
+the same oriented Morlet wavelet bank as the gridded [`ScatteringTransform2D`] but computing the
+wavelet convolutions on a uniform Fourier **mode grid** of size `ms = (m1, m2)` via a NUFFT: analysis
+maps the scattered points to the mode grid, the wavelet multiply happens there, and synthesis
+evaluates the filtered field back at the points. Apply it to a length-`M` vector of samples.
+
+`period` is the physical domain size per axis (the Fourier period); it defaults so that a uniform
+`0:m-1` grid reproduces the gridded FFT transform exactly. `solve=false` uses the fast NUFFT adjoint
+(type-1) — exact for adequately-sampled band-limited fields, approximate on gappy/irregular data;
+`solve=true` uses a conjugate-gradient least-squares inversion for the true band-limited coefficients
+(slower, needed for irregular sampling). `weights` (length `M`, summing to 1) sets the quadrature for
+the spatial mean; the default is the uniform sample mean. Requires `using FINUFFT`.
+"""
+scattered_planar_scattering(args...; kwargs...) = throw(ArgumentError(
+    "scattered / nonuniform planar scattering requires the FINUFFT extension — run `using FINUFFT`."))
 
 # Spherical scattering on S² (scattered points); method added by the NUFSHT extension.
 """
@@ -249,24 +228,56 @@ identity `|∇_S g|² = ½ Δ_S(g²) − g Δ_S g`, so no spin-weighted synthesi
 spherical_monogenic_scattering(args...; kwargs...) = throw(ArgumentError(
     "spherical monogenic scattering requires the NUFSHT extension — run `using NUFSHT`."))
 
+# Structured (uniform) spherical scattering via a fast SHT on a Clenshaw–Curtis grid; methods added
+# by the FastSphericalHarmonics extension. Completes the grid-support matrix (#4): the structured
+# analogue of the scattered `spherical_scattering` (NUFSHT).
 """
-    spherical_monogenic_components(st, field, j)
+    structured_spherical_scattering(lmax, J; max_order=2)
 
-Pointwise spherical monogenic decomposition (band-pass field, spin-1 Riesz *vector*, amplitude,
-phase, orientation) at scale `j` — the S² analogue of the planar [`monogenic_components`](@ref).
-
-!!! warning "Not implemented yet"
-    This requires **spin-1 (spin-weighted) synthesis at scattered points**, which NUFSHT does not
-    yet expose (the spin-0 surface-gradient shortcut recovers the amplitude exactly but gives
-    unreliable orientation). The amplitude-only [`spherical_monogenic_scattering`](@ref) is
-    complete and does not depend on this. Tracked: ScatteringTransforms.jl#1 (and upstream
-    NUFSHT.jl#1, for which FastSphericalHarmonics already provides the spin-weighted primitives).
+Build a spherical scattering transform for a scalar field sampled on the structured Clenshaw–Curtis
+grid of a fast spherical-harmonic transform (`Nθ = lmax+1`, `Nφ = 2lmax+1`), using the same smooth
+difference-of-Gaussians band-pass wavelets as [`spherical_scattering`](@ref). Apply it to a
+`(Nθ, Nφ)` grid of samples; obtain the grid points with [`structured_sphere_points`](@ref).
+Requires `using FastSphericalHarmonics`.
 """
-function spherical_monogenic_components(args...; kwargs...)
-    error("`spherical_monogenic_components` (pointwise orientation/phase on S²) is not implemented " *
-          "yet — it needs spin-1 scattered synthesis in NUFSHT. See ScatteringTransforms.jl#1 and " *
-          "NUFSHT.jl#1. The amplitude-only `spherical_monogenic_scattering` is available now.")
-end
+structured_spherical_scattering(args...; kwargs...) = throw(ArgumentError(
+    "structured spherical scattering requires the FastSphericalHarmonics extension — run " *
+    "`using FastSphericalHarmonics`."))
+
+"""
+    structured_spherical_monogenic_scattering(lmax, J; max_order=2)
+
+Structured-grid counterpart of [`spherical_monogenic_scattering`](@ref) (fast SHT on a
+Clenshaw–Curtis grid). Requires `using FastSphericalHarmonics`.
+"""
+structured_spherical_monogenic_scattering(args...; kwargs...) = throw(ArgumentError(
+    "structured spherical monogenic scattering requires the FastSphericalHarmonics extension — run " *
+    "`using FastSphericalHarmonics`."))
+
+"""
+    structured_sphere_points(lmax) -> (Θ, Φ)
+
+Colatitudes `Θ` (length `lmax+1`) and longitudes `Φ` (length `2lmax+1`) of the Clenshaw–Curtis grid
+used by [`structured_spherical_scattering`](@ref); sample a field as `[f(θ, φ) for θ in Θ, φ in Φ]`.
+Requires `using FastSphericalHarmonics`.
+"""
+structured_sphere_points(args...; kwargs...) = throw(ArgumentError(
+    "structured_sphere_points requires the FastSphericalHarmonics extension — run " *
+    "`using FastSphericalHarmonics`."))
+
+"""
+    spherical_monogenic_components(st, field, j) -> (; bandpass, riesz, amplitude, phase, orientation)
+
+Pointwise spherical monogenic decomposition of `field` band-passed at scale `j` — the S² analogue of
+the planar [`monogenic_components`](@ref ScatteringTransforms.Monogenic.monogenic_components). Returns
+the band-pass field `bandpass = U⁰_j`, the spin-1
+Riesz tangent vector `riesz = (u_θ, u_φ)` (`U^R_j = ð∘(−Δ_S)^{-1/2} U⁰_j`), the monogenic `amplitude`
+`√(U⁰² + ‖U^R‖²)`, the `phase = atan(‖U^R‖, U⁰)`, and the local `orientation = atan(u_φ, u_θ)` of the
+Riesz vector. Uses spin-weighted scattered synthesis from NUFSHT (`st` is a
+[`spherical_monogenic_scattering`](@ref) transform). Requires `using NUFSHT`.
+"""
+spherical_monogenic_components(args...; kwargs...) = throw(ArgumentError(
+    "spherical monogenic components requires the NUFSHT extension — run `using NUFSHT`."))
 
 """
     scattering_loss(c, target) -> Real
@@ -277,13 +288,13 @@ coefficients, `‖S₁(c)−S₁(t)‖² + ‖S₂(c)−S₂(t)‖²` divided by
 `c`, so it composes with `scattering(st, ·)` under autodiff.
 """
 function scattering_loss(c, target)
-    s1c = first_order(c)
-    s1t = first_order(target)
+    s1c = Coefficients.first_order(c)
+    s1t = Coefficients.first_order(target)
     num = sum(abs2, s1c .- s1t)
     den = sum(abs2, s1t)
-    s2t = second_order(target)
+    s2t = Coefficients.second_order(target)
     if !isempty(s2t)
-        num = num + sum(abs2, second_order(c) .- s2t)
+        num = num + sum(abs2, Coefficients.second_order(c) .- s2t)
         den = den + sum(abs2, s2t)
     end
     return num / (den + eps(float(real(eltype(s1t)))))
@@ -308,56 +319,38 @@ function synthesize(args...; kwargs...)
         "`using DifferentiationInterface` and e.g. `using Mooncake`, then pass `backend = AutoMooncake()`."))
 end
 
-# Plotting stubs (implemented in ScatteringTransformsCairoMakieExt)
-function plot_filter_bank end
-function plot_coefficients end
+# Plotting (implemented in ScatteringTransformsCairoMakieExt). Fallbacks give a helpful, consistent
+# error when CairoMakie isn't loaded (matching `synthesize`/`spherical_scattering`).
+"""
+    plot_filter_bank(fb) — plot a filter bank. Requires `using CairoMakie`.
+"""
+plot_filter_bank(args...; kwargs...) = throw(ArgumentError(
+    "plotting requires the CairoMakie extension — run `using CairoMakie`."))
 
-export ScatteringTransform1D, ScatteringTransform2D, ScatteringTransform3D, SubsampledScattering1D
-export FilterBank1D, FilterBank2D, FilterBank3D
-export build_filter_bank3d, scattering_transform3d!
-export WaveletMeta, ScatteringTree
-export SerialBackend, ThreadedBackend, GPUBackend, AutoBackend, DistributedBackend, MPIBackend
-export Line1D, Plane2D, Volume3D, Sphere
-export DirectSumPlan, AbstractScatteringPlan, forward_transform!, inverse_transform!
-export forward_transform, inverse_transform, scattering
-export AbstractSpectralBackend, DirectSumBackend, FFTBackend, AutoSpectral
-export Morlet1D, Morlet2D, Morlet3D
-export ScatteringCoefficients1D, ScatteringCoefficients2D
-export zeroth_order, first_order, second_order
-export flatten1d, flatten2d
-export frequency_response
-export build_filter_bank1d, build_filter_bank2d
-export scattering_transform!, scattering_transform2d!
-export scattering_batch
-export flatten1d!, flatten2d!, flatten_length
-export scattering_field, scattering_field!
-export ScatteringField1D, ScatteringField2D, path_field
-export compute_S1_2d!, compute_S2_2d!
-export compute_shape_sparsity, normalized_coefficients, log_coefficients
-export wavelet_transform, iwavelet, reconstruct_phase
-export MonogenicScattering, MonogenicFilterBank, build_monogenic_bank
-export riesz_multipliers, monogenic_amplitude, monogenic_components
-export spherical_scattering, spherical_monogenic_scattering, spherical_monogenic_components
-export synthesize, scattering_loss
-export plot_filter_bank, plot_coefficients
+"""
+    plot_coefficients(c; …) — plot scattering coefficients. Requires `using CairoMakie`.
+"""
+plot_coefficients(args...; kwargs...) = throw(ArgumentError(
+    "plotting requires the CairoMakie extension — run `using CairoMakie`."))
+
 
 # Precompile the hot paths (using the dependency-free direct-sum backend, so no weakdep is
 # required at precompile time) to cut time-to-first-transform.
 using PrecompileTools: @setup_workload, @compile_workload
 @setup_workload begin
     @compile_workload begin
-        st1 = ScatteringTransform1D(32, 3; Q = 1, max_order = 2, spectral = DirectSumBackend())
+        st1 = Scattering1D.ScatteringTransform1D(32, 3; Q = 1, max_order = 2, spectral = Plans.DirectSumBackend())
         c1 = st1(zeros(Float64, 32))
-        flatten1d(c1)
-        scattering_field(st1, zeros(Float64, 32); subsample = 1)
+        Coefficients.flatten1d(c1)
+        ScatteringFields.scattering_field(st1, zeros(Float64, 32); subsample = 1)
         scattering_batch(st1, zeros(Float64, 32, 2))
-        normalized_coefficients(c1)
+        Reductions.normalized_coefficients(c1)
 
-        st2 = ScatteringTransform2D((16, 16), 2; L = 4, max_order = 2, spectral = DirectSumBackend())
+        st2 = Scattering2D.ScatteringTransform2D((16, 16), 2; L = 4, max_order = 2, spectral = Plans.DirectSumBackend())
         c2 = st2(zeros(Float64, 16, 16))
-        compute_shape_sparsity(first_order(c2), second_order(c2), st2.filter_bank.meta)
+        Scattering2D.compute_shape_sparsity(Coefficients.first_order(c2), Coefficients.second_order(c2), st2.filter_bank.meta)
 
-        st3 = ScatteringTransform3D((8, 8, 8), 2; n_orient = 6, max_order = 2, spectral = DirectSumBackend())
+        st3 = Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient = 6, max_order = 2, spectral = Plans.DirectSumBackend())
         st3(zeros(Float64, 8, 8, 8))
     end
 end

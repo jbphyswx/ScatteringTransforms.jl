@@ -1,8 +1,10 @@
 """
     generate_figures.jl
 
-Generate the documentation/README figures with CairoMakie against the CURRENT API.
-Run from repo root: `julia --project=docs docs/generate_assets/generate_figures.jl`
+Generate the documentation/README figures with CairoMakie against the CURRENT API. This is a manual,
+occasional step with its own heavy environment (CairoMakie + the spectral/compute backends), kept
+separate from the lightweight docs *build* env (`docs/Project.toml` = just Documenter + the package).
+Run from repo root: `julia --project=docs/generate_assets docs/generate_assets/generate_figures.jl`
 """
 
 using ScatteringTransforms: ScatteringTransforms as ST
@@ -14,8 +16,20 @@ using DifferentiationInterface: DifferentiationInterface as DI
 using ADTypes: AutoMooncake
 import Mooncake
 using NUFSHT: NUFSHT          # enables spherical (monogenic) scattering
+using FINUFFT: FINUFFT        # enables scattered / nonuniform planar scattering
+using FastSphericalHarmonics: FastSphericalHarmonics   # enables structured spherical scattering
 
 Random.seed!(42)
+
+# Orthographic projection of the unit sphere onto the viewing plane (visible cap only), returned as
+# (u, v, front-mask, far→near draw order) — shared by the spherical figures below.
+function _ortho(x, y, z; az=0.6, el=0.5)
+    u = (-Base.sin(az)) .* x .+ Base.cos(az) .* y
+    v = (-Base.cos(az) * Base.sin(el)) .* x .+ (-Base.sin(az) * Base.sin(el)) .* y .+ Base.cos(el) .* z
+    depth = (Base.cos(az) * Base.cos(el)) .* x .+ (Base.sin(az) * Base.cos(el)) .* y .+ Base.sin(el) .* z
+    front = depth .>= -0.02
+    return u, v, front, sortperm(depth[front])
+end
 
 const ASSETS = Base.joinpath(Base.@__DIR__, "..", "src", "assets")
 Base.mkpath(ASSETS)
@@ -41,20 +55,20 @@ end
 # ── 1. filter bank tiling + Littlewood–Paley (now a tight frame ≡ 1) ──────────
 Base.println("Figure 1: filter bank...")
 save("filter_bank.png",
-     ST.plot_filter_bank(ST.ScatteringTransform1D(1024, 6; Q=1, max_order=1).filter_bank))
+     ST.plot_filter_bank(ST.Scattering1D.ScatteringTransform1D(1024, 6; Q=1, max_order=1).filter_bank))
 
 # ── 2. 1D scattering of a 1/f (turbulent) signal ──────────────────────────────
 Base.println("Figure 2: 1D scattering...")
 let N = 2048, J = 7
     sig = spectral_signal(N, -5/3)
-    st = ST.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     save("1d_scattering_example.png", ST.plot_coefficients(st(sig); signal=sig))
 end
 
 # ── 3. 2D scattering: scale–orientation selectivity across three textures ─────
 Base.println("Figure 3: 2D scattering (multi-texture)...")
 let M = 128, J = 3, L = 8
-    st = ST.ScatteringTransform2D((M, M), J; L=L, max_order=2)
+    st = ST.Scattering2D.ScatteringTransform2D((M, M), J; L=L, max_order=2)
     iso = spectral_field_2d(M, -3.0)                                  # isotropic 1/f
     θ0 = 0.6                                                          # anisotropic: oriented stripes
     aniso = [Base.sin(2π * 6 * (Base.cos(θ0) * i + Base.sin(θ0) * j) / M) for i in 0:M-1, j in 0:M-1] .+
@@ -111,10 +125,10 @@ let N = 2048, J = 6
     fB = Base.abs.(FFTW.fft(sigA)) .* exp.(im .* 2π .* Base.rand(N)); fB[1] = 0
     sigB = Base.real(FFTW.ifft(fB)); sigB ./= Statistics.std(sigB)
 
-    st = ST.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     cA, cB = st(sigA), st(sigB)
-    s2A = copy(ST.normalized_coefficients(cA).s2)   # S₂/S₁ : cross-scale coupling
-    s2B = copy(ST.normalized_coefficients(cB).s2)
+    s2A = copy(ST.Reductions.normalized_coefficients(cA).s2)   # S₂/S₁ : cross-scale coupling
+    s2B = copy(ST.Reductions.normalized_coefficients(cB).s2)
     s2A[s2A .== 0] .= NaN; s2B[s2B .== 0] .= NaN
     ratio = Base.round(Base.sum(filter(!isnan, s2A)) / Base.sum(filter(!isnan, s2B)); digits=1)
     cr = (0.0, Base.maximum(filter(!isnan, s2A)))
@@ -149,8 +163,8 @@ let J = 6
     td = Float64[]; tf = Float64[]
     for N in Ns
         x = spectral_signal(N, -5/3)
-        sd = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.DirectSumBackend())
-        sf = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.FFTBackend())
+        sd = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.DirectSumBackend())
+        sf = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.FFTBackend())
         sd(x); sf(x)  # warmup
         push!(td, Base.minimum(Base.@elapsed(sd(x)) for _ in 1:3) * 1e3)
         push!(tf, Base.minimum(Base.@elapsed(sf(x)) for _ in 1:3) * 1e3)
@@ -172,11 +186,11 @@ let N = 1024, J = 6
     sig = spectral_signal(N, -1.0)
     sig[200:260] .+= 2.0 .* sin.(range(0, 8π, length=61))
     sig[700:740] .+= 2.0 .* sin.(range(0, 24π, length=41))
-    st = ST.ScatteringTransform1D(N, J; Q=1, max_order=2)
-    sf = ST.scattering_field(st, sig; subsample=4)
+    st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
+    sf = ST.ScatteringFields.scattering_field(st, sig; subsample=4)
     o1 = ST.PathGraph.order_range(st.tree, 1)              # first-order paths
-    M = ST.path_field(sf, first(o1)) |> length
-    field = reduce(hcat, [ST.path_field(sf, p) for p in o1])'  # (n_paths1, M)
+    M = ST.ScatteringFields.path_field(sf, first(o1)) |> length
+    field = reduce(hcat, [ST.ScatteringFields.path_field(sf, p) for p in o1])'  # (n_paths1, M)
     fig = MK.Figure(size=(820, 560))
     axs = MK.Axis(fig[1, 1]; title="(a) signal with bursts at two scales", xlabel="x", ylabel="u")
     MK.lines!(axs, sig; color=:black)
@@ -194,9 +208,9 @@ let M = 128, J = 3, L = 8
     xs = range(0, 8π, length=M)'
     oriented = repeat(Base.sin.(xs), M, 1) .+ 0.05 .* Base.randn(M, M)
     iso = spectral_field_2d(M, -3.0)
-    st = ST.ScatteringTransform2D((M, M), J; L=L, max_order=2)
-    ro = ST.compute_shape_sparsity(ST.first_order(st(oriented)), ST.second_order(st(oriented)), st.filter_bank.meta)
-    ri = ST.compute_shape_sparsity(ST.first_order(st(iso)), ST.second_order(st(iso)), st.filter_bank.meta)
+    st = ST.Scattering2D.ScatteringTransform2D((M, M), J; L=L, max_order=2)
+    ro = ST.Scattering2D.compute_shape_sparsity(ST.Coefficients.first_order(st(oriented)), ST.Coefficients.second_order(st(oriented)), st.filter_bank.meta)
+    ri = ST.Scattering2D.compute_shape_sparsity(ST.Coefficients.first_order(st(iso)), ST.Coefficients.second_order(st(iso)), st.filter_bank.meta)
     fig = MK.Figure(size=(1120, 420))
     MK.Label(fig[0, 1:3], "Reduced descriptor s₂₂ (anisotropy) separates oriented from isotropic texture";
              fontsize=15, font=:bold)
@@ -216,10 +230,10 @@ end
 Base.println("Figure 8: reconstruction & synthesis...")
 let N = 384, J = 6
     sig = spectral_signal(N, -5/3)
-    st = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.FFTBackend())
+    st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.FFTBackend())
 
     # (1) exact linear wavelet-frame inverse — recovers the field to machine precision.
-    xr = ST.iwavelet(st, ST.wavelet_transform(st, sig))
+    xr = ST.Inverse.iwavelet(st, ST.Inverse.wavelet_transform(st, sig))
     inv_err = Base.maximum(Base.abs.(xr .- sig)) / Base.maximum(Base.abs.(sig))
 
     # (2) gradient-descent synthesis from the scattering coefficients (Bruna–Mallat): from noise,
@@ -227,12 +241,12 @@ let N = 384, J = 6
     #     in-core direct-sum forward (portable across AD backends; FFTW reverse-mode AD needs the
     #     backend's FFT rules).
     Random.seed!(7)
-    st_ad = ST.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.DirectSumBackend())
+    st_ad = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.DirectSumBackend())
     res = ST.synthesize(st_ad, sig; backend=AutoMooncake(), init=Base.randn(N), iters=300, lr=0.05)
     syn = res.field
 
-    cT = ST.scattering(st_ad, sig); cS = ST.scattering(st_ad, syn)
-    s1T = ST.first_order(cT); s1S = ST.first_order(cS)
+    cT = ST.ScatteringCore.scattering(st_ad, sig); cS = ST.ScatteringCore.scattering(st_ad, syn)
+    s1T = ST.Coefficients.first_order(cT); s1S = ST.Coefficients.first_order(cS)
 
     fig = MK.Figure(size=(1000, 760))
     MK.Label(fig[0, 1:2], "Reconstruction from the scattering representation"; fontsize=17, font=:bold)
@@ -265,9 +279,9 @@ let M = 128
     cx = cy = (M + 1) / 2
     rr = [Base.sqrt((i - cx)^2 + (j - cy)^2) for i in 1:M, j in 1:M]
     field = Base.cos.(2π .* rr ./ (M / 16))
-    st = ST.MonogenicScattering((M, M), 5; Q=1, max_order=1, spectral=ST.FFTBackend())
-    best = Base.argmax([Base.sum(abs2, ST.monogenic_components(st, field, j).bandpass) for j in 1:5])
-    comp = ST.monogenic_components(st, field, best)
+    st = ST.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1, spectral=ST.Plans.FFTBackend())
+    best = Base.argmax([Base.sum(abs2, ST.Monogenic.monogenic_components(st, field, j).bandpass) for j in 1:5])
+    comp = ST.Monogenic.monogenic_components(st, field, best)
     amp = comp.amplitude
     θ = [mod(Base.atan(comp.riesz[2][k], comp.riesz[1][k]), Base.π) for k in CartesianIndices(field)]
     θmask = [amp[k] > 0.15 * Base.maximum(amp) ? θ[k] : NaN for k in CartesianIndices(field)]
@@ -303,12 +317,12 @@ let M = 40, J = 3, L = 6
              0.15 .* Base.randn(M, M)
     target ./= Statistics.std(target)
     # (1) exact linear inverse — machine precision, via the FFTW fast path.
-    stf = ST.ScatteringTransform2D((M, M), J; L=L, max_order=2, spectral=ST.FFTBackend())
-    xr = ST.iwavelet(stf, ST.wavelet_transform(stf, target))
+    stf = ST.Scattering2D.ScatteringTransform2D((M, M), J; L=L, max_order=2, spectral=ST.Plans.FFTBackend())
+    xr = ST.Inverse.iwavelet(stf, ST.Inverse.wavelet_transform(stf, target))
     inv_err = Base.maximum(Base.abs.(xr .- target)) / Base.maximum(Base.abs.(target))
     # (2) coefficient synthesis from noise (direct-sum forward, portable under reverse-mode AD).
     Random.seed!(11)
-    st_ad = ST.ScatteringTransform2D((M, M), J; L=L, max_order=2, spectral=ST.DirectSumBackend())
+    st_ad = ST.Scattering2D.ScatteringTransform2D((M, M), J; L=L, max_order=2, spectral=ST.Plans.DirectSumBackend())
     res = ST.synthesize(st_ad, target; backend=AutoMooncake(), init=Base.randn(M, M),
                         iters=160, lr=0.06)
     syn = res.field
@@ -373,6 +387,110 @@ let Msph = 4500, lmax = 28, J = 4
         ["analytic |·|", "monogenic"]; position=:lt, framevisible=false)
     MK.colsize!(fig.layout, 1, MK.Relative(0.46))   # ≈ square panel so the disk fills it
     save("spherical_scattering.png", fig)
+end
+
+# ── 12. scattered / nonuniform planar scattering (NUFFT) ──────────────────────
+Base.println("Figure 12: scattered / nonuniform planar scattering (NUFFT)...")
+let Mmode = 24, Mdisp = 160, J = 3, L = 6, Npts = 6000
+    # A band-limited field on [0,2π)² (low modes) sampled both on a uniform grid and at scattered
+    # points. The scattering mode grid is 24×24 = 576 modes and there are 6000 scattered points
+    # (≈10× overdetermined), so the CG-solve recovers the true coefficients and the scattered S₁
+    # matches the gridded FFT S₁ (verified to ~0.5% in the tests).
+    g(x, y) = 1.0 + 0.8Base.cos(x) + 0.6Base.sin(2y) - 0.5Base.cos(x) * Base.sin(y) + 0.4Base.cos(3x + y)
+    fdisp = [g(2π * i / Mdisp, 2π * j / Mdisp) for i in 0:Mdisp-1, j in 0:Mdisp-1]   # smooth, for display
+    fgrid = [g(2π * i / Mmode, 2π * j / Mmode) for i in 0:Mmode-1, j in 0:Mmode-1]   # mode-grid reference
+    stg = ST.Scattering2D.ScatteringTransform2D((Mmode, Mmode), J; L=L, max_order=2, spectral=ST.Plans.FFTBackend())
+    cg = stg(fgrid)
+    Random.seed!(5)
+    px = 2π .* Base.rand(Npts); py = 2π .* Base.rand(Npts)
+    fpts = [g(px[k], py[k]) for k in 1:Npts]
+    scp = ST.scattered_planar_scattering(px, py, (Mmode, Mmode), J; L=L, max_order=2, period=(2π, 2π), solve=true)
+    cs = scp(fpts)
+    s1g = ST.Coefficients.first_order(cg); s1s = ST.Coefficients.first_order(cs)
+
+    fig = MK.Figure(size=(1180, 460))
+    MK.Label(fig[0, 1:3], "Scattered / nonuniform planar scattering via NUFFT (recovers the gridded transform)";
+             fontsize=16, font=:bold)
+    a1 = MK.Axis(fig[1, 1]; title="(a) band-limited field", aspect=MK.DataAspect())
+    MK.heatmap!(a1, fdisp; colormap=:balance); MK.hidedecorations!(a1)
+    a2 = MK.Axis(fig[1, 2]; title="(b) same field at $(Npts) scattered points", aspect=MK.DataAspect(),
+                 limits=((0, 2π), (0, 2π)))
+    MK.scatter!(a2, px, py; color=fpts, colormap=:balance, markersize=4); MK.hidedecorations!(a2)
+    a3 = MK.Axis(fig[1, 3]; title="(c) first-order S₁: gridded vs scattered (NUFFT)",
+                 xlabel="S₁ path (scale × orientation)", ylabel="S₁")
+    MK.scatterlines!(a3, s1g; color=:black, label="gridded (FFT)")
+    MK.scatterlines!(a3, s1s; color=:seagreen, marker=:rect, markersize=8, linestyle=:dash, label="scattered (NUFFT)")
+    MK.axislegend(a3; position=:lt)
+    save("scattered_planar.png", fig)
+end
+
+# ── 13. structured spherical scattering (fast SHT) alongside the scattered path ─
+Base.println("Figure 13: structured spherical scattering (fast SHT)...")
+let lmax = 24, J = 3
+    Θ, Φ = ST.structured_sphere_points(lmax)
+    gfun(θ, φ) = Base.cos(θ)^2 - 1/3 + 0.5Base.sin(θ) * Base.cos(φ) + 0.3Base.cos(2θ) * Base.sin(2φ)
+    fgrid = [gfun(θ, φ) for θ in Θ, φ in Φ]
+    rstruct = ST.structured_spherical_scattering(lmax, J)(fgrid)
+    # same field sampled at Fibonacci points for the scattered (NUFSHT) comparison
+    Msph = 4000; gra = (Base.sqrt(5.0) - 1) / 2
+    θs = [Base.acos(1 - 2 * (k - 0.5) / Msph) for k in 1:Msph]; φs = [2π * mod(k * gra, 1) for k in 1:Msph]
+    fsc = [gfun(θs[k], φs[k]) for k in 1:Msph]
+    rscat = ST.spherical_scattering(θs, φs, lmax, J)(fsc)
+
+    # structured grid points → orthographic scatter of the visible cap
+    xg = vec([Base.sin(θ) * Base.cos(φ) for θ in Θ, φ in Φ])
+    yg = vec([Base.sin(θ) * Base.sin(φ) for θ in Θ, φ in Φ])
+    zg = vec([Base.cos(θ) for θ in Θ, φ in Φ])
+    u, v, front, ord = _ortho(xg, yg, zg)
+    fvec = vec(fgrid)
+
+    fig = MK.Figure(size=(1180, 560))
+    MK.Label(fig[0, 1:2], "Structured spherical scattering on S² (fast SHT, Clenshaw–Curtis grid)";
+             fontsize=16, font=:bold)
+    ax = MK.Axis(fig[1, 1]; title="(a) field on the structured CC grid (orthographic)",
+                 aspect=MK.DataAspect(), limits=((-1.02, 1.02), (-1.02, 1.02)))
+    MK.scatter!(ax, u[front][ord], v[front][ord]; color=fvec[front][ord], colormap=:balance, markersize=9)
+    MK.hidedecorations!(ax); MK.hidespines!(ax)
+    gb = fig[1, 2] = MK.GridLayout()
+    axb = MK.Axis(gb[1, 1]; title="(b) first-order S₁ by scale: structured SHT vs scattered NUFSHT",
+                  xlabel="scale band j", ylabel="S₁", xticks=1:J)
+    js = repeat(1:J, 2); vals = vcat(rstruct.S1, rscat.S1); grp = vcat(fill(1, J), fill(2, J))
+    MK.barplot!(axb, js, vals; dodge=grp, color=[gg == 1 ? :steelblue : :seagreen for gg in grp])
+    MK.axislegend(axb, [MK.PolyElement(color=:steelblue), MK.PolyElement(color=:seagreen)],
+                  ["structured (SHT)", "scattered (NUFSHT)"]; position=:rt, framevisible=true)
+    MK.colsize!(fig.layout, 1, MK.Relative(0.46))
+    save("structured_spherical.png", fig)
+end
+
+# ── 14. spherical monogenic orientation/phase on S² (spin-1 Riesz vector) ──────
+Base.println("Figure 14: spherical monogenic orientation (spin-1)...")
+let Msph = 4000, lmax = 24, J = 3
+    gra = (Base.sqrt(5.0) - 1) / 2
+    θ = [Base.acos(1 - 2 * (k - 0.5) / Msph) for k in 1:Msph]; φ = [2π * mod(k * gra, 1) for k in 1:Msph]
+    field = Base.cos.(5 .* θ) .+ 0.6 .* Base.sin.(4 .* θ) .* Base.cos.(2 .* φ)
+    mst = ST.spherical_monogenic_scattering(θ, φ, lmax, J)
+    comp = ST.spherical_monogenic_components(mst, field, 2)
+    x = Base.sin.(θ) .* Base.cos.(φ); y = Base.sin.(θ) .* Base.sin.(φ); z = Base.cos.(θ)
+    u, v, front, ord = _ortho(x, y, z)
+    amp = comp.amplitude
+    orient = [mod(comp.orientation[k], Base.π) for k in 1:Msph]
+    omask = [amp[k] > 0.15 * Base.maximum(amp) ? orient[k] : NaN for k in 1:Msph]
+
+    fig = MK.Figure(size=(1180, 560))
+    MK.Label(fig[0, 1:2], "Spherical monogenic components on S² — amplitude & spin-1 orientation";
+             fontsize=16, font=:bold)
+    a1 = MK.Axis(fig[1, 1]; title="(a) monogenic amplitude √(U⁰²+‖U^R‖²)", aspect=MK.DataAspect(),
+                 limits=((-1.02, 1.02), (-1.02, 1.02)))
+    MK.scatter!(a1, u[front][ord], v[front][ord]; color=amp[front][ord], colormap=:viridis, markersize=9)
+    MK.hidedecorations!(a1); MK.hidespines!(a1)
+    g2 = fig[1, 2] = MK.GridLayout()
+    a2 = MK.Axis(g2[1, 1]; title="(b) local orientation atan(u_φ, u_θ)  (spin-1 Riesz vector)",
+                 aspect=MK.DataAspect(), limits=((-1.02, 1.02), (-1.02, 1.02)))
+    hm = MK.scatter!(a2, u[front][ord], v[front][ord]; color=omask[front][ord], colormap=:twilight,
+                     colorrange=(0, Base.π), nan_color=:gray, markersize=9)
+    MK.hidedecorations!(a2); MK.hidespines!(a2)
+    MK.Colorbar(g2[1, 2], hm; ticks=([0, Base.π/2, Base.π], ["0", "π/2", "π"]))
+    save("spherical_monogenic.png", fig)
 end
 
 Base.println("\nAll figures written to ", ASSETS)

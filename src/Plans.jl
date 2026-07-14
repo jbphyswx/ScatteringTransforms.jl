@@ -80,6 +80,18 @@ extension being loaded.
 function fftw_plan end
 
 """
+    abstractffts_plan(dummy_device_array; region=1:ndims(dummy_device_array))
+
+Vendor-neutral device FFT plan constructor. Declaration only — the sole method is provided by the
+KernelAbstractions extension, which builds forward/inverse plans via `AbstractFFTs.plan_fft` /
+`plan_ifft` on `dummy_device_array`. Because those dispatch on the array *type*, the same builder
+yields cuFFT (`CuArray`), rocFFT (`ROCArray`), or FFTW (plain `Array`) plans — so the GPU scattering
+path is device-agnostic. `region` selects the transformed dimensions (e.g. `(1, 2)` for a batched
+`(Ny, Nx, B)` stack, leaving the batch axis untouched).
+"""
+function abstractffts_plan end
+
+"""
     AbstractSpectralBackend
 
 Selects which spectral transform a transform uses: [`DirectSumBackend`](@ref) (in-core, always
@@ -130,6 +142,21 @@ struct DirectSumPlan{T, V<:AbstractVector{Complex{T}}, D, S} <: AbstractScatteri
     twiddle::NTuple{D, V}   # twiddle[d][m+1] = exp(-2πi m / N_d), m in 0:N_d-1
     dims::NTuple{D, Int}
     scratch::S
+    # Explicit inner constructor: enforces the plan invariant that each per-axis twiddle table has
+    # exactly its axis length. Defining it also suppresses Julia's auto-generated field-*inferring*
+    # outer constructor, whose empty-tuple case (`NTuple{0,V}` leaves the element `V` unbindable)
+    # Julia 1.11's `Base.detect_unbound_args` false-positively reports as an unbound method — a report
+    # 1.12 correctly dropped. The type is correct as written; here `T,V,D,S` are bound by the explicit
+    # `{…}` in the call rather than inferred from a possibly-empty tuple, so no spurious unbound arg.
+    function DirectSumPlan{T, V, D, S}(twiddle::NTuple{D, V}, dims::NTuple{D, Int},
+                                       scratch::S) where {T, V<:AbstractVector{Complex{T}}, D, S}
+        for d in 1:D
+            length(twiddle[d]) == dims[d] || throw(ArgumentError(
+                "DirectSumPlan: twiddle table for axis $d has length $(length(twiddle[d])), " *
+                "expected dims[$d] = $(dims[d])"))
+        end
+        return new{T, V, D, S}(twiddle, dims, scratch)
+    end
 end
 
 function _twiddles(::Type{T}, N::Int) where {T}

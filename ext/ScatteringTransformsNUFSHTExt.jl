@@ -1,209 +1,155 @@
 module ScatteringTransformsNUFSHTExt
 
 """
-    ScatteringTransformsNUFSHTExt — spherical scattering on S² (scattered points)
+    ScatteringTransformsNUFSHTExt — scattered-point spherical scattering on S² (NUFSHT backend)
 
-Scattering transform for scalar fields sampled at scattered points on the sphere, via NUFSHT.
+Provides the **scattered-sphere** backend for the shared spherical scattering core
+(`SphericalCore`): a scalar field sampled at arbitrary points `(θ, φ)` on S², analysed/synthesised
+via NUFSHT. The DoG band-pass bank, the S0/S1/S2 cascade, and the spin-0 Bochner monogenic amplitude
+all live in `SphericalCore`; this extension only supplies
 
-The previous implementation used a **brick-wall** band-pass in ℓ (zeroing modes outside
-`[ℓ_lo, ℓ_hi]`), which rings in real space and is not a wavelet. This version uses NUFSHT's
-**smooth Gaussian spectral transfer** `GaussianTransfer(σ²) = exp(-σ²ℓ(ℓ+1)/2)` (a heat-kernel
-low-pass) and forms band-pass wavelets as **differences of Gaussians** across dyadic scales —
-smooth, localized needlet-like bands. `nusht_filter!` applies a transfer as
-points → (bandlimited SH) → points in one call, so no manual mode bookkeeping is needed.
+  * a plan wrapper `NUSHTSphericalPlan` over `NUFSHT.NUSHTplan`;
+  * `sphere_coeffs` (exact analysis via `nusht_solve!`) and `sphere_apply!` (per-degree multiply via
+    `apply_transfer!` + synthesis via `nusht_type2!`);
+  * `sphere_mean` (unweighted sample mean over the scattered points);
 
-Coefficients (globally averaged, matching the gridded transforms):
-- `S0 = ⟨field⟩`
-- `S1[j] = ⟨|field ⋆ ψ_j|⟩`
-- `S2[j1,j2] = ⟨||field ⋆ ψ_{j1}| ⋆ ψ_{j2}|⟩` for strictly coarser `j2 < j1`
+plus the constructors `spherical_scattering` / `spherical_monogenic_scattering`.
 
-with `ψ_j` the difference-of-Gaussians band-pass between dyadic cutoffs `ℓ_{j-1} < ℓ_j`.
+Analysis uses NUFSHT's **exact inverse** (`nusht_solve!`), not the adjoint (`nusht_type1!`): on
+scattered points the adjoint mis-scales the coefficients degree-dependently, which made the scattering
+coefficients absolutely wrong (only scale-invariant properties survived). The `SphericalCore` cascade
+analyses each field once and reuses its coefficients across all bands, so the (iterative) solve runs
+once per field rather than once per band.
 """
 
 using NUFSHT: NUFSHT
 using ScatteringTransforms: ScatteringTransforms
 
 const ST = ScatteringTransforms
+const SC = ST.SphericalCore
+
+# ---------------------------------------------------------------------------
+# Scattered-sphere plan + the two SphericalCore interface methods
+# ---------------------------------------------------------------------------
 
 """
-    SphericalScattering{T,P}
+    NUSHTSphericalPlan{P,V,T} <: SphericalCore.AbstractSphericalPlan
 
-Spherical scattering transform. `sigma2[k+1]` is the Gaussian-transfer variance for the dyadic
-low-pass cutoff `ℓ_k = lmax / 2^(J-k)`, `k = 0..J`; band-pass wavelet `j` is
-`lowpass(ℓ_j) − lowpass(ℓ_{j-1})`.
+Scattered-point spherical plan wrapping a `NUFSHT.NUSHTplan`, the sample count `M`, the band limit
+`lmax`, the scattered points `(theta, phi)` (retained so spin-weighted plans can be built on the same
+points for `spherical_monogenic_components`), and the CG-inversion tolerance/iteration cap used by
+[`sphere_coeffs`](@ref). Analysis uses NUFSHT's **exact inversion** (`nusht_solve!`), not the adjoint:
+on scattered points the adjoint mis-scales the coefficients (degree-dependent), which would make the
+scattering coefficients absolutely wrong (they only look right under scale-invariant checks). Accurate
+inversion needs the sampling to resolve the band limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed
+points.
 """
-struct SphericalScattering{T,P}
-    lmax::Int
-    J::Int
-    max_order::Int
+struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real} <: SC.AbstractSphericalPlan
     plan::P
-    sigma2::Vector{T}   # length J+1, σ² for cutoffs ℓ_0 … ℓ_J
-    M::Int              # number of sample points
+    M::Int
+    lmax::Int
+    theta::V
+    phi::V
+    rtol::T
+    maxiter::Int
 end
 
-# σ² so the Gaussian transfer is e^{-1/2} at degree ℓ (i.e. ℓ marks the low-pass roll-off).
-_sigma2_for_cutoff(ℓ::Real, ::Type{T}) where {T} = ℓ <= 0 ? T(Inf) : T(1) / (T(ℓ) * (T(ℓ) + 1))
-
-function ST.spherical_scattering(pts_theta::AbstractVector{T}, pts_phi::AbstractVector{T},
-                                 lmax::Int, J::Int; max_order::Int = 2) where {T<:Real}
-    plan = NUFSHT.make_plan(pts_theta, pts_phi, lmax; T = T)
-    # dyadic cutoffs ℓ_k = lmax / 2^(J-k), k = 0..J  (ℓ_J = lmax)
-    sigma2 = T[_sigma2_for_cutoff(lmax / 2.0^(J - k), T) for k in 0:J]
-    return SphericalScattering{T, typeof(plan)}(lmax, J, max_order, plan, sigma2, length(pts_theta))
-end
-
-# Smooth band-pass wavelet j applied to `field`: lowpass(ℓ_j) − lowpass(ℓ_{j-1}), into `band`.
-# Uses `hi`, `lo` as scratch (all length M).
-function _bandpass!(band::AbstractVector{T}, field::AbstractVector{T}, j::Int,
-                    st::SphericalScattering{T}, hi::AbstractVector{T}, lo::AbstractVector{T}) where {T}
-    NUFSHT.nusht_filter!(hi, field, NUFSHT.GaussianTransfer(st.sigma2[j + 1]), st.plan)  # lowpass ℓ_j
-    NUFSHT.nusht_filter!(lo, field, NUFSHT.GaussianTransfer(st.sigma2[j]),     st.plan)  # lowpass ℓ_{j-1}
-    @. band = hi - lo
-    return band
-end
-
-"""
-    (st::SphericalScattering)(field) -> (; S0, S1, S2)
-
-Apply the spherical scattering transform to a scalar `field` sampled at the plan's points.
-"""
-function (st::SphericalScattering{T})(field::AbstractVector{T}) where {T}
-    J, M = st.J, st.M
-    S0 = sum(field) / T(M)
-    S1 = zeros(T, J)
-    S2 = zeros(T, J, J)
-
-    hi = Vector{T}(undef, M)
-    lo = Vector{T}(undef, M)
-    band = Vector{T}(undef, M)
-    U1 = [Vector{T}(undef, M) for _ in 1:J]
-
-    # first order
-    for j in 1:J
-        _bandpass!(band, field, j, st, hi, lo)
-        @. U1[j] = abs(band)
-        S1[j] = sum(U1[j]) / T(M)
-    end
-
-    # second order over strictly coarser scales (j2 < j1)
-    if st.max_order >= 2
-        for j1 in 1:J, j2 in 1:(j1 - 1)
-            _bandpass!(band, U1[j1], j2, st, hi, lo)
-            @. band = abs(band)
-            S2[j1, j2] = sum(band) / T(M)
-        end
-    end
-
-    return (S0 = S0, S1 = S1, S2 = S2)
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Spherical MONOGENIC scattering (Part E)
-#
-# Monogenic amplitude per scale:  A_j = √(U⁰_j² + |U^R_j|²),  where
-#   U⁰_j   = difference-of-Gaussians band-pass of the field   (spin-0, scalar)
-#   U^R_j  = spin-1 Riesz field  R = ð∘(−Δ_S)^{-1/2}  applied to U⁰_j.
-# The Riesz operator is SH-diagonal with eigenvalue r_ℓ = 1 (ℓ≥1; 0 at ℓ=0), since
-# ð contributes √(ℓ(ℓ+1)) and (−Δ_S)^{-1/2} contributes 1/√(ℓ(ℓ+1)).
-#
-# KEY: the Riesz *energy* needs only spin-0 transforms. With g_j = (−Δ_S)^{-1/2} U⁰_j,
-#   |U^R_j|² = |ð g_j|² = |∇_S g_j|²,
-# and the surface-gradient magnitude follows from the Bochner/product identity
-#   |∇_S g|² = ½ Δ_S(g²) − g · Δ_S g                    (Δ_S diagonal: â_ℓm ↦ −ℓ(ℓ+1)â_ℓm).
-# So spin-1 synthesis is NOT required for the scattering amplitude — only the spin-0
-# `nusht_filter!` with per-ℓ multipliers (exact in exact arithmetic). Pointwise orientation/phase
-# on S² WOULD need the actual spin-1 field; see jbphyswx/NUFSHT.jl#1.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Generic per-degree spectral multiplier h(ℓ): NUFSHT's apply_transfer!/nusht_filter! dispatch
-# on `kernel_transfer(filter, ℓ)`, so any object with this method is a valid transfer.
+# Generic per-degree spectral multiplier h(ℓ): NUFSHT's apply_transfer! dispatches on
+# `kernel_transfer(filter, ℓ)`, so any object with this method is a valid transfer.
 struct _FnTransfer{F}
     f::F
 end
 NUFSHT.kernel_transfer(t::_FnTransfer, ℓ) = t.f(ℓ)
 
-# Difference-of-Gaussians band b_j(ℓ) = G(σ²_hi) − G(σ²_lo), G(σ²) = exp(−σ²ℓ(ℓ+1)/2).
-# b_j(0) = 0 automatically (both Gaussians are 1 at ℓ=0).
-@inline _bj(ℓ, σ²hi, σ²lo) = exp(-σ²hi * ℓ * (ℓ + 1) / 2) - exp(-σ²lo * ℓ * (ℓ + 1) / 2)
+# Analysis: the TRUE spherical-harmonic coefficients of `field` via exact CG inversion.
+function SC.sphere_coeffs(plan::NUSHTSphericalPlan, field::AbstractVector)
+    C = zero(plan.plan.C)
+    NUFSHT.nusht_solve!(C, field, plan.plan; rtol = plan.rtol, maxiter = plan.maxiter)
+    return C
+end
 
-_band_transfer(σ²hi, σ²lo) = _FnTransfer(ℓ -> _bj(ℓ, σ²hi, σ²lo))
-# g = (−Δ_S)^{-1/2} of the band:  h(ℓ) = b_j(ℓ)/√(ℓ(ℓ+1)).
-_riesz_potential_transfer(σ²hi, σ²lo) =
-    _FnTransfer(ℓ -> ℓ == 0 ? 0.0 : _bj(ℓ, σ²hi, σ²lo) / sqrt(ℓ * (ℓ + 1)))
-# Δ_S g = −ℓ(ℓ+1)·ĝ:  h(ℓ) = −√(ℓ(ℓ+1))·b_j(ℓ).
-_riesz_laplacian_transfer(σ²hi, σ²lo) =
-    _FnTransfer(ℓ -> ℓ == 0 ? 0.0 : -sqrt(ℓ * (ℓ + 1)) * _bj(ℓ, σ²hi, σ²lo))
-const _LAPLACIAN = _FnTransfer(ℓ -> -ℓ * (ℓ + 1))
+# Apply the per-degree multiplier `h(ℓ)` to a copy of the coefficients and synthesise at the points.
+function SC.sphere_apply!(out::AbstractVector, plan::NUSHTSphericalPlan, C, h)
+    C2 = copy(C)
+    NUFSHT.apply_transfer!(C2, _FnTransfer(h), plan.lmax)
+    NUFSHT.nusht_type2!(out, C2, plan.plan)
+    return out
+end
 
-"""
-    SphericalMonogenicScattering{T,P}
+# Unweighted sample mean over the (quasi-uniform) scattered points ≈ the spherical average.
+SC.sphere_mean(plan::NUSHTSphericalPlan, field::AbstractVector) = sum(field) / plan.M
 
-Spherical monogenic scattering transform. Shares the dyadic difference-of-Gaussians bands of
-[`SphericalScattering`](@ref) but replaces the analytic modulus with the spherical monogenic
-amplitude `A_j = √(U⁰_j² + |∇_S g_j|²)`.
-"""
-struct SphericalMonogenicScattering{T,P}
-    lmax::Int
-    J::Int
-    max_order::Int
-    plan::P
-    sigma2::Vector{T}
-    M::Int
+# ---------------------------------------------------------------------------
+# Constructors (scattered-sphere entry points declared in core)
+# ---------------------------------------------------------------------------
+
+_nusht_plan(pts_theta::AbstractVector{T}, pts_phi::AbstractVector{T}, lmax::Int,
+            rtol::Real, maxiter::Int) where {T<:Real} =
+    NUSHTSphericalPlan(NUFSHT.make_plan(pts_theta, pts_phi, lmax; T = T), length(pts_theta), lmax,
+                       collect(T, pts_theta), collect(T, pts_phi), T(rtol), maxiter)
+
+function ST.spherical_scattering(pts_theta::AbstractVector{T}, pts_phi::AbstractVector{T},
+                                 lmax::Int, J::Int; max_order::Int = 2,
+                                 rtol::Real = 1.0e-8, maxiter::Int = 500) where {T<:Real}
+    plan = _nusht_plan(pts_theta, pts_phi, lmax, rtol, maxiter)
+    return SC.SphericalScattering{T, typeof(plan)}(lmax, J, max_order, plan, SC.dog_sigma2(lmax, J, T))
 end
 
 function ST.spherical_monogenic_scattering(pts_theta::AbstractVector{T}, pts_phi::AbstractVector{T},
-                                           lmax::Int, J::Int; max_order::Int = 2) where {T<:Real}
-    plan = NUFSHT.make_plan(pts_theta, pts_phi, lmax; T = T)
-    sigma2 = T[_sigma2_for_cutoff(lmax / 2.0^(J - k), T) for k in 0:J]
-    return SphericalMonogenicScattering{T, typeof(plan)}(lmax, J, max_order, plan, sigma2,
-                                                         length(pts_theta))
+                                           lmax::Int, J::Int; max_order::Int = 2,
+                                           rtol::Real = 1.0e-8, maxiter::Int = 500) where {T<:Real}
+    plan = _nusht_plan(pts_theta, pts_phi, lmax, rtol, maxiter)
+    return SC.SphericalMonogenicScattering{T, typeof(plan)}(lmax, J, max_order, plan,
+                                                            SC.dog_sigma2(lmax, J, T))
 end
 
-# Monogenic amplitude field of `field` band-passed at scale `j`, written into `amp`.
-# `w` is a NamedTuple of length-M scratch vectors (band, g, lapg, g2, lapg2).
-function _spherical_monogenic_amplitude!(amp, st::SphericalMonogenicScattering{T},
-                                         field, j::Int, w) where {T}
-    σ²hi = st.sigma2[j + 1]
-    σ²lo = st.sigma2[j]
-    NUFSHT.nusht_filter!(w.band, field, _band_transfer(σ²hi, σ²lo), st.plan)             # U⁰
-    NUFSHT.nusht_filter!(w.g,    field, _riesz_potential_transfer(σ²hi, σ²lo), st.plan)  # g = (−Δ)^{-1/2}U⁰
-    NUFSHT.nusht_filter!(w.lapg, field, _riesz_laplacian_transfer(σ²hi, σ²lo), st.plan)  # Δ_S g
-    @. w.g2 = w.g^2
-    NUFSHT.nusht_filter!(w.lapg2, w.g2, _LAPLACIAN, st.plan)                             # Δ_S(g²)
-    # |∇_S g|² = ½ Δ_S(g²) − g Δ_S g  (clamp tiny negatives from finite-lmax/adjoint error)
-    @. amp = sqrt(w.band^2 + max(zero(T), T(0.5) * w.lapg2 - w.g * w.lapg))
-    return amp
-end
+# ---------------------------------------------------------------------------
+# Pointwise spherical monogenic decomposition (issue #1) — the S² analogue of the planar
+# `monogenic_components`. Now unblocked: NUFSHT.jl provides spin-weighted scattered synthesis.
+#
+# For band-pass `U⁰_j = b_j(ℓ)·a_ℓm` (spin-0), the spin-1 Riesz field is
+#   U^R_j = ð∘(−Δ_S)^{-1/2} U⁰_j,   coeffs = √(ℓ(ℓ+1))·(1/√(ℓ(ℓ+1)))·b_j(ℓ)·a_ℓm = b_j(ℓ)·a_ℓm  (ℓ≥1).
+# So the SAME coefficient array `sf = b_j(ℓ)·a` synthesised at spin-0 gives the band-pass field and at
+# spin-1 gives the complex tangent Riesz field `U = u_θ + i u_φ`. The scalar amplitude √(U⁰²+|U^R|²)
+# agrees (up to the SHT's accuracy) with the spin-0 Bochner identity used by the scattering cascade —
+# validated in the tests, which also check the spin-1 synthesis against the closed-form `sYlm`.
+# ---------------------------------------------------------------------------
 
-"""
-    (st::SphericalMonogenicScattering)(field) -> (; S0, S1, S2)
+function ST.spherical_monogenic_components(st::SC.SphericalMonogenicScattering, field::AbstractVector, j::Int)
+    p = st.plan
+    lmax = st.lmax
+    T = eltype(p.theta)
+    # Complex spin-0 coefficients of the field in NUFSHT's dense spin layout (exact CG inversion,
+    # so the band-pass and Riesz fields below share one consistent set of coefficients).
+    p0 = NUFSHT.make_spin_plan(p.theta, p.phi, lmax, 0; T = T)
+    p1 = NUFSHT.make_spin_plan(p.theta, p.phi, lmax, 1; T = T)
+    a = zeros(Complex{T}, lmax + 1, 2lmax + 1)
+    NUFSHT.nusht_solve_spin!(a, Complex{T}.(field), p0)
 
-Apply the spherical monogenic scattering transform to a scalar `field` sampled at the plan's
-points. `S1[j] = ⟨A_j⟩`, `S2[j1,j2] = ⟨A_{j2}[A_{j1}]⟩` for strictly coarser `j2 < j1`.
-"""
-function (st::SphericalMonogenicScattering{T})(field::AbstractVector{T}) where {T}
-    J, M = st.J, st.M
-    S0 = sum(field) / T(M)
-    S1 = zeros(T, J)
-    S2 = zeros(T, J, J)
-    w = (band = Vector{T}(undef, M), g = Vector{T}(undef, M), lapg = Vector{T}(undef, M),
-         g2 = Vector{T}(undef, M), lapg2 = Vector{T}(undef, M))
-    U1 = [Vector{T}(undef, M) for _ in 1:J]
-
-    for j in 1:J
-        _spherical_monogenic_amplitude!(U1[j], st, field, j, w)
-        S1[j] = sum(U1[j]) / T(M)
-    end
-
-    if st.max_order >= 2
-        amp = Vector{T}(undef, M)
-        for j1 in 1:J, j2 in 1:(j1 - 1)
-            _spherical_monogenic_amplitude!(amp, st, U1[j1], j2, w)
-            S2[j1, j2] = sum(amp) / T(M)
+    # sf = b_j(ℓ)·a  (b_j(0)=0, so the ℓ=0 term vanishes as the Riesz operator requires).
+    bfn = SC.band_multiplier(st.sigma2[j + 1], st.sigma2[j])
+    sf = similar(a)
+    @inbounds for ℓ in 0:lmax
+        bl = bfn(ℓ)
+        for m in -ℓ:ℓ
+            idx = NUFSHT.spin_coeff_index(ℓ, m, lmax)
+            sf[idx] = bl * a[idx]
         end
     end
 
-    return (S0 = S0, S1 = S1, S2 = S2)
+    M = p.M
+    U0 = Vector{Complex{T}}(undef, M)
+    UR = Vector{Complex{T}}(undef, M)
+    NUFSHT.nusht_type2_spin!(U0, sf, p0)          # spin-0 synthesis → band-pass (real up to error)
+    NUFSHT.nusht_type2_spin!(UR, sf, p1)          # spin-1 synthesis → Riesz tangent field u_θ + i u_φ
+
+    bandpass = real.(U0)
+    riesz = (real.(UR), imag.(UR))                # (u_θ, u_φ)
+    rnorm = abs.(UR)
+    amplitude = sqrt.(bandpass .^ 2 .+ rnorm .^ 2)
+    phase = atan.(rnorm, bandpass)                # atan(‖riesz‖, bandpass)
+    orientation = atan.(imag.(UR), real.(UR))     # tangent-vector direction on S²
+    return (; bandpass, riesz, amplitude, phase, orientation)
 end
 
 end # module ScatteringTransformsNUFSHTExt

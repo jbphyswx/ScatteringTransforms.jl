@@ -43,10 +43,10 @@ function _mpi_batch(b::MPIBackend, st, X, slicer)
     return reshape(recv, flen, ncols)
 end
 
-ST.scattering_batch(b::MPIBackend, st::ST.ScatteringTransform1D, X::AbstractMatrix) =
+ST.scattering_batch(b::MPIBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix) =
     _mpi_batch(b, st, X, (A, cols) -> A[:, cols])
 
-ST.scattering_batch(b::MPIBackend, st::ST.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
+ST.scattering_batch(b::MPIBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
     _mpi_batch(b, st, X, (A, cols) -> A[:, :, cols])
 
 end # module ScatteringTransformsMPIExt

@@ -16,8 +16,12 @@ are the same.
 
 ## Features
 
-- **Domains**: 1D, 2D (oriented Morlet), 3D (oriented 3D Morlet), and spherical (NUFSHT,
-  smooth difference-of-Gaussians bands).
+- **Domains**: 1D, 2D (oriented Morlet), 3D (oriented 3D Morlet), and spherical (S², smooth
+  difference-of-Gaussians bands).
+- **Grid-support matrix**: Cartesian × spherical, on uniform/structured and nonuniform/scattered
+  sampling — gridded `ScatteringTransform{1,2,3}D` (FFT), scattered-planar `scattered_planar_scattering`
+  (NUFFT), structured-sphere `structured_spherical_scattering` (fast SHT), scattered-sphere
+  `spherical_scattering` (NUFSHT).
 - **Two outputs**: globally-averaged coefficients `st(x)` and the localized (Mallat) field
   `scattering_field(st, x) = (|U_p x| ⋆ φ_J)↓` (their spatial means agree by construction).
 - **Correct path structure**: second order over strictly coarser scales, all orientation pairs.
@@ -27,34 +31,40 @@ are the same.
   phase retrieval (`reconstruct_phase`), and gradient-descent `synthesize` from coefficients
   (DifferentiationInterface extension, any `ADTypes` backend).
 - **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
-  monogenic amplitude + continuous orientation/phase (`monogenic_components`), and
-  `spherical_monogenic_scattering` on S².
+  monogenic amplitude + continuous orientation/phase (`monogenic_components`); on S²,
+  `spherical_monogenic_scattering` (amplitude) and `spherical_monogenic_components` (pointwise
+  orientation/phase via the spin-1 Riesz vector).
 - **Tight-frame filter bank**: `|φ|² + Σⱼ|ψⱼ|² ≡ 1` (non-expansive).
 - **Pluggable spectral backend**: in-core direct-sum default; `using FFTW` → `O(N log N)`
   fast path (`spectral = AutoSpectral() | DirectSumBackend() | FFTBackend()`).
 - **Scale**: `scattering_batch` (one plan reused), `ThreadedBackend` (OhMyThreads),
-  `DistributedBackend`/`MPIBackend` (parametric over the inner backend), `GPUBackend` (CUDA).
+  `DistributedBackend`/`MPIBackend` (parametric over the inner backend),
+  `GPUBackend` (vendor-neutral KernelAbstractions: CUDA/ROCm/oneAPI/Metal, or `KA.CPU()`).
 - **Generic & type-stable**: `Float32`/`Float64`, autodiff-friendly, GPU-array-ready hot path.
 
 ## Quick start
 
+Symbols live in submodules and are accessed via fully-qualified paths — the package intentionally
+does not re-export names into the top level (see the [API Reference](api.md)). Alias the package
+for brevity:
+
 ```julia
-using ScatteringTransforms
-using FFTW   # optional: switches on the O(N log N) fast path automatically
+using ScatteringTransforms: ScatteringTransforms as ST
+using FFTW: FFTW   # optional: loading it switches on the O(N log N) fast path automatically
 
 # 1D
-st = ScatteringTransform1D(1024, 8; Q=1, max_order=2)
+st = ST.Scattering1D.ScatteringTransform1D(1024, 8; Q=1, max_order=2)
 c  = st(randn(1024))
-zeroth_order(c); first_order(c); second_order(c)
+ST.Coefficients.zeroth_order(c); ST.Coefficients.first_order(c); ST.Coefficients.second_order(c)
 
 # 2D / 3D
-c2 = ScatteringTransform2D((256, 256), 4; L=8)(randn(256, 256))
-c3 = ScatteringTransform3D((32, 32, 32), 3; n_orient=6)(randn(32, 32, 32))
+c2 = ST.Scattering2D.ScatteringTransform2D((256, 256), 4; L=8)(randn(256, 256))
+c3 = ST.Scattering3D.ScatteringTransform3D((32, 32, 32), 3; n_orient=6)(randn(32, 32, 32))
 
 # localized field, reductions, batching
-field = scattering_field(st, randn(1024))      # per-path low-passed, subsampled maps
-red   = normalized_coefficients(c)             # s1 = S1/S0, s2 = S2/S1
-B     = scattering_batch(st, randn(1024, 100)) # (coeffs × 100), one plan reused
+field = ST.ScatteringFields.scattering_field(st, randn(1024))   # per-path low-passed, subsampled maps
+red   = ST.Reductions.normalized_coefficients(c)                # s1 = S1/S0, s2 = S2/S1
+B     = ST.scattering_batch(st, randn(1024, 100))               # (coeffs × 100), one plan reused
 ```
 
 ### Filter bank (tight frame)
@@ -74,11 +84,13 @@ from the scattering *coefficients*, `synthesize` descends `‖S(x̂)−S(x)‖²
 DifferentiationInterface) to draw a new sample with matching multiscale statistics — in 1D and 2D.
 
 ```julia
-using DifferentiationInterface, Mooncake
+using DifferentiationInterface: DifferentiationInterface
+using Mooncake: Mooncake
+using ADTypes: AutoMooncake
 # exact linear inverse (machine precision)
-x̂ = iwavelet(st, wavelet_transform(st, signal))
+x̂ = ST.Inverse.iwavelet(st, ST.Inverse.wavelet_transform(st, signal))
 # coefficient synthesis from noise (a matching sample, not the original field)
-res = synthesize(st, signal; backend = AutoMooncake(), iters = 400)
+res = ST.synthesize(st, signal; backend = AutoMooncake(), iters = 400)
 ```
 
 ![Reconstruction & synthesis (1D)](assets/reconstruction_synthesis.png)
@@ -91,11 +103,21 @@ orientation (not quantized into bins).
 
 ![Monogenic analysis](assets/monogenic.png)
 
+### Nonuniform / scattered planar grids (NUFFT)
+Off-lattice / gappy planar data is scattered onto a uniform Fourier mode grid by a NUFFT
+(`scattered_planar_scattering`); on a uniform grid it reproduces the gridded FFT transform exactly.
+
+![Scattered planar scattering](assets/scattered_planar.png)
+
 ### Spherical scattering
-On S² (scattered points, via NUFSHT) both the analytic and monogenic transforms are available;
-the monogenic Riesz energy is computed with spin-0 transforms via a Bochner identity.
+On S², both **scattered points** (`spherical_scattering`, NUFSHT) and a **structured**
+Clenshaw–Curtis grid (`structured_spherical_scattering`, fast SHT) give matching coefficients; the
+monogenic Riesz energy is computed with spin-0 transforms via a Bochner identity, and
+`spherical_monogenic_components` synthesizes the spin-1 Riesz vector for pointwise orientation/phase.
 
 ![Spherical scattering](assets/spherical_scattering.png)
+![Structured spherical scattering](assets/structured_spherical.png)
+![Spherical monogenic components](assets/spherical_monogenic.png)
 
 ## Backends & scale
 

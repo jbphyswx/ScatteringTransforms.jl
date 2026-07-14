@@ -7,7 +7,7 @@ Implements Morlet wavelets in the frequency domain for FFT-based convolutions.
 """
 
 export Morlet1D, Morlet2D, Morlet3D
-export frequency_response, gaussian_window, plane_wave
+export frequency_response
 export fibonacci_directions
 
 """
@@ -282,26 +282,6 @@ function fibonacci_directions(n::Int, ::Type{T}=Float64) where {T<:Real}
         dirs[i + 1] = (r * Base.cos(θ), r * Base.sin(θ), z)
     end
     return dirs
-end
-
-"""
-    gaussian_window(N::Int, sigma::Real) -> Vector{Float64}
-
-Create a Gaussian window in real space.
-"""
-function gaussian_window(N::Int, sigma::Real)
-    x = range(-N÷2, N÷2 - 1, length=N)
-    return exp.(-x.^2 ./ (2 .* sigma.^2))
-end
-
-"""
-    plane_wave(N::Int, k::Real) -> Vector{ComplexF64}
-
-Create a complex plane wave exp(i k x) for testing.
-"""
-function plane_wave(N::Int, k::Real)
-    x = range(0, 2π * (1 - 1/N), length=N)
-    return exp.(im .* k .* x)
 end
 
 end # module Filters

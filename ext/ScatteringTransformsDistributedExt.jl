@@ -35,10 +35,10 @@ function _distributed_batch(b::DistributedBackend, st, X, slicer)
     return reduce(hcat, parts)
 end
 
-ST.scattering_batch(b::DistributedBackend, st::ST.ScatteringTransform1D, X::AbstractMatrix) =
+ST.scattering_batch(b::DistributedBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix) =
     _distributed_batch(b, st, X, (A, cols) -> A[:, cols])
 
-ST.scattering_batch(b::DistributedBackend, st::ST.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
+ST.scattering_batch(b::DistributedBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
     _distributed_batch(b, st, X, (A, cols) -> A[:, :, cols])
 
 end # module ScatteringTransformsDistributedExt

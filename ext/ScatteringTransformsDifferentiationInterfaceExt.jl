@@ -9,7 +9,7 @@ gradient supplied through DifferentiationInterface (DI). DI is backend-agnostic,
 backend works — `AutoMooncake()`, `AutoEnzyme()`, `AutoZygote()`, … — the user picks one and
 loads the corresponding AD package.
 
-The differentiable forward is the non-mutating `ScatteringTransforms.scattering(st, x)`: with the
+The differentiable forward is the non-mutating `ScatteringTransforms.ScatteringCore.scattering(st, x)`: with the
 in-core direct-sum spectral backend it is plain matmul/broadcast (differentiable by every
 backend); with the FFTW fast path it differentiates via `AbstractFFTs` ChainRules (Mooncake /
 Zygote). For reverse-mode synthesis the direct-sum backend is the most portable default.
@@ -19,12 +19,12 @@ using DifferentiationInterface: DifferentiationInterface as DI
 using ScatteringTransforms: ScatteringTransforms
 
 # The gridded transforms expose the same non-mutating `scattering` + `buffer_mod` shape.
-const _Gridded = Union{ScatteringTransforms.ScatteringTransform1D,
-                       ScatteringTransforms.ScatteringTransform2D,
-                       ScatteringTransforms.ScatteringTransform3D}
+const _Gridded = Union{ScatteringTransforms.Scattering1D.ScatteringTransform1D,
+                       ScatteringTransforms.Scattering2D.ScatteringTransform2D,
+                       ScatteringTransforms.Scattering3D.ScatteringTransform3D}
 
 # A target given as a field array -> its coefficients; otherwise it already is a coeff container.
-_target_coeffs(st, target::AbstractArray) = ScatteringTransforms.scattering(st, target)
+_target_coeffs(st, target::AbstractArray) = ScatteringTransforms.ScatteringCore.scattering(st, target)
 _target_coeffs(::Any, target) = target
 
 # Spatial shape of the transform input (the real modulus workspace carries it).
@@ -40,7 +40,7 @@ function ScatteringTransforms.synthesize(st::_Gridded, target;
     T = real(eltype(st.filter_bank.averaging))
     x = init === nothing ? randn(T, _field_shape(st)) : T.(collect(init))
 
-    objective(z) = loss(ScatteringTransforms.scattering(st, z), tc)
+    objective(z) = loss(ScatteringTransforms.ScatteringCore.scattering(st, z), tc)
     prep = DI.prepare_gradient(objective, backend, x)
 
     # Adam — first-order, no extra optimizer dependency.

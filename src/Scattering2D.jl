@@ -302,9 +302,8 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
             ScatteringCore.apply_modulus!(st.U1_buffers[j1], st.buffer_conv)
         end
         @inbounds for j1 in 1:num_w
-            @simd for i in eachindex(st.U1_buffers[j1])
-                st.buffer_input[i] = complex(st.U1_buffers[j1][i])
-            end
+            # Broadcast real→complex (no scalar indexing): CPU + GPU compatible.
+            st.buffer_input .= complex.(st.U1_buffers[j1])
             Plans.forward_transform!(st.U1_fft_buffers[j1], st.plan, st.buffer_input)
         end
         @inbounds for p in PathGraph.order_range(tree, 2)
