@@ -8,8 +8,12 @@
 using KernelAbstractions: KernelAbstractions as KA
 using AbstractFFTs: AbstractFFTs
 
-# f is warmed up once, then measured on a second identical call.
-_alloc(f, args...) = (f(args...); @allocated f(args...))
+# f is warmed up once, then measured on a second identical call. The `f::F where {F}` forces Julia to
+# specialize this helper on the concrete function type, so `f(args...)` is a statically-known call with
+# an inferred return type. Without it, a scalar (bitstype) return is boxed by the higher-order call — a
+# spurious 16-byte allocation the measurement would otherwise attribute to `f` (observed on Julia 1.11;
+# the 1.12 compiler elides it). Array-returning `!` ops are unaffected (they return an existing pointer).
+_alloc(f::F, args...) where {F} = (f(args...); @allocated f(args...))
 
 Test.@testset "Allocation discipline" begin
     C   = ScatteringTransforms.Coefficients
