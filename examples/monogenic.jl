@@ -22,18 +22,18 @@ println("Monogenic (Riesz) scattering")
 println("="^64)
 
 # ── Riesz multipliers tile unity off the DC bin ───────────────────────────────
-R = ST.riesz_multipliers((32, 32), Float64)
+R = ST.Monogenic.riesz_multipliers((32, 32), Float64)
 partition = sum(abs2.(Rd) for Rd in R)
 println("\nRiesz partition Σ_d|R_d|² = 1 off-DC: ",
         maximum(abs.([partition[i] for i in CartesianIndices(partition) if i != CartesianIndex(1, 1)] .- 1)) < 1e-12)
 
 # ── 1D / 2D / 3D monogenic scattering ─────────────────────────────────────────
 let
-    c1 = ST.MonogenicScattering(256, 5; Q=1, max_order=2)(randn(256))
-    c2 = ST.MonogenicScattering((48, 48), 3; Q=1, max_order=2)(randn(48, 48))
-    c3 = ST.MonogenicScattering((16, 16, 16), 2; max_order=2)(randn(16, 16, 16))
+    c1 = ST.Monogenic.MonogenicScattering(256, 5; Q=1, max_order=2)(randn(256))
+    c2 = ST.Monogenic.MonogenicScattering((48, 48), 3; Q=1, max_order=2)(randn(48, 48))
+    c3 = ST.Monogenic.MonogenicScattering((16, 16, 16), 2; max_order=2)(randn(16, 16, 16))
     println("1D/2D/3D monogenic S1 lengths: ",
-            length(ST.first_order(c1)), " / ", length(ST.first_order(c2)), " / ", length(ST.first_order(c3)))
+            length(ST.Coefficients.first_order(c1)), " / ", length(ST.Coefficients.first_order(c2)), " / ", length(ST.Coefficients.first_order(c3)))
 end
 
 # ── amplitude envelope + continuous orientation on an oriented field ──────────
@@ -42,9 +42,9 @@ M = 128
 cx = cy = (M + 1) / 2
 rr = [sqrt((i - cx)^2 + (j - cy)^2) for i in 1:M, j in 1:M]
 field = cos.(2π .* rr ./ (M / 16))
-st = ST.MonogenicScattering((M, M), 5; Q=1, max_order=1, spectral=ST.FFTBackend())
-best = argmax([sum(abs2, ST.monogenic_components(st, field, j).bandpass) for j in 1:5])
-comp = ST.monogenic_components(st, field, best)
+st = ST.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1, spectral=ST.Plans.FFTBackend())
+best = argmax([sum(abs2, ST.Monogenic.monogenic_components(st, field, j).bandpass) for j in 1:5])
+comp = ST.Monogenic.monogenic_components(st, field, best)
 
 # the monogenic amplitude is a smooth envelope: far less oscillatory than the band-pass field
 env_osc = Statistics.std(diff(vec(comp.amplitude)))

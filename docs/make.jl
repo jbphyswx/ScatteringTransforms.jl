@@ -1,7 +1,5 @@
 using Documenter: Documenter
-using ScatteringTransforms                 # bare for @docs scope resolution
-using FFTW: FFTW                           # load the FFTW extension so the fast path is active
-using CairoMakie: CairoMakie               # load the plotting extension
+using ScatteringTransforms: ScatteringTransforms   # @docs blocks use fully-qualified `ScatteringTransforms.…` paths
 
 Documenter.makedocs(
     sitename = "ScatteringTransforms.jl",

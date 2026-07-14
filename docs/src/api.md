@@ -1,5 +1,20 @@
 # API Reference
 
+Symbols are accessed via fully-qualified submodule paths (the package does not re-export names into
+its top-level namespace); `using ScatteringTransforms: ScatteringTransforms as ST`, then e.g.
+`ST.Scattering2D.ScatteringTransform2D(...)`.
+
+## Grid-support matrix
+
+Planar (Cartesian) and spherical scattering, on uniform/structured and nonuniform/scattered sampling:
+
+| domain | uniform / structured | nonuniform / scattered |
+|---|---|---|
+| Cartesian | `ScatteringTransform{1,2,3}D` (FFT; GPU via `GPUBackend`) | `scattered_planar_scattering` (NUFFT; `using FINUFFT`) |
+| Sphere (S²) | `structured_spherical_scattering` (fast SHT; `using FastSphericalHarmonics`) | `spherical_scattering` (NUFSHT; `using NUFSHT`) |
+
+Monogenic (Riesz) variants exist on both sphere paths; see below.
+
 ## Transforms
 
 ```@docs
@@ -10,7 +25,10 @@ ScatteringTransforms.Scattering1D.scattering_transform!
 ScatteringTransforms.Scattering2D.scattering_transform2d!
 ScatteringTransforms.Scattering3D.scattering_transform3d!
 ScatteringTransforms.ScatteringCore.scattering
+ScatteringTransforms.scattered_planar_scattering
 ScatteringTransforms.spherical_scattering
+ScatteringTransforms.structured_spherical_scattering
+ScatteringTransforms.structured_sphere_points
 ```
 
 ## Reconstruction & synthesis
@@ -34,6 +52,7 @@ ScatteringTransforms.Monogenic.monogenic_amplitude
 ScatteringTransforms.Monogenic.monogenic_components
 ScatteringTransforms.spherical_monogenic_scattering
 ScatteringTransforms.spherical_monogenic_components
+ScatteringTransforms.structured_spherical_monogenic_scattering
 ```
 
 ## Localized (Mallat) field

@@ -20,8 +20,13 @@ stack. The pattern for TB-scale datasets.
 
 ## `backends.jl` — spectral & compute backends
 In-core direct-sum vs FFTW fast path (identical results, ~100–1000× faster); serial vs
-`ThreadedBackend` batched transforms; GPU is exercised if a CUDA device is available and skipped
-gracefully otherwise.
+`ThreadedBackend` batched transforms; the vendor-neutral GPU path via `GPUBackend` (real CUDA if a
+device is available, else the KernelAbstractions CPU backend as a portable fallback).
+
+## `grid_support_matrix.jl` — planar & spherical, uniform & scattered
+The full grid-support matrix: scattered-planar scattering via NUFFT (reproducing the gridded FFT
+transform on a uniform grid), structured-sphere scattering via the fast SHT, scattered-sphere
+scattering via NUFSHT, and pointwise spherical monogenic orientation/phase (spin-1 Riesz vector).
 
 ## `synthesis_and_inverse.jl` — reconstruction
 The three reconstruction levels: the exact linear wavelet-frame inverse (`iwavelet ∘
@@ -35,4 +40,4 @@ sample with matching multiscale statistics.
 `monogenic_components` — the smooth amplitude envelope and the continuously-recovered local
 orientation/phase (vs the oriented-modulus transform).
 
-All five examples double as smoke tests (they `@test` their own invariants).
+All examples double as smoke tests (they `@test` their own invariants).
