@@ -12,6 +12,7 @@ using Distributed: Distributed
 using MPI: MPI
 using NUFSHT: NUFSHT
 using Statistics: Statistics
+using Random: Random
 using DifferentiationInterface: DifferentiationInterface as DI
 using ADTypes: AutoMooncake
 import Mooncake
@@ -920,6 +921,11 @@ Test.@testset "Exact linear wavelet-frame inverse: iwavelet ∘ wavelet_transfor
 end
 
 Test.@testset "Phase retrieval (Gerchberg–Saxton): reconstructed moduli match target" begin
+    # Gerchberg–Saxton is nonconvex, so convergence depends on the random target/init draw. Seed the
+    # RNG so this is deterministic rather than an occasional CI failure: across seeds the relative
+    # modulus error clusters near 0.10 and its worst draws approach the 0.15 threshold, so an unseeded
+    # run flakes. Seed 123 gives 0.099 identically on Julia 1.11 and 1.12 — comfortably under 0.15.
+    Random.seed!(123)
     N, J = 128, 6
     x = randn(N)
     st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=2, max_order=1)

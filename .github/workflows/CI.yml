@@ -18,7 +18,9 @@ jobs:
       matrix:
         # 1.11 is the floor: Project.toml [workspace] and the test [sources] entry (used for the
         # unregistered NUFSHT.jl) require Julia >= 1.11. Add '1.10' back once those are registered.
-        version: ['1.11', '1.12', '1']
+        # '1' is intentionally omitted — it currently resolves to 1.12, duplicating that job; bump the
+        # explicit list when a newer stable Julia is released.
+        version: ['1.11', '1.12']
         os: [ubuntu-latest]
         arch: [x64]
         include:
