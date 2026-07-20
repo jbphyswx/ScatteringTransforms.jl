@@ -1,4 +1,4 @@
-# Vendor-neutral GPU path (issue #3, #5), validated on the KernelAbstractions CPU backend.
+# Vendor-neutral GPU path, validated on the KernelAbstractions CPU backend.
 #
 # `GPUBackend(KA.CPU())` runs the *exact* device-resident constructors + batched-throughput path used
 # on CUDA/ROCm/…, differing only in the concrete array type — so this exercises the full

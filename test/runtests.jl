@@ -55,9 +55,9 @@ include("test_jet.jl")
 include("test_mooncake.jl")
 
 Test.@testset "Type stability (concrete struct fields + inferred transforms)" begin
-    # Every field of the transform struct must be concretely typed — in particular the FFT
-    # plan fields (previously untyped `Any`, causing dynamic dispatch on every `mul!`) and the
-    # 2D filter-bank field (previously `FilterBank2D{T}` with the matrix param dropped).
+    # Every field of the transform struct must be concretely typed — in particular the FFT plan
+    # fields (an untyped `Any` there forces dynamic dispatch on every `mul!`) and the 2D filter-bank
+    # field (its matrix container must stay a type parameter, not be dropped to an abstract type).
     N = 256
     J = 4
     st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
@@ -331,8 +331,8 @@ Test.@testset "Filter Bank Wavelet Energy" begin
     J = 4
     bank = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=1)
     
-    # Each wavelet should have non-negligible energy
-    # This is a regression test - previously bandwidth was wrong causing near-zero energy
+    # Each wavelet must have non-negligible in-band energy (guards against a bandwidth error that
+    # collapses the filters to near-zero magnitude).
     for (j, ψ) in enumerate(bank.wavelets)
         energy = Statistics.maximum(Base.abs.(ψ))
         # With correct formulas, all wavelets should have ~0.01-0.1 energy
@@ -992,7 +992,7 @@ include("test_spherical_sht.jl")
 # Scattered / nonuniform planar scattering (NUFFT) — completes the Cartesian side of the matrix.
 include("test_scattered_planar.jl")
 
-# Pointwise spherical monogenic orientation/phase (spin-1 synthesis, #1).
+# Pointwise spherical monogenic orientation/phase (spin-1 synthesis).
 include("test_spherical_monogenic_components.jl")
 
 # Allocation discipline: hot paths zero-alloc; allocating paths minimal + data-size-independent.

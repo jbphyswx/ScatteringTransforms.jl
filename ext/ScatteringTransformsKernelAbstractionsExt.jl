@@ -1,9 +1,9 @@
 module ScatteringTransformsKernelAbstractionsExt
 
 """
-    ScatteringTransformsKernelAbstractionsExt — vendor-neutral GPU scattering (issue #3, #5)
+    ScatteringTransformsKernelAbstractionsExt — vendor-neutral GPU scattering
 
-The real device-agnostic GPU execution path, dispatched on `Backends.GPUBackend{B}` where `B` is any
+The device-agnostic GPU execution path, dispatched on `Backends.GPUBackend{B}` where `B` is any
 `KernelAbstractions.Backend` (CUDA/ROCm/oneAPI/Metal for real hardware, `KA.CPU()` for CPU-parity CI).
 
 The scattering engine (`ScatteringCore`, `Scattering{1,2,3}D`) is already array-type-generic — every hot
@@ -12,8 +12,7 @@ op is a fused broadcast or a `mul!` through the plan interface — so this path 
 
   1. device allocation — `KA.allocate(backend, T, dims)` + `copyto!` / `fill!`;
   2. the FFT plan — `AbstractFFTs.plan_fft(device_array)` / `plan_ifft`, which dispatch on the array
-     *type* (cuFFT for `CuArray`, rocFFT for `ROCArray`, FFTW for a plain `Array`). This is the same
-     mechanism `FlowInvariantTransfer.jl` uses to stay vendor-neutral.
+     *type* (cuFFT for `CuArray`, rocFFT for `ROCArray`, FFTW for a plain `Array`).
 
 Two entry points are provided:
 
@@ -21,12 +20,11 @@ Two entry points are provided:
     transform whose filter bank + workspace + plan live on the device; the existing generic `st(x_dev)`
     then runs on-device unchanged;
   * **batched-FFT throughput** `scattering_batch(gpu, st, X)` / `scattering_batch!(out, gpu, st, X)` —
-    transform a whole `(N…, B)` stack with one batched plan and fused broadcasts, the performant path
-    for the SMODE GPU workload.
+    transform a whole `(N…, B)` stack with one batched plan and fused broadcasts.
 
-We deliberately do **not** override core elementwise ops (`apply_modulus!`, complexify) by a broad
-`::AbstractArray` — that would hijack CPU dispatch the instant KA is loaded (the original issue #3 bug);
-base broadcast is already correct on device arrays.
+Core elementwise ops (`apply_modulus!`, complexify) are not overridden by a broad `::AbstractArray`
+method: that would also capture CPU arrays once this extension loads, and base broadcast is already
+correct on device arrays.
 """
 
 using KernelAbstractions: KernelAbstractions as KA

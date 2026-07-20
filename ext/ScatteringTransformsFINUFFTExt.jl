@@ -3,8 +3,8 @@ module ScatteringTransformsFINUFFTExt
 """
     ScatteringTransformsFINUFFTExt — nonuniform / scattered planar scattering (NUFFT)
 
-The **scattered/nonuniform Cartesian** backend, completing the planar side of the grid-support matrix
-(#4a). A scalar field sampled at arbitrary points `(x, y)` is scattered via a Type-1 NUFFT onto a
+The **scattered/nonuniform Cartesian** backend. A scalar field sampled at arbitrary points `(x, y)`
+is scattered via a Type-1 NUFFT onto a
 uniform Fourier **mode grid** of size `ms`, where the ordinary oriented-Morlet wavelet bank lives; the
 wavelet multiply happens on that grid and a Type-2 NUFFT evaluates the filtered field back at the
 points. The modulus + a (quadrature-weighted) spatial mean then give the S0/S1/S2 coefficients, exactly
@@ -36,8 +36,8 @@ const ScatteringCore = ST.ScatteringCore
 # ---------------------------------------------------------------------------
 # NUFFT spectral plan: analysis (points → modes, Type-1 or CG-solve) + synthesis (modes → points).
 # Implements the `Plans.AbstractScatteringPlan` interface so the cascade reuses `wavelet_convolve!`.
-# `guru1`/`guru2` are opaque FINUFFT C-plan handles (kept untyped, as in FlowFieldSpectra); the
-# array buffers are type parameters so the struct stays generic and concretely typed.
+# `guru1`/`guru2` are opaque FINUFFT C-plan handles (kept untyped); the array buffers are type
+# parameters so the struct stays generic and concretely typed.
 # ---------------------------------------------------------------------------
 
 mutable struct NUFFTScatteringPlan{T, CV<:AbstractVector{Complex{T}},

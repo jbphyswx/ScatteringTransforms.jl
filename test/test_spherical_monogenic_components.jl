@@ -1,4 +1,4 @@
-# Pointwise spherical monogenic orientation/phase on S² (issue #1), via spin-1 scattered synthesis
+# Pointwise spherical monogenic orientation/phase on S², via spin-1 scattered synthesis
 # (NUFSHT). Validated against the closed-form spin-weighted harmonic ₁Y_ℓm: for a field that is a
 # single real harmonic Y_{ℓ0,0}, the band-pass and Riesz-vector fields have exact analytic forms.
 using NUFSHT: NUFSHT

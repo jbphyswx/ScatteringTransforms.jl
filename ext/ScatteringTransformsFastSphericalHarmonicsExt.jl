@@ -4,8 +4,8 @@ module ScatteringTransformsFastSphericalHarmonicsExt
     ScatteringTransformsFastSphericalHarmonicsExt — structured-grid spherical scattering (fast SHT)
 
 The **structured (uniform)** spherical backend for the shared spherical scattering core
-(`SphericalCore`), completing the grid-support matrix (#4) alongside the scattered-point NUFSHT
-backend. A scalar field is sampled on the Clenshaw–Curtis grid of `FastSphericalHarmonics`
+(`SphericalCore`), alongside the scattered-point NUFSHT backend. A scalar field is sampled on the
+Clenshaw–Curtis grid of `FastSphericalHarmonics`
 (`Nθ = lmax+1`, `Nφ = 2lmax+1`) and analysed/synthesised with the fast `sph_transform!` /
 `sph_evaluate!`. The DoG band-pass bank, S0/S1/S2 cascade, and the spin-0 Bochner monogenic amplitude
 are shared with `SphericalCore`; this extension only supplies the plan and the two interface methods.

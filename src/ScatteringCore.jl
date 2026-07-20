@@ -93,7 +93,7 @@ In-place modulus. Stores |signal| in pre-allocated `out`. Zero allocation.
 function apply_modulus!(out::AbstractArray, signal::AbstractArray)
     # Broadcast: CPU + GPU compatible (no scalar indexing). On GPU arrays this fuses to a single
     # kernel automatically, so no explicit-kernel override is needed (and none is defined — a broad
-    # `::AbstractArray` override here would hijack CPU dispatch; see issue #3).
+    # `::AbstractArray` override would also capture CPU arrays).
     @. out = abs(signal)
     return out
 end

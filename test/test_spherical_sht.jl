@@ -1,4 +1,4 @@
-# Structured (uniform) spherical scattering via the fast SHT path (issue #4b), on the
+# Structured (uniform) spherical scattering via the fast SHT path, on the
 # FastSphericalHarmonics Clenshaw–Curtis grid. Shares SphericalCore's DoG bank + cascade with the
 # scattered NUFSHT backend; only the spectral transform (exact fast SHT) differs.
 using FastSphericalHarmonics: FastSphericalHarmonics

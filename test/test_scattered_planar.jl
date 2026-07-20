@@ -1,4 +1,4 @@
-# Nonuniform / scattered planar scattering via NUFFT (issue #4a). On a uniform grid the NUFFT
+# Nonuniform / scattered planar scattering via NUFFT. On a uniform grid the NUFFT
 # analysis/synthesis reduce to fft/ifft, so scattered-planar scattering must reproduce the gridded
 # ScatteringTransform2D exactly (to NUFFT tolerance); on irregular points the CG-solve path recovers
 # a band-limited field.

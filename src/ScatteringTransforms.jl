@@ -182,7 +182,6 @@ function scattering_batch(b::Backends.AbstractExecutionBackend, st, X)
 end
 
 # Nonuniform / scattered planar scattering via NUFFT; method added by the FINUFFT extension.
-# Completes the Cartesian side of the grid-support matrix (#4a).
 """
     scattered_planar_scattering(x, y, ms, J; L=8, max_order=2, T=Float64, period=nothing,
                                 solve=false, weights=nothing, eps=..., maxiter=100, rtol=1e-8)
@@ -229,8 +228,8 @@ spherical_monogenic_scattering(args...; kwargs...) = throw(ArgumentError(
     "spherical monogenic scattering requires the NUFSHT extension — run `using NUFSHT`."))
 
 # Structured (uniform) spherical scattering via a fast SHT on a Clenshaw–Curtis grid; methods added
-# by the FastSphericalHarmonics extension. Completes the grid-support matrix (#4): the structured
-# analogue of the scattered `spherical_scattering` (NUFSHT).
+# by the FastSphericalHarmonics extension. The structured analogue of the scattered
+# `spherical_scattering` (NUFSHT).
 """
     structured_spherical_scattering(lmax, J; max_order=2)
 

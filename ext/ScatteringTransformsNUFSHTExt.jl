@@ -104,8 +104,8 @@ function ST.spherical_monogenic_scattering(pts_theta::AbstractVector{T}, pts_phi
 end
 
 # ---------------------------------------------------------------------------
-# Pointwise spherical monogenic decomposition (issue #1) — the S² analogue of the planar
-# `monogenic_components`. Now unblocked: NUFSHT.jl provides spin-weighted scattered synthesis.
+# Pointwise spherical monogenic decomposition — the S² analogue of the planar `monogenic_components`,
+# using NUFSHT's spin-weighted scattered synthesis.
 #
 # For band-pass `U⁰_j = b_j(ℓ)·a_ℓm` (spin-0), the spin-1 Riesz field is
 #   U^R_j = ð∘(−Δ_S)^{-1/2} U⁰_j,   coeffs = √(ℓ(ℓ+1))·(1/√(ℓ(ℓ+1)))·b_j(ℓ)·a_ℓm = b_j(ℓ)·a_ℓm  (ℓ≥1).
