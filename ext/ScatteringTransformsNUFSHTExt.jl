@@ -16,8 +16,8 @@ all live in `SphericalCore`; this extension only supplies
 plus the constructors `spherical_scattering` / `spherical_monogenic_scattering`.
 
 Analysis uses NUFSHT's **exact inverse** (`nusht_solve!`), not the adjoint (`nusht_type1!`): on
-scattered points the adjoint mis-scales the coefficients degree-dependently, which made the scattering
-coefficients absolutely wrong (only scale-invariant properties survived). The `SphericalCore` cascade
+scattered points the adjoint mis-scales the coefficients degree-dependently, so the exact inverse is
+needed for correct absolute magnitudes. The `SphericalCore` cascade
 analyses each field once and reuses its coefficients across all bands, so the (iterative) solve runs
 once per field rather than once per band.
 """
@@ -39,10 +39,9 @@ Scattered-point spherical plan wrapping a `NUFSHT.NUSHTplan`, the sample count `
 `lmax`, the scattered points `(theta, phi)` (retained so spin-weighted plans can be built on the same
 points for `spherical_monogenic_components`), and the CG-inversion tolerance/iteration cap used by
 [`sphere_coeffs`](@ref). Analysis uses NUFSHT's **exact inversion** (`nusht_solve!`), not the adjoint:
-on scattered points the adjoint mis-scales the coefficients (degree-dependent), which would make the
-scattering coefficients absolutely wrong (they only look right under scale-invariant checks). Accurate
-inversion needs the sampling to resolve the band limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed
-points.
+on scattered points the adjoint mis-scales the coefficients degree-dependently, so the exact inversion
+is needed for correct absolute magnitudes. Accurate inversion needs the sampling to resolve the band
+limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed points.
 """
 struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real} <: SC.AbstractSphericalPlan
     plan::P

@@ -187,11 +187,8 @@ Test.@testset "1D Filter Bank with Q > 1 Fractional Center Frequencies" begin
 end
 
 Test.@testset "2D S2 Coefficients Zero-Initialization Verification" begin
-    # TODO(Phase 2): this asserts the PROVISIONAL dense-matrix-with-zero-triangle storage
-    # contract. The dense S2 matrix is a placeholder for the true scattering path structure;
-    # it will be replaced by a path-indexed container and these assertions become
-    # path-structure checks (counts per order, frequency-decreasing constraint). Until then
-    # keep verifying the current contract so the suite stays green.
+    # Checks the 2D second-order storage contract: S2 is a dense J×J matrix whose inadmissible
+    # (non-frequency-decreasing) entries are zeroed.
     Ny, Nx = 64, 64
     J = 3
     L = 4
