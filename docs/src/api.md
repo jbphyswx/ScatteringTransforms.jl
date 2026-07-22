@@ -10,10 +10,18 @@ Planar (Cartesian) and spherical scattering, on uniform/structured and nonunifor
 
 | domain | uniform / structured | nonuniform / scattered |
 |---|---|---|
-| Cartesian | `ScatteringTransform{1,2,3}D` (FFT; GPU via `GPUBackend`) | `scattered_planar_scattering` (NUFFT; `using FINUFFT`) |
-| Sphere (S²) | `structured_spherical_scattering` (fast SHT; `using FastSphericalHarmonics`) | `spherical_scattering` (NUFSHT; `using NUFSHT`) |
+| Cartesian | `ScatteringTransform{1,2,3}D` (FFT/direct sum; GPU via `GPUBackend`) | `scattered_planar_scattering` (exact direct NUDFT; FINUFFT fast path) |
+| Sphere (S²) | `structured_spherical_scattering` (exact direct SHT; FastSphericalHarmonics fast path) | `spherical_scattering` (exact direct SHT; NUFSHT fast path) |
 
-Monogenic (Riesz) variants exist on both sphere paths; see below.
+**Every cell has an in-core, dependency-free default** (direct summation), with an optional fast path
+selected by the `spectral` keyword: scattered-planar uses `Plans.DirectNUFFTBackend` (default) or
+`Plans.NUFFTBackend` (FINUFFT); scattered-sphere uses `SphericalCore.DirectSHTBackend` (default) or
+`SphericalCore.NUSHTBackend` (NUFSHT); structured-sphere uses `SphericalCore.DirectSHTBackend` (default)
+or `SphericalCore.SHTBackend` (FastSphericalHarmonics). `Plans.AutoSpectral` (the default) picks the
+fast path if its extension is loaded, else the direct sum — so nothing requires an external library.
+
+Monogenic (Riesz) variants exist on both sphere paths; see below (pointwise
+`spherical_monogenic_components` additionally needs the NUFSHT spin-1 synthesis).
 
 ## Transforms
 

@@ -23,10 +23,7 @@ once per field rather than once per band.
 """
 
 using NUFSHT: NUFSHT
-using ScatteringTransforms: ScatteringTransforms
-
-const ST = ScatteringTransforms
-const SC = ST.SphericalCore
+using ScatteringTransforms: ScatteringTransforms as ST
 
 # ---------------------------------------------------------------------------
 # Scattered-sphere plan + the two SphericalCore interface methods
@@ -43,7 +40,7 @@ on scattered points the adjoint mis-scales the coefficients degree-dependently, 
 is needed for correct absolute magnitudes. Accurate inversion needs the sampling to resolve the band
 limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed points.
 """
-struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real} <: SC.AbstractSphericalPlan
+struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real} <: ST.SphericalCore.AbstractSphericalPlan
     plan::P
     M::Int
     lmax::Int
@@ -61,14 +58,14 @@ end
 NUFSHT.kernel_transfer(t::_FnTransfer, ℓ) = t.f(ℓ)
 
 # Analysis: the TRUE spherical-harmonic coefficients of `field` via exact CG inversion.
-function SC.sphere_coeffs(plan::NUSHTSphericalPlan, field::AbstractVector)
+function ST.SphericalCore.sphere_coeffs(plan::NUSHTSphericalPlan, field::AbstractVector)
     C = zero(plan.plan.C)
     NUFSHT.nusht_solve!(C, field, plan.plan; rtol = plan.rtol, maxiter = plan.maxiter)
     return C
 end
 
 # Apply the per-degree multiplier `h(ℓ)` to a copy of the coefficients and synthesise at the points.
-function SC.sphere_apply!(out::AbstractVector, plan::NUSHTSphericalPlan, C, h)
+function ST.SphericalCore.sphere_apply!(out::AbstractVector, plan::NUSHTSphericalPlan, C, h)
     C2 = copy(C)
     NUFSHT.apply_transfer!(C2, _FnTransfer(h), plan.lmax)
     NUFSHT.nusht_type2!(out, C2, plan.plan)
@@ -76,30 +73,20 @@ function SC.sphere_apply!(out::AbstractVector, plan::NUSHTSphericalPlan, C, h)
 end
 
 # Unweighted sample mean over the (quasi-uniform) scattered points ≈ the spherical average.
-SC.sphere_mean(plan::NUSHTSphericalPlan, field::AbstractVector) = sum(field) / plan.M
+ST.SphericalCore.sphere_mean(plan::NUSHTSphericalPlan, field::AbstractVector) = sum(field) / plan.M
 
 # ---------------------------------------------------------------------------
-# Constructors (scattered-sphere entry points declared in core)
+# Fast-path plan constructor (scattered-sphere seam declared in SphericalCore). The core
+# `spherical_scattering` / `spherical_monogenic_scattering` build this when `spectral` selects NUFSHT.
 # ---------------------------------------------------------------------------
 
-_nusht_plan(pts_theta::AbstractVector{T}, pts_phi::AbstractVector{T}, lmax::Int,
-            rtol::Real, maxiter::Int) where {T<:Real} =
-    NUSHTSphericalPlan(NUFSHT.make_plan(pts_theta, pts_phi, lmax; T = T), length(pts_theta), lmax,
-                       collect(T, pts_theta), collect(T, pts_phi), T(rtol), maxiter)
-
-function ST.spherical_scattering(pts_theta::AbstractVector{T}, pts_phi::AbstractVector{T},
-                                 lmax::Int, J::Int; max_order::Int = 2,
-                                 rtol::Real = 1.0e-8, maxiter::Int = 500) where {T<:Real}
-    plan = _nusht_plan(pts_theta, pts_phi, lmax, rtol, maxiter)
-    return SC.SphericalScattering{T, typeof(plan)}(lmax, J, max_order, plan, SC.dog_sigma2(lmax, J, T))
-end
-
-function ST.spherical_monogenic_scattering(pts_theta::AbstractVector{T}, pts_phi::AbstractVector{T},
-                                           lmax::Int, J::Int; max_order::Int = 2,
-                                           rtol::Real = 1.0e-8, maxiter::Int = 500) where {T<:Real}
-    plan = _nusht_plan(pts_theta, pts_phi, lmax, rtol, maxiter)
-    return SC.SphericalMonogenicScattering{T, typeof(plan)}(lmax, J, max_order, plan,
-                                                            SC.dog_sigma2(lmax, J, T))
+function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_phi::AbstractVector,
+                                               lmax::Int, ::Type{T}; rtol::Real = 1.0e-8,
+                                               maxiter::Int = 500) where {T<:Real}
+    θ = collect(T, pts_theta)
+    φ = collect(T, pts_phi)
+    return NUSHTSphericalPlan(NUFSHT.make_plan(θ, φ, lmax; T = T), length(θ), lmax, θ, φ,
+                              T(rtol), maxiter)
 end
 
 # ---------------------------------------------------------------------------
@@ -114,7 +101,8 @@ end
 # validated in the tests, which also check the spin-1 synthesis against the closed-form `sYlm`.
 # ---------------------------------------------------------------------------
 
-function ST.spherical_monogenic_components(st::SC.SphericalMonogenicScattering, field::AbstractVector, j::Int)
+function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogenicScattering{<:Any, <:NUSHTSphericalPlan},
+                                           field::AbstractVector, j::Int)
     p = st.plan
     lmax = st.lmax
     T = eltype(p.theta)
@@ -126,7 +114,7 @@ function ST.spherical_monogenic_components(st::SC.SphericalMonogenicScattering, 
     NUFSHT.nusht_solve_spin!(a, Complex{T}.(field), p0)
 
     # sf = b_j(ℓ)·a  (b_j(0)=0, so the ℓ=0 term vanishes as the Riesz operator requires).
-    bfn = SC.band_multiplier(st.sigma2[j + 1], st.sigma2[j])
+    bfn = ST.SphericalCore.band_multiplier(st.sigma2[j + 1], st.sigma2[j])
     sf = similar(a)
     @inbounds for ℓ in 0:lmax
         bl = bfn(ℓ)

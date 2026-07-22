@@ -69,3 +69,48 @@ Test.@testset "Structured (SHT) and scattered (NUFSHT) spherical scattering agre
         Test.@test maximum(abs.(rsca.S2 .- rstr.S2)) / (maximum(abs.(rstr.S2)) + eps()) < 0.10
     end
 end
+
+# The in-core dependency-free direct-summation SH backend and the NUFSHT fast path solve the same
+# scattered least-squares SH inversion, so on a band-limited, adequately-sampled field (M ≫ (lmax+1)²)
+# their scattering coefficients agree closely — S1 essentially to solver tolerance, S2 looser (its
+# input is a broadband modulus truncated slightly differently). This verifies `spherical_scattering`
+# works with no external library (`spectral = DirectSHTBackend()`).
+Test.@testset "Dependency-free direct SH backend agrees with NUFSHT (scattered S²)" begin
+    lmax, J, M = 12, 3, 2500
+    gr = (sqrt(5) - 1) / 2
+    θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φ = [2π * mod(k * gr, 1) for k in 1:M]
+    SC = ScatteringTransforms.SphericalCore
+    for gfun in ((θ, φ) -> cos(θ)^2 - 1/3 + 0.5sin(θ) * cos(φ),
+                 (θ, φ) -> cos(2θ) + 0.4sin(θ) * cos(2φ))
+        f = [gfun(θ[k], φ[k]) for k in 1:M]
+        sdir = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; spectral = SC.DirectSHTBackend())
+        snu  = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; spectral = SC.NUSHTBackend())
+        Test.@test sdir.plan isa SC.DirectSHTSphericalPlan
+        rdir, rnu = sdir(f), snu(f)
+        Test.@test rdir.S0 ≈ rnu.S0 atol = 1e-6
+        Test.@test maximum(abs.(rdir.S1 .- rnu.S1)) / maximum(abs.(rnu.S1)) < 0.01
+        Test.@test maximum(abs.(rdir.S2 .- rnu.S2)) / (maximum(abs.(rnu.S2)) + eps()) < 0.05
+    end
+end
+
+# The in-core dependency-free direct SHT on the structured (equiangular) grid vs the
+# FastSphericalHarmonics fast exact SHT: on a band-limited field the least-squares SH fit is exact, so
+# S1 matches to solver tolerance and the exact Fejér-quadrature mean matches. This verifies
+# `structured_spherical_scattering` works with no external library (`spectral = DirectSHTBackend()`).
+Test.@testset "Dependency-free structured SHT agrees with FastSphericalHarmonics" begin
+    lmax, J = 16, 3
+    Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)
+    SC = ScatteringTransforms.SphericalCore
+    for gfun in ((θ, φ) -> cos(θ)^2 - 1/3 + 0.5sin(θ) * cos(φ),      # band-limited to ℓ ≤ 2
+                 (θ, φ) -> sin(θ)^2 * cos(2φ) + 0.6cos(θ))
+        f = [gfun(θ, φ) for θ in Θ, φ in Φ]
+        sdir = ScatteringTransforms.structured_spherical_scattering(lmax, J; spectral = SC.DirectSHTBackend())
+        sfsh = ScatteringTransforms.structured_spherical_scattering(lmax, J; spectral = SC.SHTBackend())
+        Test.@test sdir.plan isa SC.DirectSHTSphericalPlan
+        rdir, rfsh = sdir(f), sfsh(f)
+        Test.@test rdir.S0 ≈ rfsh.S0 atol = 1e-8
+        Test.@test maximum(abs.(rdir.S1 .- rfsh.S1)) / maximum(abs.(rfsh.S1)) < 0.01
+        Test.@test maximum(abs.(rdir.S2 .- rfsh.S2)) / (maximum(abs.(rfsh.S2)) + eps()) < 0.05
+    end
+end

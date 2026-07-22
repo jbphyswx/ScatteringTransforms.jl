@@ -51,6 +51,7 @@ include("ScatteringFields.jl")
 include("Scattering1D.jl")
 include("Scattering2D.jl")
 include("Scattering3D.jl")
+include("ScatteredPlanar.jl")
 include("SubsampledScattering.jl")
 include("Reductions.jl")
 include("Monogenic.jl")
@@ -181,36 +182,59 @@ function scattering_batch(b::Backends.AbstractExecutionBackend, st, X)
         "(GPUBackend)."))
 end
 
-# Nonuniform / scattered planar scattering via NUFFT; method added by the FINUFFT extension.
+# Nonuniform / scattered planar scattering. Dependency-free by default (exact direct-summation NUDFT
+# in `Plans`); the FINUFFT extension supplies a faster spectral plan for the same cascade.
 """
-    scattered_planar_scattering(x, y, ms, J; L=8, max_order=2, T=Float64, period=nothing,
-                                solve=false, weights=nothing, eps=..., maxiter=100, rtol=1e-8)
+    scattered_planar_scattering(x, y, ms, J; L=8, max_order=2, T=Float64,
+                                spectral=Plans.AutoSpectral(), period=nothing, solve=false,
+                                weights=nothing, eps=nothing, maxiter=100, rtol=1e-8)
 
 Build a 2D planar scattering transform for a scalar field sampled at scattered points `(x, y)`, using
 the same oriented Morlet wavelet bank as the gridded [`ScatteringTransform2D`] but computing the
-wavelet convolutions on a uniform Fourier **mode grid** of size `ms = (m1, m2)` via a NUFFT: analysis
-maps the scattered points to the mode grid, the wavelet multiply happens there, and synthesis
+wavelet convolutions on a uniform Fourier **mode grid** of size `ms = (m1, m2)` via a nonuniform DFT:
+analysis maps the scattered points to the mode grid, the wavelet multiply happens there, and synthesis
 evaluates the filtered field back at the points. Apply it to a length-`M` vector of samples.
 
-`period` is the physical domain size per axis (the Fourier period); it defaults so that a uniform
-`0:m-1` grid reproduces the gridded FFT transform exactly. `solve=false` uses the fast NUFFT adjoint
-(type-1) — exact for adequately-sampled band-limited fields, approximate on gappy/irregular data;
-`solve=true` uses a conjugate-gradient least-squares inversion for the true band-limited coefficients
-(slower, needed for irregular sampling). `weights` (length `M`, summing to 1) sets the quadrature for
-the spatial mean; the default is the uniform sample mean. Requires `using FINUFFT`.
+`spectral` selects the transform: [`Plans.DirectNUFFTBackend`](@ref ScatteringTransforms.Plans.DirectNUFFTBackend)
+is the in-core, dependency-free exact NUDFT (always available, `O(M·prod(ms))`);
+[`Plans.NUFFTBackend`](@ref ScatteringTransforms.Plans.NUFFTBackend) uses the FINUFFT fast path (needs
+`using FINUFFT`); [`Plans.AutoSpectral`](@ref ScatteringTransforms.Plans.AutoSpectral) (the default)
+picks FINUFFT if its extension is loaded, else the direct sum. `period` is the physical domain size per
+axis (the Fourier period); it defaults so a uniform `0:m-1` grid reproduces the gridded FFT transform
+exactly. `solve=false` uses the fast adjoint (type-1) — exact for adequately-sampled band-limited
+fields, approximate on gappy/irregular data; `solve=true` uses a conjugate-gradient least-squares
+inversion for the true band-limited coefficients (slower, needed for irregular sampling). `weights`
+(length `M`, summing to 1) sets the quadrature for the spatial mean; the default is the uniform sample
+mean. `eps` is the FINUFFT tolerance (ignored by the exact direct sum).
 """
-scattered_planar_scattering(args...; kwargs...) = throw(ArgumentError(
-    "scattered / nonuniform planar scattering requires the FINUFFT extension — run `using FINUFFT`."))
+scattered_planar_scattering(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, J::Int; kwargs...) =
+    ScatteredPlanar.build(x, y, ms, J; kwargs...)
 
-# Spherical scattering on S² (scattered points); method added by the NUFSHT extension.
+# Spherical scattering on S² (scattered points). Dependency-free by default (in-core direct real-SH
+# least-squares transform in `SphericalCore`); the NUFSHT extension supplies a faster spectral plan.
 """
-    spherical_scattering(pts_theta, pts_phi, lmax, J; max_order=2)
+    spherical_scattering(pts_theta, pts_phi, lmax, J; max_order=2, spectral=Plans.AutoSpectral(),
+                         rtol=1e-8, maxiter=500)
 
-Build a spherical scattering transform for a scalar field at scattered points `(θ, φ)` on S²,
-using smooth difference-of-Gaussians band-pass wavelets. Requires `using NUFSHT`.
+Build a spherical scattering transform for a scalar field at scattered points `(θ, φ)` on S², using
+smooth difference-of-Gaussians band-pass wavelets. `spectral` selects the spherical-harmonic transform:
+[`SphericalCore.DirectSHTBackend`](@ref ScatteringTransforms.SphericalCore.DirectSHTBackend) is the
+in-core, dependency-free exact least-squares transform (always available, `O(M·(lmax+1)²)`);
+[`SphericalCore.NUSHTBackend`](@ref ScatteringTransforms.SphericalCore.NUSHTBackend) uses the NUFSHT
+fast path (needs `using NUFSHT`); [`Plans.AutoSpectral`](@ref ScatteringTransforms.Plans.AutoSpectral)
+(the default) picks NUFSHT if its extension is loaded, else the direct transform. Accurate analysis
+needs the sampling to resolve the band limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed points.
 """
-spherical_scattering(args...; kwargs...) = throw(ArgumentError(
-    "spherical scattering requires the NUFSHT extension — run `using NUFSHT`."))
+function spherical_scattering(pts_theta::AbstractVector{TT}, pts_phi::AbstractVector, lmax::Int, J::Int;
+                              max_order::Int = 2,
+                              spectral::Plans.AbstractSpectralBackend = Plans.AutoSpectral(),
+                              rtol::Real = 1.0e-8, maxiter::Int = 500) where {TT<:Real}
+    T = float(TT)
+    plan = SphericalCore.make_spherical_plan(spectral, pts_theta, pts_phi, lmax, T;
+                                             rtol = rtol, maxiter = maxiter)
+    return SphericalCore.SphericalScattering{T, typeof(plan)}(lmax, J, max_order, plan,
+                                                              SphericalCore.dog_sigma2(lmax, J, T))
+end
 
 # Spherical *monogenic* scattering on S² (scattered points); method added by the NUFSHT extension.
 """
@@ -221,48 +245,68 @@ Build a **monogenic** spherical scattering transform for a scalar field at scatt
 `A_j = √(U⁰_j² + |U^R_j|²)`, where `U⁰_j` is the difference-of-Gaussians band-pass and `U^R_j` is
 the spin-1 Riesz field `R = ð∘(−Δ_S)^{-1/2}`. The Riesz energy `|U^R_j|² = |∇_S g_j|²` (with
 `g_j = (−Δ_S)^{-1/2} U⁰_j`) is evaluated using only spin-0 spherical-harmonic transforms via the
-identity `|∇_S g|² = ½ Δ_S(g²) − g Δ_S g`, so no spin-weighted synthesis is required. Requires
-`using NUFSHT`.
+identity `|∇_S g|² = ½ Δ_S(g²) − g Δ_S g`, so no spin-weighted synthesis is required. `spectral`
+selects the spherical-harmonic transform as in [`spherical_scattering`](@ref) (dependency-free
+`SphericalCore.DirectSHTBackend` by default, NUFSHT fast path when loaded).
 """
-spherical_monogenic_scattering(args...; kwargs...) = throw(ArgumentError(
-    "spherical monogenic scattering requires the NUFSHT extension — run `using NUFSHT`."))
+function spherical_monogenic_scattering(pts_theta::AbstractVector{TT}, pts_phi::AbstractVector,
+                                        lmax::Int, J::Int; max_order::Int = 2,
+                                        spectral::Plans.AbstractSpectralBackend = Plans.AutoSpectral(),
+                                        rtol::Real = 1.0e-8, maxiter::Int = 500) where {TT<:Real}
+    T = float(TT)
+    plan = SphericalCore.make_spherical_plan(spectral, pts_theta, pts_phi, lmax, T;
+                                             rtol = rtol, maxiter = maxiter)
+    return SphericalCore.SphericalMonogenicScattering{T, typeof(plan)}(lmax, J, max_order, plan,
+                                                              SphericalCore.dog_sigma2(lmax, J, T))
+end
 
-# Structured (uniform) spherical scattering via a fast SHT on a Clenshaw–Curtis grid; methods added
-# by the FastSphericalHarmonics extension. The structured analogue of the scattered
-# `spherical_scattering` (NUFSHT).
+# Structured (uniform-grid) spherical scattering on the equiangular grid. Dependency-free by default
+# (in-core direct SHT on the grid); the FastSphericalHarmonics extension supplies the fast exact SHT.
 """
-    structured_spherical_scattering(lmax, J; max_order=2)
+    structured_spherical_scattering(lmax, J; max_order=2, spectral=Plans.AutoSpectral(), T=Float64,
+                                    rtol=1e-8, maxiter=500)
 
-Build a spherical scattering transform for a scalar field sampled on the structured Clenshaw–Curtis
-grid of a fast spherical-harmonic transform (`Nθ = lmax+1`, `Nφ = 2lmax+1`), using the same smooth
-difference-of-Gaussians band-pass wavelets as [`spherical_scattering`](@ref). Apply it to a
-`(Nθ, Nφ)` grid of samples; obtain the grid points with [`structured_sphere_points`](@ref).
-Requires `using FastSphericalHarmonics`.
+Build a spherical scattering transform for a scalar field sampled on the structured equiangular grid
+(`Nθ = lmax+1` colatitudes, `Nφ = 2lmax+1` longitudes), using the same smooth difference-of-Gaussians
+band-pass wavelets as [`spherical_scattering`](@ref). Apply it to a `(Nθ, Nφ)` grid of samples; obtain
+the grid points with [`structured_sphere_points`](@ref). `spectral` selects the transform:
+[`SphericalCore.DirectSHTBackend`](@ref ScatteringTransforms.SphericalCore.DirectSHTBackend) (in-core,
+dependency-free) by default, or [`SphericalCore.SHTBackend`](@ref ScatteringTransforms.SphericalCore.SHTBackend)
+(the fast exact SHT, needs `using FastSphericalHarmonics`); `Plans.AutoSpectral` picks the fast path if
+its extension is loaded, else the direct SHT.
 """
-structured_spherical_scattering(args...; kwargs...) = throw(ArgumentError(
-    "structured spherical scattering requires the FastSphericalHarmonics extension — run " *
-    "`using FastSphericalHarmonics`."))
+function structured_spherical_scattering(lmax::Int, J::Int; max_order::Int = 2,
+                                         spectral::Plans.AbstractSpectralBackend = Plans.AutoSpectral(),
+                                         T::Type = Float64, rtol::Real = 1.0e-8, maxiter::Int = 500)
+    plan = SphericalCore.make_structured_plan(spectral, lmax, T; rtol = rtol, maxiter = maxiter)
+    return SphericalCore.SphericalScattering{T, typeof(plan)}(lmax, J, max_order, plan,
+                                                              SphericalCore.dog_sigma2(lmax, J, T))
+end
 
 """
-    structured_spherical_monogenic_scattering(lmax, J; max_order=2)
+    structured_spherical_monogenic_scattering(lmax, J; max_order=2, spectral=Plans.AutoSpectral(),
+                                              T=Float64, rtol=1e-8, maxiter=500)
 
-Structured-grid counterpart of [`spherical_monogenic_scattering`](@ref) (fast SHT on a
-Clenshaw–Curtis grid). Requires `using FastSphericalHarmonics`.
+Structured-grid counterpart of [`spherical_monogenic_scattering`](@ref). `spectral` selects the SH
+transform as in [`structured_spherical_scattering`](@ref) (dependency-free direct SHT by default, fast
+exact SHT with `using FastSphericalHarmonics`).
 """
-structured_spherical_monogenic_scattering(args...; kwargs...) = throw(ArgumentError(
-    "structured spherical monogenic scattering requires the FastSphericalHarmonics extension — run " *
-    "`using FastSphericalHarmonics`."))
+function structured_spherical_monogenic_scattering(lmax::Int, J::Int; max_order::Int = 2,
+                                         spectral::Plans.AbstractSpectralBackend = Plans.AutoSpectral(),
+                                         T::Type = Float64, rtol::Real = 1.0e-8, maxiter::Int = 500)
+    plan = SphericalCore.make_structured_plan(spectral, lmax, T; rtol = rtol, maxiter = maxiter)
+    return SphericalCore.SphericalMonogenicScattering{T, typeof(plan)}(lmax, J, max_order, plan,
+                                                              SphericalCore.dog_sigma2(lmax, J, T))
+end
 
 """
     structured_sphere_points(lmax) -> (Θ, Φ)
 
-Colatitudes `Θ` (length `lmax+1`) and longitudes `Φ` (length `2lmax+1`) of the Clenshaw–Curtis grid
-used by [`structured_spherical_scattering`](@ref); sample a field as `[f(θ, φ) for θ in Θ, φ in Φ]`.
-Requires `using FastSphericalHarmonics`.
+Colatitudes `Θ` (length `lmax+1`) and longitudes `Φ` (length `2lmax+1`) of the equiangular structured
+grid used by [`structured_spherical_scattering`](@ref); sample a field as
+`[f(θ, φ) for θ in Θ, φ in Φ]`. In-core (no dependency); matches `FastSphericalHarmonics.sph_points`.
 """
-structured_sphere_points(args...; kwargs...) = throw(ArgumentError(
-    "structured_sphere_points requires the FastSphericalHarmonics extension — run " *
-    "`using FastSphericalHarmonics`."))
+structured_sphere_points(lmax::Int) = SphericalCore.structured_grid(lmax, Float64)
 
 """
     spherical_monogenic_components(st, field, j) -> (; bandpass, riesz, amplitude, phase, orientation)
@@ -272,11 +316,20 @@ the planar [`monogenic_components`](@ref ScatteringTransforms.Monogenic.monogeni
 the band-pass field `bandpass = U⁰_j`, the spin-1
 Riesz tangent vector `riesz = (u_θ, u_φ)` (`U^R_j = ð∘(−Δ_S)^{-1/2} U⁰_j`), the monogenic `amplitude`
 `√(U⁰² + ‖U^R‖²)`, the `phase = atan(‖U^R‖, U⁰)`, and the local `orientation = atan(u_φ, u_θ)` of the
-Riesz vector. Uses spin-weighted scattered synthesis from NUFSHT (`st` is a
-[`spherical_monogenic_scattering`](@ref) transform). Requires `using NUFSHT`.
+Riesz vector. `st` is a [`spherical_monogenic_scattering`](@ref) transform. With the in-core direct SH
+plan (dependency-free) the Riesz field is synthesized as the surface gradient of `g = (−Δ_S)^{-1/2}U⁰`;
+with a NUFSHT-backed plan it uses spin-weighted synthesis — the two agree to solver accuracy.
 """
 spherical_monogenic_components(args...; kwargs...) = throw(ArgumentError(
-    "spherical monogenic components requires the NUFSHT extension — run `using NUFSHT`."))
+    "spherical_monogenic_components expects a `spherical_monogenic_scattering` transform (with an " *
+    "in-core direct SH plan or a NUFSHT-backed plan) plus a field and scale index."))
+
+# Dependency-free pointwise monogenic decomposition on the in-core direct SH plan: the spin-1 Riesz
+# field is synthesized as the surface gradient of g (see `SphericalCore.direct_monogenic_components`).
+# The NUFSHT extension provides the equivalent via spin-weighted synthesis for its plan.
+spherical_monogenic_components(st::SphericalCore.SphericalMonogenicScattering{<:Any, <:SphericalCore.DirectSHTSphericalPlan},
+                               field::AbstractVector, j::Int) =
+    SphericalCore.direct_monogenic_components(st, field, j)
 
 """
     scattering_loss(c, target) -> Real

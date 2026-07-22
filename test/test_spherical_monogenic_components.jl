@@ -43,3 +43,29 @@ Test.@testset "Spherical monogenic components (spin-1 orientation/phase on S²)"
     fα = Float64[real(NUFSHT.sYlm(0, ℓ0, 0, θ[k], φ[k])) for k in 1:M]       # m=0 ⇒ φ-invariant
     Test.@test comp.amplitude ≈ ScatteringTransforms.spherical_monogenic_components(st, fα, j).amplitude
 end
+
+# Same validation for the in-core dependency-free direct SH backend (no NUFSHT for the transform — the
+# spin-1 Riesz field is the surface gradient of g). Band-pass = b_j(ℓ0)·Y_{ℓ0,0} and Riesz vector =
+# b_j(ℓ0)·₁Y_{ℓ0,0}, matching the closed-form spin-weighted harmonic (`sYlm` is used only as the
+# analytic reference here).
+Test.@testset "Spherical monogenic components: dependency-free direct SH backend" begin
+    lmax, J, M = 16, 3, 1200
+    gr = (sqrt(5) - 1) / 2
+    θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φ = [2π * mod(k * gr, 1) for k in 1:M]
+    SC = ScatteringTransforms.SphericalCore
+    st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J; spectral = SC.DirectSHTBackend())
+    Test.@test st.plan isa SC.DirectSHTSphericalPlan
+    ℓ0 = 5
+    sig = SC.dog_sigma2(lmax, J, Float64)
+    bvals = [SC.band_multiplier(sig[j + 1], sig[j])(ℓ0) for j in 1:J]
+    j = argmax(abs.(bvals)); bl = bvals[j]
+    field = Float64[real(NUFSHT.sYlm(0, ℓ0, 0, θ[k], φ[k])) for k in 1:M]     # band-limited (ℓ = ℓ0)
+    comp = ScatteringTransforms.spherical_monogenic_components(st, field, j)
+    Test.@test comp.amplitude ≈ sqrt.(comp.bandpass .^ 2 .+ comp.riesz[1] .^ 2 .+ comp.riesz[2] .^ 2)
+    Test.@test all(comp.amplitude .>= abs.(comp.bandpass) .- 1e-10)
+    Test.@test comp.bandpass ≈ bl .* field rtol = 1e-5
+    URc = comp.riesz[1] .+ im .* comp.riesz[2]
+    ref = Complex{Float64}[bl * NUFSHT.sYlm(1, ℓ0, 0, θ[k], φ[k]) for k in 1:M]
+    Test.@test maximum(abs.(URc .- ref)) / maximum(abs.(ref)) < 1e-5
+end

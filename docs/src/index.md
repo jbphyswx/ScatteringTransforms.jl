@@ -20,8 +20,9 @@ are the same.
   difference-of-Gaussians bands).
 - **Grid-support matrix**: Cartesian × spherical, on uniform/structured and nonuniform/scattered
   sampling — gridded `ScatteringTransform{1,2,3}D` (FFT), scattered-planar `scattered_planar_scattering`
-  (NUFFT), structured-sphere `structured_spherical_scattering` (fast SHT), scattered-sphere
-  `spherical_scattering` (NUFSHT).
+  (exact direct NUDFT), structured-sphere `structured_spherical_scattering` (fast SHT), scattered-sphere
+  `spherical_scattering` (exact direct SHT). Every cell has an in-core, dependency-free default; FINUFFT
+  / NUFSHT are optional fast paths selected via the `spectral` keyword.
 - **Two outputs**: globally-averaged coefficients `st(x)` and the localized (Mallat) field
   `scattering_field(st, x) = (|U_p x| ⋆ φ_J)↓` (their spatial means agree by construction).
 - **Correct path structure**: second order over strictly coarser scales, all orientation pairs.
@@ -103,14 +104,17 @@ orientation (not quantized into bins).
 
 ![Monogenic analysis](assets/monogenic.png)
 
-### Nonuniform / scattered planar grids (NUFFT)
-Off-lattice / gappy planar data is scattered onto a uniform Fourier mode grid by a NUFFT
-(`scattered_planar_scattering`); on a uniform grid it reproduces the gridded FFT transform exactly.
+### Nonuniform / scattered planar grids
+Off-lattice / gappy planar data is scattered onto a uniform Fourier mode grid by a nonuniform DFT
+(`scattered_planar_scattering`); on a uniform grid it reproduces the gridded FFT transform exactly. The
+default is an in-core exact direct NUDFT (no dependencies); `using FINUFFT` enables the faster NUFFT
+path via `spectral = Plans.NUFFTBackend()`.
 
 ![Scattered planar scattering](assets/scattered_planar.png)
 
 ### Spherical scattering
-On S², both **scattered points** (`spherical_scattering`, NUFSHT) and a **structured**
+On S², both **scattered points** (`spherical_scattering`; in-core direct SHT by default, NUFSHT fast
+path when loaded) and a **structured**
 Clenshaw–Curtis grid (`structured_spherical_scattering`, fast SHT) give matching coefficients; the
 monogenic Riesz energy is computed with spin-0 transforms via a Bochner identity, and
 `spherical_monogenic_components` synthesizes the spin-1 Riesz vector for pointwise orientation/phase.

@@ -13,16 +13,13 @@ backend may be `GPUBackend{…}` for multi-GPU with CUDA-aware MPI.
 """
 
 using MPI: MPI
-using ScatteringTransforms: ScatteringTransforms
-
-const ST = ScatteringTransforms
-const MPIBackend = ST.Backends.MPIBackend
+using ScatteringTransforms: ScatteringTransforms as ST
 
 # Contiguous, in-order block of columns assigned to `rank` (0-based) of `nranks` (may be empty).
 _rank_block(ncols::Int, nranks::Int, rank::Int) =
     (div(rank * ncols, nranks) + 1):(div((rank + 1) * ncols, nranks))
 
-function _mpi_batch(b::MPIBackend, st, X, slicer)
+function _mpi_batch(b::ST.Backends.MPIBackend, st, X, slicer)
     MPI.Initialized() ||
         throw(ArgumentError("MPI is not initialized — call `MPI.Init()` before scattering_batch(MPIBackend(), …)."))
     comm = MPI.COMM_WORLD
@@ -43,10 +40,10 @@ function _mpi_batch(b::MPIBackend, st, X, slicer)
     return reshape(recv, flen, ncols)
 end
 
-ST.scattering_batch(b::MPIBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix) =
+ST.scattering_batch(b::ST.Backends.MPIBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix) =
     _mpi_batch(b, st, X, (A, cols) -> A[:, cols])
 
-ST.scattering_batch(b::MPIBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
+ST.scattering_batch(b::ST.Backends.MPIBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
     _mpi_batch(b, st, X, (A, cols) -> A[:, :, cols])
 
 end # module ScatteringTransformsMPIExt

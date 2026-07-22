@@ -125,6 +125,43 @@ end
 make_plan(::AutoSpectral, ::Type{T}, dims) where {T} =
     _have_fftw() ? fftw_plan(T, dims) : DirectSumPlan(T, dims)
 
+"In-core exact direct-summation NUDFT for scattered/nonuniform planar points (dependency-free, `O(M·prod(ms))`)."
+struct DirectNUFFTBackend <: AbstractSpectralBackend end
+
+"FINUFFT fast path for scattered/nonuniform planar points; requires the FINUFFT extension (`using FINUFFT`)."
+struct NUFFTBackend <: AbstractSpectralBackend end
+
+_have_finufft() = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsFINUFFTExt) !== nothing
+
+"""
+    finufft_scattered_plan(x, y, ms, T; period, solve, maxiter, rtol, eps)
+
+Fast-path scattered-planar plan constructor. Declaration only — the FINUFFT extension provides the
+sole method. Call via [`make_scattered_plan`](@ref), which guards on the extension being loaded.
+"""
+function finufft_scattered_plan end
+
+"""
+    make_scattered_plan(spectral, x, y, ms, T; period, solve, maxiter, rtol, eps) -> AbstractScatteringPlan
+
+Build the scattered/nonuniform planar plan selected by `spectral` over points `(x, y)` and a uniform
+mode grid of size `ms`. [`DirectNUFFTBackend`](@ref) is the dependency-free default; [`NUFFTBackend`](@ref)
+(or [`AutoSpectral`](@ref) once the FINUFFT extension is loaded) uses the FINUFFT fast path.
+"""
+function make_scattered_plan(::DirectNUFFTBackend, x, y, ms, ::Type{T}; period = nothing,
+                             solve::Bool = false, maxiter::Int = 100, rtol::Real = 1.0e-8,
+                             eps = nothing) where {T}
+    return DirectNUFFTPlan(x, y, ms, T; period, solve, maxiter, rtol)
+end
+function make_scattered_plan(::NUFFTBackend, x, y, ms, ::Type{T}; kwargs...) where {T}
+    _have_finufft() ||
+        throw(ArgumentError("NUFFTBackend requires the FINUFFT extension. Run `using FINUFFT`."))
+    return finufft_scattered_plan(x, y, ms, T; kwargs...)
+end
+make_scattered_plan(::AutoSpectral, x, y, ms, ::Type{T}; kwargs...) where {T} =
+    _have_finufft() ? finufft_scattered_plan(x, y, ms, T; kwargs...) :
+    make_scattered_plan(DirectNUFFTBackend(), x, y, ms, T; kwargs...)
+
 # ---------------------------------------------------------------------------
 # In-core direct-summation DFT plan (slow but dependency-free default)
 # ---------------------------------------------------------------------------
@@ -295,6 +332,130 @@ function inverse_transform(p::DirectSumPlan{T,V,3}, x::AbstractArray{<:Any,3}) w
         y = _apply_along(_dft_matrix(p.twiddle[d], p.dims[d], true), y, d)
     end
     return y .* inv(T(prod(p.dims)))
+end
+
+# ---------------------------------------------------------------------------
+# Dependency-free scattered / nonuniform planar transform (exact direct-summation NUDFT).
+#
+# The `O(M·prod(ms))` fallback that lets `scattered_planar_scattering` run with no external NUFFT
+# library — the nonuniform counterpart of `DirectSumPlan`. Same numeric contract as the FINUFFT
+# `NUFFTScatteringPlan`: `forward_transform!` is the Type-1 adjoint (points → uniform mode grid), or a
+# conjugate-gradient least-squares inversion when `solve`; `inverse_transform!` is the Type-2 synthesis
+# (modes → points) scaled by `1/prod(ms)`. The mode grid uses FFT ordering, so on a uniform `0:m-1`
+# grid these reduce exactly to `fft`/`ifft` and the lattice matches the wavelet bank's `fftfreq` layout.
+#
+# Exact NUDFT by direct summation, separated per axis (`s = 2π(p−min)/period` scaled coordinates,
+# `f_d` the FFT-ordered integer frequencies):
+#   Type-1:  X[k₁,k₂] = Σ_n c_n · e^{-i f₁[k₁]·sx_n} · e^{-i f₂[k₂]·sy_n}
+#   Type-2:  c_n      = Σ_{k₁,k₂} X[k₁,k₂] · e^{+i f₁[k₁]·sx_n} · e^{+i f₂[k₂]·sy_n}
+# ---------------------------------------------------------------------------
+
+# FFT-ordered integer frequencies for a length-`m` axis: 0,1,…,⌈m/2⌉−1, −⌊m/2⌋,…,−1.
+_fftfreqs(m::Int) = Int[i <= (m - 1) ÷ 2 ? i : i - m for i in 0:(m - 1)]
+
+struct DirectNUFFTPlan{T, EM<:AbstractMatrix{Complex{T}},
+                       CV<:AbstractVector{Complex{T}}} <: AbstractScatteringPlan
+    ms::NTuple{2, Int}
+    M::Int
+    invN::T                 # 1/prod(ms) — makes synthesis the ifft-convention inverse
+    solve::Bool
+    maxiter::Int
+    rtol::T
+    Ex::EM                  # (ms[1], M)  e^{-i f₁[k]·sx_n}
+    Ey::EM                  # (ms[2], M)  e^{-i f₂[k]·sy_n}
+    Exc::EM                 # (ms[1], M)  conj(Ex)
+    Eyc::EM                 # (ms[2], M)  conj(Ey)
+    cj::CV                  # (M) values buffer (shared by Type-1/Type-2)
+    Sbuf::EM                # (M, ms[2]) Type-1 scratch
+    T1::EM                  # (ms[1], M) Type-2 scratch
+    r::EM                   # (ms) CG residual / rhs
+    p::EM                   # (ms) CG search direction
+    Ap::EM                  # (ms) CG A†A·p
+    tmp_pts::CV             # (M) CG scratch (points)
+end
+
+function DirectNUFFTPlan(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, ::Type{T};
+                         period = nothing, solve::Bool = false, maxiter::Int = 100,
+                         rtol::Real = 1.0e-8) where {T}
+    M = length(x)
+    length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
+    xmin, ymin = T(minimum(x)), T(minimum(y))
+    # Default period so a uniform 0:m-1 grid (span m-1) maps to the exact DFT nodes 2π·(0:m-1)/m.
+    px = period === nothing ? (T(maximum(x)) - xmin) * ms[1] / (ms[1] - 1) : T(period[1])
+    py = period === nothing ? (T(maximum(y)) - ymin) * ms[2] / (ms[2] - 1) : T(period[2])
+    sx = T(2π) .* (T.(x) .- xmin) ./ px
+    sy = T(2π) .* (T.(y) .- ymin) ./ py
+    f1, f2 = _fftfreqs(ms[1]), _fftfreqs(ms[2])
+    Ex = Complex{T}[cis(-f1[k] * sx[n]) for k in 1:ms[1], n in 1:M]
+    Ey = Complex{T}[cis(-f2[k] * sy[n]) for k in 1:ms[2], n in 1:M]
+    return DirectNUFFTPlan{T, Matrix{Complex{T}}, Vector{Complex{T}}}(
+        ms, M, one(T) / prod(ms), solve, maxiter, T(rtol),
+        Ex, Ey, conj.(Ex), conj.(Ey),
+        Vector{Complex{T}}(undef, M),
+        Matrix{Complex{T}}(undef, M, ms[2]), Matrix{Complex{T}}(undef, ms[1], M),
+        Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms),
+        Vector{Complex{T}}(undef, M))
+end
+
+# Type-1 (points → modes): X = Ex · (c ⊙ Eyᵀ), all preallocated.
+function _nudft_type1!(X::AbstractMatrix, plan::DirectNUFFTPlan, c::AbstractVector)
+    @inbounds for k2 in 1:plan.ms[2], n in 1:plan.M
+        plan.Sbuf[n, k2] = c[n] * plan.Ey[k2, n]
+    end
+    LinearAlgebra.mul!(X, plan.Ex, plan.Sbuf)
+    return X
+end
+
+# Type-2 (modes → points): c_n = Σ_{k₁} Exc[k₁,n]·(X·Eyc)[k₁,n].
+function _nudft_type2!(c::AbstractVector, plan::DirectNUFFTPlan{T}, X::AbstractMatrix) where {T}
+    LinearAlgebra.mul!(plan.T1, X, plan.Eyc)
+    @inbounds for n in 1:plan.M
+        acc = zero(Complex{T})
+        for k1 in 1:plan.ms[1]
+            acc += plan.Exc[k1, n] * plan.T1[k1, n]
+        end
+        c[n] = acc
+    end
+    return c
+end
+
+inverse_transform!(out_pts::AbstractVector, plan::DirectNUFFTPlan, Xmodes::AbstractMatrix) =
+    (_nudft_type2!(plan.cj, plan, Xmodes); @. out_pts = plan.cj * plan.invN; out_pts)
+
+function forward_transform!(Xmodes::AbstractMatrix, plan::DirectNUFFTPlan, x_pts::AbstractVector)
+    if plan.solve
+        _cg_solve_nudft!(Xmodes, plan, x_pts)
+    else
+        copyto!(plan.cj, x_pts)
+        _nudft_type1!(Xmodes, plan, plan.cj)
+    end
+    return Xmodes
+end
+
+# CG least-squares inversion of the normal equations (A†A)f = A†(N·x), A = Type-2, A† = Type-1 — so
+# synthesis (Type-2/N) of the recovered modes reproduces the sampled values. Mirrors the FINUFFT path.
+function _cg_solve_nudft!(f::AbstractMatrix, plan::DirectNUFFTPlan{T}, x_pts::AbstractVector) where {T}
+    N = one(T) / plan.invN
+    copyto!(plan.cj, x_pts)
+    _nudft_type1!(plan.r, plan, plan.cj)                       # r = A†x  (modes)
+    plan.r .*= N                                               # r = A†(N·x) = rhs
+    fill!(f, zero(Complex{T}))
+    copyto!(plan.p, plan.r)
+    rsold = real(LinearAlgebra.dot(vec(plan.r), vec(plan.r)))
+    rs0 = rsold
+    rs0 == 0 && return f
+    @inbounds for _ in 1:plan.maxiter
+        _nudft_type2!(plan.tmp_pts, plan, plan.p)              # tmp = A·p    (points)
+        _nudft_type1!(plan.Ap, plan, plan.tmp_pts)             # Ap  = A†A·p  (modes)
+        α = rsold / real(LinearAlgebra.dot(vec(plan.p), vec(plan.Ap)))
+        f .+= α .* plan.p
+        plan.r .-= α .* plan.Ap
+        rsnew = real(LinearAlgebra.dot(vec(plan.r), vec(plan.r)))
+        sqrt(rsnew) <= plan.rtol * sqrt(rs0) && break
+        plan.p .= plan.r .+ (rsnew / rsold) .* plan.p
+        rsold = rsnew
+    end
+    return f
 end
 
 end # module Plans

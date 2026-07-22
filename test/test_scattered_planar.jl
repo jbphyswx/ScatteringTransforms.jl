@@ -27,6 +27,19 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         end
     end
 
+    Test.@testset "dependency-free direct NUDFT backend (no external library)" begin
+        # The in-core DirectNUFFTBackend uses exact direct summation, no FINUFFT: on the uniform grid it
+        # must reproduce the gridded FFT transform to machine precision, and match the FINUFFT path.
+        dir = ScatteringTransforms.scattered_planar_scattering(n1, n2, (Ny, Nx), J;
+            L=L, max_order=2, period=(Ny, Nx), spectral=ScatteringTransforms.Plans.DirectNUFFTBackend())
+        Test.@test dir.plan isa ScatteringTransforms.Plans.DirectNUFFTPlan
+        cd = ScatteringTransforms.Coefficients.flatten2d(dir(vec(f)))
+        Test.@test cd ≈ ref rtol=1e-9
+        fin = ScatteringTransforms.scattered_planar_scattering(n1, n2, (Ny, Nx), J;
+            L=L, max_order=2, period=(Ny, Nx), spectral=ScatteringTransforms.Plans.NUFFTBackend())
+        Test.@test cd ≈ ScatteringTransforms.Coefficients.flatten2d(fin(vec(f))) rtol=1e-6
+    end
+
     Test.@testset "S0 is the (weighted) sample mean" begin
         sca = ScatteringTransforms.scattered_planar_scattering(n1, n2, (Ny, Nx), J; L=L, max_order=1, period=(Ny, Nx))
         Test.@test ScatteringTransforms.Coefficients.zeroth_order(sca(vec(f))) ≈ sum(f) / length(f)

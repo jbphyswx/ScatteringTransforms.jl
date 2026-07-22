@@ -19,11 +19,14 @@ Fast, generic wavelet scattering transforms in Julia.
 - **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
   monogenic amplitude + continuous orientation/phase (`monogenic_components`); on S²,
   `spherical_monogenic_scattering` (amplitude via the spin-0 Bochner identity) plus
-  `spherical_monogenic_components` for pointwise orientation/phase (spin-1 Riesz vector, `using NUFSHT`).
+  `spherical_monogenic_components` for pointwise orientation/phase (spin-1 Riesz vector, dependency-free
+  via the surface gradient, or NUFSHT's spin-weighted synthesis when loaded).
 - **Grid-support matrix**: Cartesian × spherical, on uniform/structured and nonuniform/scattered
   sampling — gridded `ScatteringTransform{1,2,3}D` (FFT), scattered-planar `scattered_planar_scattering`
-  (NUFFT, `using FINUFFT`), structured-sphere `structured_spherical_scattering` (fast SHT,
-  `using FastSphericalHarmonics`), and scattered-sphere `spherical_scattering` (NUFSHT).
+  (exact direct NUDFT), structured-sphere `structured_spherical_scattering` (exact direct SHT), and
+  scattered-sphere `spherical_scattering` (exact direct SHT). **Every cell has an in-core,
+  dependency-free default**; `using FINUFFT` / `using NUFSHT` / `using FastSphericalHarmonics` add
+  faster paths selected via the `spectral` keyword.
 - **Pluggable spectral backend**: dependency-free direct-sum default; `using FFTW` switches on
   an `O(N log N)` fast path automatically
   (`spectral = AutoSpectral() | DirectSumBackend() | FFTBackend()`).
@@ -125,18 +128,19 @@ not quantized orientation bins.
 
 ![Monogenic analysis](docs/src/assets/monogenic.png)
 
-### Nonuniform / scattered planar grids (NUFFT)
+### Nonuniform / scattered planar grids
 Off-lattice / gappy planar data (scattered `(x, y)` points) is scattered onto a uniform Fourier mode
-grid by a NUFFT (`scattered_planar_scattering`, `using FINUFFT`), where the ordinary Morlet wavelet
-bank lives; on a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` gives
-the exact band-limited (CG least-squares) inversion for irregular sampling.
+grid by a nonuniform DFT (`scattered_planar_scattering`), where the ordinary Morlet wavelet bank lives;
+on a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` gives the exact
+band-limited (CG least-squares) inversion for irregular sampling. The default is an in-core exact direct
+NUDFT (no dependencies); `using FINUFFT` enables the faster NUFFT path.
 
 ![Scattered planar scattering](docs/src/assets/scattered_planar.png)
 
 ### Spherical scattering
-On S², both **scattered points** (`spherical_scattering`, via NUFSHT) and a **structured**
-Clenshaw–Curtis grid (`structured_spherical_scattering`, via the fast SHT in FastSphericalHarmonics)
-give matching multi-scale coefficients:
+On S², both **scattered points** (`spherical_scattering`; in-core direct SHT by default, NUFSHT fast
+path with `using NUFSHT`) and a **structured** Clenshaw–Curtis grid (`structured_spherical_scattering`,
+via the fast SHT in FastSphericalHarmonics) give matching multi-scale coefficients:
 
 ![Spherical scattering](docs/src/assets/spherical_scattering.png)
 ![Structured spherical scattering](docs/src/assets/structured_spherical.png)

@@ -14,12 +14,8 @@ The spherical average (`sphere_mean`) is the exact Clenshaw–Curtis quadrature 
 from the degree-0 harmonic coefficient (`c₀₀ · Y₀₀`, `Y₀₀ = 1/√(4π)`).
 """
 
-using FastSphericalHarmonics: FastSphericalHarmonics
-using ScatteringTransforms: ScatteringTransforms
-
-const ST = ScatteringTransforms
-const SC = ST.SphericalCore
-const FSH = FastSphericalHarmonics
+using FastSphericalHarmonics: FastSphericalHarmonics as FSH
+using ScatteringTransforms: ScatteringTransforms as ST
 
 """
     SHTSphericalPlan{T} <: SphericalCore.AbstractSphericalPlan
@@ -28,7 +24,7 @@ Structured spherical plan on a Clenshaw–Curtis grid (`N = lmax+1` colatitudes,
 backed by `FastSphericalHarmonics`. The forward SHT is exact for band-limited fields, so this backend
 needs no iterative solve. `FastSphericalHarmonics` supports `Float64` only, so `T == Float64`.
 """
-struct SHTSphericalPlan{T} <: SC.AbstractSphericalPlan
+struct SHTSphericalPlan{T} <: ST.SphericalCore.AbstractSphericalPlan
     lmax::Int
     inv_sqrt4pi::T         # Y₀₀ = 1/√(4π): turns the ℓ=0 coefficient into the spherical mean
 end
@@ -48,7 +44,7 @@ function _apply_degree_multiplier!(C::AbstractMatrix, h, lmax::Int)
 end
 
 # Analysis: exact forward SHT (grid → SH coefficients).
-function SC.sphere_coeffs(plan::SHTSphericalPlan, field::AbstractMatrix)
+function ST.SphericalCore.sphere_coeffs(plan::SHTSphericalPlan, field::AbstractMatrix)
     C = Matrix{Float64}(undef, size(field))
     copyto!(C, field)
     FSH.sph_transform!(C)
@@ -56,7 +52,7 @@ function SC.sphere_coeffs(plan::SHTSphericalPlan, field::AbstractMatrix)
 end
 
 # Apply the per-degree multiplier h(ℓ) to a copy of the coefficients and synthesise back to the grid.
-function SC.sphere_apply!(out::AbstractMatrix, plan::SHTSphericalPlan, C, h)
+function ST.SphericalCore.sphere_apply!(out::AbstractMatrix, plan::SHTSphericalPlan, C, h)
     C2 = copy(C)
     _apply_degree_multiplier!(C2, h, plan.lmax)
     FSH.sph_evaluate!(C2)
@@ -65,7 +61,7 @@ function SC.sphere_apply!(out::AbstractMatrix, plan::SHTSphericalPlan, C, h)
 end
 
 # Exact spherical average via the degree-0 coefficient: ⟨f⟩ = c₀₀ · Y₀₀ (Clenshaw–Curtis quadrature).
-function SC.sphere_mean(plan::SHTSphericalPlan, field::AbstractMatrix)
+function ST.SphericalCore.sphere_mean(plan::SHTSphericalPlan, field::AbstractMatrix)
     C = Matrix{Float64}(undef, size(field))
     copyto!(C, field)
     FSH.sph_transform!(C)
@@ -73,21 +69,15 @@ function SC.sphere_mean(plan::SHTSphericalPlan, field::AbstractMatrix)
 end
 
 # ---------------------------------------------------------------------------
-# Constructors + grid helper (structured-sphere entry points declared in core)
+# Fast-path structured plan constructor (structured-sphere seam declared in SphericalCore). The core
+# `structured_spherical_scattering` / `structured_spherical_monogenic_scattering` build this when
+# `spectral` selects the fast SHT. The grid (`structured_sphere_points`) is computed in core and
+# matches `FSH.sph_points`, so a field sampled there is valid input to this plan.
 # ---------------------------------------------------------------------------
 
-ST.structured_sphere_points(lmax::Int) = FSH.sph_points(lmax + 1)
-
-function ST.structured_spherical_scattering(lmax::Int, J::Int; max_order::Int = 2)
-    plan = SHTSphericalPlan(lmax)
-    return SC.SphericalScattering{Float64, typeof(plan)}(lmax, J, max_order, plan,
-                                                         SC.dog_sigma2(lmax, J, Float64))
-end
-
-function ST.structured_spherical_monogenic_scattering(lmax::Int, J::Int; max_order::Int = 2)
-    plan = SHTSphericalPlan(lmax)
-    return SC.SphericalMonogenicScattering{Float64, typeof(plan)}(lmax, J, max_order, plan,
-                                                                  SC.dog_sigma2(lmax, J, Float64))
+function ST.SphericalCore.fsh_structured_plan(lmax::Int, ::Type{T}) where {T}
+    T === Float64 || throw(ArgumentError("FastSphericalHarmonics supports Float64 only; got $T."))
+    return SHTSphericalPlan(lmax)
 end
 
 end # module ScatteringTransformsFastSphericalHarmonicsExt
