@@ -4,6 +4,10 @@ Symbols are accessed via fully-qualified submodule paths (the package does not r
 its top-level namespace); `using ScatteringTransforms: ScatteringTransforms as ST`, then e.g.
 `ST.Scattering2D.ScatteringTransform2D(...)`.
 
+```@docs
+ScatteringTransforms.ScatteringTransforms
+```
+
 ## Grid-support matrix
 
 Planar (Cartesian) and spherical scattering, on uniform/structured and nonuniform/scattered sampling:
@@ -45,8 +49,9 @@ ScatteringTransforms.structured_sphere_points
 ## Reconstruction & synthesis
 
 ```@docs
-ScatteringTransforms.Inverse.wavelet_transform
-ScatteringTransforms.Inverse.iwavelet
+ScatteringTransforms.Inverse.ReconstructionWorkspace
+ScatteringTransforms.Inverse.wavelet_transform!
+ScatteringTransforms.Inverse.iwavelet!
 ScatteringTransforms.Inverse.reconstruct_phase
 ScatteringTransforms.synthesize
 ScatteringTransforms.scattering_loss
@@ -74,6 +79,7 @@ ScatteringTransforms.ScatteringFields.scattering_field!
 ScatteringTransforms.ScatteringFields.ScatteringField1D
 ScatteringTransforms.ScatteringFields.ScatteringField2D
 ScatteringTransforms.ScatteringFields.path_field
+ScatteringTransforms.ScatteringFields.subsample_factor
 ```
 
 ## Coefficients & reductions
@@ -86,11 +92,18 @@ ScatteringTransforms.Coefficients.first_order
 ScatteringTransforms.Coefficients.second_order
 ScatteringTransforms.Coefficients.flatten1d
 ScatteringTransforms.Coefficients.flatten2d
+ScatteringTransforms.Coefficients.flatten1d!
+ScatteringTransforms.Coefficients.flatten2d!
 ScatteringTransforms.Coefficients.flatten_length
+ScatteringTransforms.Coefficients.flat_length
+ScatteringTransforms.Coefficients.update_S0
 ScatteringTransforms.Scattering2D.compute_shape_sparsity
 ScatteringTransforms.Reductions.normalized_coefficients
 ScatteringTransforms.Reductions.log_coefficients
 ```
+
+`flat_length`'s docstring also covers the row accessors `flat_row_s0`, `flat_row_s1` and
+`flat_row_s2`, which are the layout `flatten1d!`, `flatten2d!` and the batched paths all walk.
 
 ## Batching & backends
 
@@ -142,6 +155,10 @@ ScatteringTransforms.Filters.frequency_response
 ScatteringTransforms.Filters.fibonacci_directions
 ScatteringTransforms.PathGraph.ScatteringTree
 ScatteringTransforms.PathGraph.build_tree
+ScatteringTransforms.PathGraph.order2_groups
+ScatteringTransforms.PathGraph.order_range
+ScatteringTransforms.PathGraph.path_indices
+ScatteringTransforms.PathGraph.npaths
 ```
 
 ## Spectral plans & core operations
@@ -154,7 +171,93 @@ ScatteringTransforms.Plans.inverse_transform!
 ScatteringTransforms.Plans.forward_transform
 ScatteringTransforms.Plans.inverse_transform
 ScatteringTransforms.Plans.make_plan
+ScatteringTransforms.Plans.make_scattered_plan
+ScatteringTransforms.Plans.spectral_backend
+ScatteringTransforms.Plans.task_local_plan
+ScatteringTransforms.Plans.with_fft_nthreads
+ScatteringTransforms.ScatteringCore.wavelet_convolve
 ScatteringTransforms.ScatteringCore.wavelet_convolve!
+ScatteringTransforms.ScatteringCore.apply_modulus
 ScatteringTransforms.ScatteringCore.apply_modulus!
+ScatteringTransforms.ScatteringCore.modulus_mean
+ScatteringTransforms.ScatteringCore.modulus_mean!
 ScatteringTransforms.ScatteringCore.spatial_average
+ScatteringTransforms.ScatteringCore.task_workspace
+```
+
+### Plans supplied by extensions
+
+These are declared in the core and given a method by the corresponding extension. Calling one
+without its package loaded raises with the `using` line to run.
+
+```@docs
+ScatteringTransforms.Plans.fftw_plan
+ScatteringTransforms.Plans.abstractffts_plan
+ScatteringTransforms.Plans.finufft_scattered_plan
+ScatteringTransforms.Plans.nonuniformffts_scattered_plan
+ScatteringTransforms.Plans.FINUFFTBackend
+ScatteringTransforms.Plans.NonuniformFFTsBackend
+```
+
+## Execution backends
+
+```@docs
+ScatteringTransforms.Execution.resolve_backend
+ScatteringTransforms.Execution.check_available
+ScatteringTransforms.Execution.have_threads
+ScatteringTransforms.Execution.have_gpu
+ScatteringTransforms.Execution.have_distributed
+ScatteringTransforms.Execution.have_mpi
+```
+
+## Cascade internals
+
+The cascade each gridded transform runs, and the per-surface in-place entry points.
+
+```@docs
+ScatteringTransforms.Scattering1D.cascade!
+ScatteringTransforms.Scattering2D.cascade!
+ScatteringTransforms.Scattering3D.cascade!
+ScatteringTransforms.ScatteredPlanar.ScatteredPlanarScattering
+ScatteringTransforms.ScatteredPlanar.scattered_planar_scattering!
+ScatteringTransforms.SubsampledScattering.Level
+```
+
+## Spherical scattering
+
+A spherical plan implements three primitives — analysis, multiply-and-synthesise, and the spherical
+mean — and everything above them is shared. The in-core direct plan is always available; NUFSHT and
+FastSphericalHarmonics supply the fast ones.
+
+```@docs
+ScatteringTransforms.SphericalCore.AbstractSphericalPlan
+ScatteringTransforms.SphericalCore.sphere_coeffs
+ScatteringTransforms.SphericalCore.sphere_coeffs!
+ScatteringTransforms.SphericalCore.sphere_coeffs_buffer
+ScatteringTransforms.SphericalCore.sphere_apply!
+ScatteringTransforms.SphericalCore.sphere_mean
+ScatteringTransforms.SphericalCore.SphericalScattering
+ScatteringTransforms.SphericalCore.SphericalMonogenicScattering
+ScatteringTransforms.SphericalCore.SphericalWorkspace
+ScatteringTransforms.SphericalCore.SphericalMonogenicWorkspace
+ScatteringTransforms.SphericalCore.spherical_scattering!
+ScatteringTransforms.SphericalCore.spherical_monogenic_scattering!
+ScatteringTransforms.SphericalCore.monogenic_amplitude!
+ScatteringTransforms.SphericalCore.task_local
+ScatteringTransforms.SphericalCore.band_multiplier
+ScatteringTransforms.SphericalCore.dog_sigma2
+ScatteringTransforms.SphericalCore.structured_grid
+ScatteringTransforms.SphericalCore.make_spherical_plan
+ScatteringTransforms.SphericalCore.make_structured_plan
+ScatteringTransforms.SphericalCore.nusht_spherical_plan
+ScatteringTransforms.SphericalCore.fsh_structured_plan
+```
+
+## Plotting
+
+Methods are supplied by the CairoMakie extension.
+
+```@docs
+ScatteringTransforms.plot_coefficients
+ScatteringTransforms.plot_filter_bank
 ```

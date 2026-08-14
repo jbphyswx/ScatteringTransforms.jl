@@ -20,16 +20,11 @@ export WaveletMeta
 # Mirrors FFTW.fftfreq(N)[k+1].
 @inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
 
-"""
-    _complement_lowpass(wavelets) -> averaging filter φ
-
-Build the scaling function (low-pass averaging filter) as the *complement* of the wavelet
-energy: `|φ(ω)|² = max(0, 1 − Σⱼ|ψⱼ(ω)|²)`. This makes the Littlewood–Paley sum
-`Σⱼ|ψⱼ|² + |φ|² ≡ 1` a (near) tight frame, so the transform is non-expansive (no frequency is
-amplified). The DC bin is pinned to `φ(0)=1` exactly (the wavelets are zero-mean there), which
-keeps the localized-field spatial mean equal to the globally-averaged coefficient.
-Works for 1D/2D/3D filter arrays.
-"""
+# The scaling function (low-pass averaging filter) as the *complement* of the wavelet energy:
+# `|φ(ω)|² = max(0, 1 − Σⱼ|ψⱼ(ω)|²)`. This makes the Littlewood–Paley sum `Σⱼ|ψⱼ|² + |φ|² ≡ 1` a
+# (near) tight frame, so the transform is non-expansive — no frequency is amplified. The DC bin is
+# pinned to `φ(0)=1` exactly (the wavelets are zero-mean there), which keeps the localized-field
+# spatial mean equal to the globally-averaged coefficient. Works for 1D/2D/3D filter arrays.
 function _complement_lowpass(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{Complex{T}}}
     ϕ = similar(first(wavelets))
     @inbounds for i in eachindex(ϕ)
@@ -43,14 +38,11 @@ function _complement_lowpass(wavelets::AbstractVector{A}) where {T, A<:AbstractA
     return ϕ
 end
 
-"""
-    _tight_frame_lowpass!(wavelets) -> averaging filter φ
-
-Globally rescale `wavelets` (in place) so that `max_ω Σⱼ|ψⱼ(ω)|² = 1` — making the transform
-non-expansive — then return the complement low-pass φ, giving a tight frame with
-Littlewood–Paley sum `Σⱼ|ψⱼ|² + |φ|² ≡ 1`. The rescale is a single global constant, so it does
-not change the *relative* coefficient structure.
-"""
+# Globally rescale `wavelets` in place so that `max_ω Σⱼ|ψⱼ(ω)|² = 1` — making the transform
+# non-expansive — then return the complement low-pass φ, giving a tight frame with Littlewood–Paley
+# sum `Σⱼ|ψⱼ|² + |φ|² ≡ 1`. The rescale is a single global constant, so it does not change the
+# *relative* coefficient structure — but it is not 1, so a bank built at another resolution must go
+# through here too or its coefficients land on a different scale.
 function _tight_frame_lowpass!(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{Complex{T}}}
     maxs = zero(T)
     @inbounds for i in eachindex(first(wavelets))

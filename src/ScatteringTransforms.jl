@@ -310,7 +310,7 @@ end
 Transform a stack of `B` fields sampled by the same spherical plan — `X` of size
 `(field_size…, B)`, so `(M, B)` for a scattered point set and `(nθ, nφ, B)` on a structured grid.
 
-Rows follow the flat layout of [`Coefficients.flat_row_s0`](@ref) and friends. The spherical cascade
+Rows follow the flat layout of [`Coefficients.flat_length`](@ref) and its row accessors. The spherical cascade
 pairs each scale with strictly *coarser* ones (`j2 < j1`), so a pair lands in the row that layout
 assigns to the unordered pair, `flat_row_s2(j2, j1, J)`.
 """

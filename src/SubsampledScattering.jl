@@ -83,17 +83,13 @@ _orient_count(fb::FilterBanks.FilterBank1D) = fb.Q
 _orient_count(fb::FilterBanks.FilterBank2D) = fb.L
 _orient_count(fb::FilterBanks.FilterBank3D) = fb.n_orient
 
-"""
-    _build(T, dims, bank_at; J, max_order, oversampling, spectral) -> MultiResolutionScattering
-
-Shared construction. `bank_at(dims)` builds the filter bank on a given grid, so the caller supplies
-the dimension-specific bank and everything else is common.
-
-Reduced-resolution banks go through the same builder as the full one, which is what applies the
-tight-frame normalisation. Building them from bare frequency responses instead leaves out that
-factor (measured `0.90` in 1D and `0.38` in 2D, i.e. not close to 1), which would rescale every
-decimated second-order coefficient.
-"""
+# Shared construction: `bank_at(dims)` builds the filter bank on a given grid, so the caller supplies
+# the dimension-specific bank and everything else here is common.
+#
+# Reduced-resolution banks go through the same builder as the full one, which is what applies the
+# tight-frame normalisation. Building them from bare frequency responses instead leaves out that
+# factor — measured `0.90` in 1D and `0.38` in 2D, so not close to 1 — which would rescale every
+# decimated second-order coefficient.
 function _build(::Type{T}, dims::NTuple{D, Int}, bank_at; J::Int, max_order::Int,
                 oversampling::Int, spectral::SB.AbstractSpectralBackend) where {T, D}
     fb = bank_at(dims)

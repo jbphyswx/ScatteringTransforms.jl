@@ -6,22 +6,30 @@ Documenter.makedocs(
     format = Documenter.HTML(
         prettyurls = get(ENV, "CI", "false") == "true",
         canonical = "https://jbphyswx.github.io/ScatteringTransforms.jl",
+        # The API reference is one page covering every surface, so it runs past the default warning
+        # size. Splitting it would scatter the reference rather than improve it.
+        size_threshold_warn = 300 * 1024,
+        size_threshold = 400 * 1024,
     ),
     modules = [
         ScatteringTransforms,
-        ScatteringTransforms.Backends,
-        ScatteringTransforms.Domains,
+        ScatteringTransforms.Execution,
         ScatteringTransforms.Plans,
         ScatteringTransforms.Filters,
         ScatteringTransforms.FilterBanks,
         ScatteringTransforms.PathGraph,
         ScatteringTransforms.ScatteringCore,
+        ScatteringTransforms.Batched,
         ScatteringTransforms.Coefficients,
         ScatteringTransforms.ScatteringFields,
         ScatteringTransforms.Scattering1D,
         ScatteringTransforms.Scattering2D,
         ScatteringTransforms.Scattering3D,
+        ScatteringTransforms.ScatteredPlanar,
         ScatteringTransforms.SubsampledScattering,
+        ScatteringTransforms.Monogenic,
+        ScatteringTransforms.SphericalCore,
+        ScatteringTransforms.Inverse,
         ScatteringTransforms.Reductions,
     ],
     pages = [
@@ -30,7 +38,6 @@ Documenter.makedocs(
         "API Reference" => "api.md",
     ],
     authors = "Jordan Benjamin",
-    warnonly = true,
 )
 
 Documenter.deploydocs(

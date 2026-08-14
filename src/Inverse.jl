@@ -13,7 +13,7 @@ scattering coefficients themselves, lives in the DifferentiationInterface extens
    (`Σ_λ |ψ̂_λ|² + |φ̂|² ≡ 1`), the dual frame is the frame itself and reconstruction is the
    conjugate-filter sum
    `x̂ = Σ_λ (x ⋆ ψ_λ) ⋆ ψ_λ^* + (x ⋆ φ) ⋆ φ^*` — exact to machine precision.
-   [`wavelet_transform`](@ref) / [`iwavelet`](@ref).
+   [`wavelet_transform!`](@ref) / [`iwavelet!`](@ref).
 
 2. **Phase retrieval** from first-order moduli `|x ⋆ ψ_λ|` (Waldspurger & Mallat 2015):
    alternating projections (Gerchberg–Saxton) — reconstruct via the exact inverse, re-impose the
@@ -78,7 +78,7 @@ end
 The **linear** (pre-modulus) wavelet layer underlying the scattering transform: the complex
 wavelet coefficient fields `wavelet[λ] = x ⋆ ψ_λ` (the continuous wavelet transform) and the
 low-pass field `lowpass = x ⋆ φ`. Together these are an *exact, invertible* representation of
-`x` (see [`iwavelet`](@ref)); taking `|wavelet[λ]|` and averaging is the first scattering layer.
+`x` (see [`iwavelet!`](@ref)); taking `|wavelet[λ]|` and averaging is the first scattering layer.
 """
 function wavelet_transform!(ws::ReconstructionWorkspace, st::GriddedScattering, x::AbstractArray)
     fb, plan = st.filter_bank, st.plan
@@ -99,7 +99,7 @@ wavelet_transform(st::GriddedScattering, x::AbstractArray) =
     iwavelet(st, wt) -> x
     iwavelet!(ws, st, wavelet, lowpass) -> x
 
-Exact inverse of [`wavelet_transform`](@ref) via the tight-frame conjugate-filter sum
+Exact inverse of [`wavelet_transform!`](@ref) via the tight-frame conjugate-filter sum
 `x̂ = Σ_λ ψ̂_λ^* · (x̂·ψ̂_λ) + φ̂^* · (x̂·φ̂)`. Returns the reconstructed **real** field. With the
 tight-frame bank (`Σ|ψ̂_λ|²+|φ̂|² ≡ 1`) this satisfies `iwavelet(st, wavelet_transform(st, x)...) ≈ x`
 to machine precision.
@@ -135,7 +135,7 @@ scattering transform averages), via Gerchberg–Saxton alternating projections:
 
 1. take the linear wavelet transform of the current estimate;
 2. re-impose the target magnitudes on each band-pass channel (keeping the recovered phase);
-3. reconstruct with the exact frame inverse [`iwavelet`](@ref); repeat.
+3. reconstruct with the exact frame inverse [`iwavelet!`](@ref); repeat.
 
 The low-pass channel carries no magnitude target, so it is taken from the current estimate each
 iteration (or from `seed_lowpass` if supplied). The reconstruction is determined only up to a

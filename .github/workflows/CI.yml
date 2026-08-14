@@ -48,6 +48,29 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
         continue-on-error: true
 
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Instantiate docs env
+        run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'   # local package wired via [sources]
+      # `make.jl` runs without `warnonly`, so a missing docstring, a dangling `@ref` or a module that
+      # no longer exists fails here rather than silently shipping a broken reference.
+      - name: Build and deploy
+        run: julia --project=docs docs/make.jl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+
   examples:
     name: Run examples
     runs-on: ubuntu-latest

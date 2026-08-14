@@ -181,12 +181,8 @@ end
 # Localized (Mallat) scattering field: S_p x = (|U_p x| ⋆ φ_J) ↓ s
 # ============================================================================
 
-"""
-    _default_subsample(N, J) -> Int
-
-Default decimation factor for the localized field: `2^(J-1)`, reduced to the largest such
-power of two that divides `N` (so `N % s == 0`).
-"""
+# Default decimation factor for the localized field: `2^(J-1)`, reduced to the largest such power of
+# two that divides `N` (so `N % s == 0`).
 function _default_subsample(N::Int, J::Int)
     ds = 1 << max(0, J - 1)
     while ds > 1 && N % ds != 0
