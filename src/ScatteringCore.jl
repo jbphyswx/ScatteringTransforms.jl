@@ -6,10 +6,10 @@ module ScatteringCore
 Implements the fundamental building blocks: FFT-based convolution,
 modulus, and averaging operations.
 
-Design: All `!` functions are zero-allocation. Non-`!` wrappers allocate
-and delegate to the `!` versions. Spectral transforms go through the plan
-interface (`Plans.inverse_transform!`), so the engine is agnostic to whether
-the backing transform is the in-core direct sum, FFTW, CUFFT, etc.
+All `!` functions are zero-allocation; non-`!` wrappers allocate and delegate
+to them. Spectral transforms go through the plan interface
+(`Plans.inverse_transform!`), so the engine is agnostic to whether the backing
+transform is the in-core direct sum, FFTW, CUFFT, etc.
 """
 
 using LinearAlgebra: LinearAlgebra
@@ -18,7 +18,6 @@ using ..Plans: Plans
 export wavelet_convolve, wavelet_convolve!
 export apply_modulus, apply_modulus!, spatial_average
 export scattering
-export ScatteringLayer
 
 """
     scattering(st, x) -> ScatteringCoefficients
@@ -35,6 +34,18 @@ Use `st(x)` (mutating, zero-alloc) for production forward passes; use `scatterin
 you need to differentiate the forward map (e.g. gradient-descent synthesis).
 """
 function scattering end
+
+"""
+    task_workspace(st) -> st′
+
+A transform equivalent to `st` that shares its read-only parts — filter bank, path tree, work list —
+but owns fresh buffers and a task-local spectral plan, so the two can run concurrently.
+
+This is what lets a parallel backend give each task private scratch without duplicating the filter
+bank, which dominates a transform's memory (for a 256×256 J=4 L=8 transform, 33 MiB of the 38 MiB).
+Methods are defined per transform type.
+"""
+function task_workspace end
 
 """
     wavelet_convolve(signal_fft, filter_fft, plan)
@@ -109,13 +120,31 @@ function spatial_average(signal::AbstractArray)
 end
 
 """
-    ScatteringLayer{V<:AbstractVector{Int}}
+    modulus_mean(signal) -> Real
 
-Represents a layer in the scattering transform network.
+`⟨|signal|⟩` in a single reduction. A scattering coefficient is the mean of a modulus, so the
+modulus field itself is never needed unless a coarser scale consumes it — this is the leaf case,
+which writes nothing.
 """
-struct ScatteringLayer{V<:AbstractVector{Int}}
-    order::Int          # 0, 1, 2, ...
-    scale_indices::V    # Which scales are used (generic array type)
+modulus_mean(signal::AbstractArray) = sum(abs, signal) / length(signal)
+
+"""
+    modulus_mean!(out, signal) -> Real
+
+Write `|signal|` into `out` and return `⟨|signal|⟩`. Used where the modulus field *is* consumed
+downstream; the generic method is two device-friendly passes, the CPU method fuses them into one.
+"""
+modulus_mean!(out::AbstractArray, signal::AbstractArray) =
+    (@. out = abs(signal); sum(out) / length(out))
+
+function modulus_mean!(out::Array{T}, signal::Array{Complex{T}}) where {T <: Real}
+    acc = zero(T)
+    @inbounds @simd for i in eachindex(out, signal)
+        v = abs(signal[i])
+        out[i] = v
+        acc += v
+    end
+    return acc / length(out)
 end
 
 end # module ScatteringCore

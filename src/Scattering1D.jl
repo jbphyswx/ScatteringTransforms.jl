@@ -8,6 +8,8 @@ Implements first- and second-order 1D scattering transforms.
 
 # Import sibling modules
 using ..Plans: Plans
+using ComputationalBackends: ComputationalBackends as CB
+using SpectralBackends: SpectralBackends as SB
 using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Coefficients: Coefficients
@@ -15,66 +17,76 @@ using ..PathGraph: PathGraph
 using ..ScatteringFields: ScatteringFields
 
 export ScatteringTransform1D
-export scattering_transform!, compute_S1!, compute_S2!
+export scattering_transform!, cascade!
 
 """
-    ScatteringTransform1D{T}
+    ScatteringTransform1D{T,V,M,P,Tree,FB,G}
 
-1D scattering transform with configurable parameters and workspace buffers.
+1D scattering transform: a filter bank, the admissible path tree, a spectral plan, and the
+workspace the cascade runs in. Every array field is a type parameter, so the same struct holds CPU,
+GPU or static storage.
 
 # Fields
-- `filter_bank::FilterBanks.FilterBank1D{T,V}`: Pre-computed filter bank
-- `max_order::Int`: Maximum scattering order (1 or 2)
+- `filter_bank`: pre-computed 1D filter bank
+- `tree`: admissible scattering paths
+- `groups`: `(j1, children)` from `tree`, longest-first — the order the cascade walks
+- `max_order`: maximum scattering order (1 or 2)
 - `plan`: spectral transform plan (in-core direct sum by default; FFTW fast path if loaded)
-- `buffer_input`: Complex buffer for real→complex cast of input (zero alloc)
-- `buffer_signal_fft`: Complex buffer holding the FFT of the input signal (preserved across S1/S2 passes)
-- `buffer_conv`: Complex buffer for convolution output (IFFT result)
-- `buffer_mod`: Real buffer for modulus output
-- `U1_buffers`: Vector of real buffers for S2 computation (one per wavelet)
-- `U1_fft_buffers`: Vector of complex buffers for FFT of U1 (one per wavelet)
+- `buffer_input`: complex buffer for real→complex promotion, and multiply scratch
+- `buffer_signal_fft`: the input spectrum, read-only for the whole cascade
+- `buffer_conv`: inverse-transform output
+- `buffer_mod`: real modulus buffer for the localized-field path
+- `buffer_u1`, `buffer_u1_fft`: the current first-order modulus and its spectrum, reused across
+  that wavelet's children — one pair, not one per wavelet
 """
 struct ScatteringTransform1D{T, V<:AbstractVector{Complex{T}}, M<:AbstractVector{T},
                              P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
-                             FB<:FilterBanks.FilterBank1D, UB<:AbstractVector, UF<:AbstractVector}
+                             FB<:FilterBanks.FilterBank1D, G<:AbstractVector}
     filter_bank::FB         # any FilterBank1D (CPU/GPU/static/…), kept as a type param
     tree::Tree              # admissible scattering paths (source of truth for second-order)
+    groups::G               # (j1, children) from the tree, longest-first — the cascade's work list
     max_order::Int
     plan::P                 # spectral plan (direct-sum default, FFTW fast path); concrete type param
     buffer_input::V         # complex buffer for real→complex promotion of input
-    buffer_signal_fft::V    # preserves signal FFT across S1/S2 passes
+    buffer_signal_fft::V    # preserves signal FFT across the whole cascade
     buffer_conv::V          # convolution / inverse-transform output
-    buffer_mod::M           # real modulus buffer
-    U1_buffers::UB          # per-wavelet first-order moduli (S2)
-    U1_fft_buffers::UF      # per-wavelet U1 transforms (S2)
+    buffer_mod::M           # real modulus buffer (localized-field path)
+    buffer_u1::M            # first-order modulus of the current j1
+    buffer_u1_fft::V        # its spectrum, reused across that j1's children
 end
 
-function ScatteringTransform1D(N::Int, J::Int;
+"""
+    ScatteringTransform1D([T=Float64,] N, J; Q=1, max_order=2, spectral=AutoSpectralBackend())
+
+Build a 1D scattering transform for length-`N` signals over `J` octaves. The element type is
+positional, as for `zeros(T, …)`; omit it for `Float64`.
+"""
+function ScatteringTransform1D(::Type{T}, N::Int, J::Int;
                                Q::Int=1,
                                max_order::Int=2,
-                               T::Type=Float64,
-                               spectral::Plans.AbstractSpectralBackend=Plans.AutoSpectral())
-    filter_bank = FilterBanks.build_filter_bank1d(N, J; Q=Q, T=T)
+                               spectral::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T}
+    filter_bank = FilterBanks.build_filter_bank1d(T, N, J; Q=Q)
     tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+    groups = max_order >= 2 ? PathGraph.order2_groups(tree, length(filter_bank.wavelets)) :
+             [(j, Int[], Int[]) for j in 1:length(filter_bank.wavelets)]
     plan = Plans.make_plan(spectral, T, (N,))
 
     dummy = zeros(Complex{T}, N)
-    num_w = length(filter_bank.wavelets)
-    buffer_input      = similar(dummy)
-    buffer_signal_fft = similar(dummy)
-    buffer_conv       = similar(dummy)
-    buffer_mod        = Vector{T}(undef, N)
-    if max_order >= 2
-        U1_buffers     = [Vector{T}(undef, N) for _ in 1:num_w]
-        U1_fft_buffers = [similar(dummy) for _ in 1:num_w]
-    else
-        U1_buffers     = Vector{T}[]
-        U1_fft_buffers = Vector{Complex{T}}[]
-    end
-    # auto field constructor infers all type parameters
-    return ScatteringTransform1D(filter_bank, tree, max_order, plan,
-                                 buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
-                                 U1_buffers, U1_fft_buffers)
+    # Workspace is O(N), not O(nw·N): the cascade holds one first-order modulus and its spectrum at
+    # a time, because it finishes every child of a `j1` before moving to the next.
+    return ScatteringTransform1D(filter_bank, tree, groups, max_order, plan,
+                                 similar(dummy), similar(dummy), similar(dummy),
+                                 Vector{T}(undef, N), Vector{T}(undef, N), similar(dummy))
 end
+ScatteringTransform1D(N::Int, J::Int; kwargs...) = ScatteringTransform1D(Float64, N, J; kwargs...)
+
+# Shares filter bank / tree / groups; copies only the buffers and the plan's scratch.
+ScatteringCore.task_workspace(st::ScatteringTransform1D) =
+    ScatteringTransform1D(st.filter_bank, st.tree, st.groups, st.max_order,
+                          Plans.task_local_plan(st.plan),
+                          similar(st.buffer_input), similar(st.buffer_signal_fft),
+                          similar(st.buffer_conv), similar(st.buffer_mod),
+                          similar(st.buffer_u1), similar(st.buffer_u1_fft))
 
 """
     (st::ScatteringTransform1D)(signal) -> ScatteringCoefficients1D
@@ -96,95 +108,73 @@ end
 """
     scattering_transform!(coeffs, st, signal)
 
-In-place scattering transform. Fills pre-allocated S1/S2, returns new struct with updated S0.
-Zero allocations: uses `buffer_input` for real→complex promotion, `mul!` for FFT.
-Only allocates a new wrapper struct when S0 is a scalar (immutable).
+In-place scattering transform. Fills pre-allocated S1/S2, returns the coefficients with S0 updated.
+Allocation-free; only allocates a new wrapper struct when S0 is a scalar (immutable).
 """
 function scattering_transform!(coeffs::Coefficients.ScatteringCoefficients1D,
                               st::ScatteringTransform1D,
                               signal::AbstractVector)
-    # Zero-alloc real→complex: write into pre-allocated buffer_input
     st.buffer_input .= complex.(signal)
-    
-    # Zero-alloc FFT: mul!(out, plan, src) writes FFT(buffer_input) into buffer_signal_fft
     Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
-    
-    # S1: First order — passes buffer_signal_fft as signal_fft.
-    # NOTE: compute_S1! will overwrite buffer_conv but NOT buffer_signal_fft.
-    compute_S1!(coeffs.S1, st, st.buffer_signal_fft)
-    
-    # S2: Second order — also uses buffer_signal_fft (still intact)
-    if st.max_order >= 2
-        compute_S2!(coeffs.S2, st, st.buffer_signal_fft)
-    end
-    
-    # S0: 0th order - use dispatch-based update
-    S0_val = ScatteringCore.spatial_average(signal)
-    return Coefficients.update_S0(coeffs, S0_val)
+    cascade!(coeffs.S1, coeffs.S2, st, st.buffer_signal_fft)
+    return Coefficients.update_S0(coeffs, ScatteringCore.spatial_average(signal))
 end
 
 """
-    compute_S1!(S1, st, signal_fft)
+    scattering_transform!(coeffs, backend, st, signal)
 
-Compute first-order scattering coefficients in-place using workspace buffers.
-Zero allocations: `buffer_input` is used as the pointwise-multiply scratch,
-`buffer_conv` receives the IFFT output (no aliasing).
+Transform one signal on an explicit execution backend. `SerialBackend` runs the cascade in this
+task; `ThreadedBackend` (OhMyThreads extension) spreads the first-order wavelet groups across
+tasks, which is the only parallel axis available when there is a single field rather than a batch.
+The input transform is done once up front, so only the group loop is parallel.
 """
-function compute_S1!(S1::AbstractVector, st::ScatteringTransform1D, 
-                     signal_fft::AbstractVector)
-    @inbounds for (j, ψ_fft) in enumerate(st.filter_bank.wavelets)
-        # buffer_input = scratch for multiply; buffer_conv = IFFT output (non-aliased)
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, signal_fft, ψ_fft, 
-                                          st.plan, st.buffer_input)
-        
-        # In-place modulus into buffer_mod
-        ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
-        
-        # Average and store
-        S1[j] = ScatteringCore.spatial_average(st.buffer_mod)
-    end
-    return S1
+function scattering_transform!(coeffs::Coefficients.ScatteringCoefficients1D,
+                               backend::CB.AbstractExecutionBackend,
+                               st::ScatteringTransform1D, signal::AbstractVector)
+    st.buffer_input .= complex.(signal)
+    Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
+    cascade!(coeffs.S1, coeffs.S2, backend, st, st.buffer_signal_fft)
+    return Coefficients.update_S0(coeffs, ScatteringCore.spatial_average(signal))
 end
 
-"""
-    compute_S2!(S2, st, signal_fft)
+cascade!(S1::AbstractVector, S2::AbstractMatrix, ::CB.AbstractSerialBackend,
+         st::ScatteringTransform1D, signal_fft::AbstractVector) = cascade!(S1, S2, st, signal_fft)
 
-Compute second-order scattering coefficients in-place using workspace buffers.
-Zero allocations: uses `U1_fft_buffers` (pre-allocated per-wavelet FFT scratch)
-to avoid `complex.()` and `plan * x` allocations in the hot loop.
 """
-function compute_S2!(S2::AbstractMatrix, st::ScatteringTransform1D, 
-                     signal_fft::AbstractVector)
-    num_w = length(st.filter_bank.wavelets)
-    
-    # Pass 1: compute first-order moduli |x ★ ψ_j1| into U1_buffers
-    @inbounds for (j1, ψ1_fft) in enumerate(st.filter_bank.wavelets)
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, signal_fft, ψ1_fft, 
-                                          st.plan, st.buffer_input)
-        ScatteringCore.apply_modulus!(st.U1_buffers[j1], st.buffer_conv)
-    end
-    
-    # Pass 2: FFT each U1 into U1_fft_buffers (zero alloc via mul!)
-    @inbounds for j1 in 1:num_w
-        # Zero-alloc real→complex promotion into buffer_input, then FFT
-        st.buffer_input .= complex.(st.U1_buffers[j1])
-        Plans.forward_transform!(st.U1_fft_buffers[j1], st.plan, st.buffer_input)
-    end
+    cascade!(S1, S2, st, signal_fft) -> (S1, S2)
 
-    # Pass 3: second-order scattering over the ADMISSIBLE paths (j_eff strictly increasing),
-    # taken from the scattering tree rather than a flat upper-triangle loop.
-    tree = st.tree
-    @inbounds for p in PathGraph.order_range(tree, 2)
-        idx = PathGraph.path_indices(tree, p)
-        j1, j2 = idx[1], idx[2]
-        ψ2_fft = st.filter_bank.wavelets[j2]
-        # buffer_input = multiply scratch; buffer_conv = IFFT output
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1], ψ2_fft,
-                                          st.plan, st.buffer_input)
-        ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
-        S2[j1, j2] = ScatteringCore.spatial_average(st.buffer_mod)
+Both scattering orders in one pass over the tree, grouped by first-order wavelet:
+
+    for (j1, children):  U₁ = |x ⋆ ψ_j1| ;  S1[j1] = ⟨U₁⟩
+                         Û₁ = fft(U₁)     ;  S2[j1,j2] = ⟨|U₁ ⋆ ψ_j2|⟩  for each child
+
+The first-order convolution is therefore evaluated once, not once for `S1` and again for `S2`, and
+only one `U₁`/`Û₁` pair is live at a time rather than one per wavelet. Wavelets with no admissible
+child skip the modulus buffer entirely, reducing to a single fused `⟨|·|⟩`.
+
+`signal_fft` is read only, so the caller's preserved signal spectrum survives the call.
+"""
+function cascade!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform1D,
+                  signal_fft::AbstractVector)
+    isempty(S2) || fill!(S2, zero(eltype(S2)))
+    wavelets = st.filter_bank.wavelets
+    @inbounds for (j1, children, _) in st.groups
+        ScatteringCore.wavelet_convolve!(st.buffer_conv, signal_fft, wavelets[j1],
+                                         st.plan, st.buffer_input)
+        if isempty(children)
+            S1[j1] = ScatteringCore.modulus_mean(st.buffer_conv)
+            continue
+        end
+        S1[j1] = ScatteringCore.modulus_mean!(st.buffer_u1, st.buffer_conv)
+        st.buffer_input .= complex.(st.buffer_u1)
+        Plans.forward_transform!(st.buffer_u1_fft, st.plan, st.buffer_input)
+        for j2 in children
+            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_u1_fft, wavelets[j2],
+                                             st.plan, st.buffer_input)
+            S2[j1, j2] = ScatteringCore.modulus_mean(st.buffer_conv)
+        end
     end
-    return S2
+    return S1, S2
 end
 
 # ============================================================================
@@ -246,33 +236,21 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
     root = first(PathGraph.order_range(tree, 0))
     _lowpass_downsample!(view(data, :, root), st, st.buffer_mod, ds)
 
-    # order 1: (|x ⋆ ψ_j| ⋆ φ_J) ↓
-    @inbounds for p in PathGraph.order_range(tree, 1)
-        j = PathGraph.path_indices(tree, p)[1]
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft,
-            st.filter_bank.wavelets[j], st.plan, st.buffer_input)
-        ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
-        _lowpass_downsample!(view(data, :, p), st, st.buffer_mod, ds)
-    end
-
-    # order 2: (||x ⋆ ψ_j1| ⋆ ψ_j2| ⋆ φ_J) ↓
-    if st.max_order >= 2 && length(tree.by_order) >= 3
-        num_w = length(st.filter_bank.wavelets)
-        @inbounds for (j1, ψ1_fft) in enumerate(st.filter_bank.wavelets)
-            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft, ψ1_fft,
+    # Orders 1 and 2 in one grouped pass, as in `cascade!`: the first-order field of each `j1` is
+    # computed once, low-passed into its own column, then transformed once and reused by every child.
+    p1_first = first(PathGraph.order_range(tree, 1))
+    wavelets = st.filter_bank.wavelets
+    @inbounds for (j1, children, pathids) in st.groups
+        ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft, wavelets[j1],
+            st.plan, st.buffer_input)
+        ScatteringCore.apply_modulus!(st.buffer_u1, st.buffer_conv)
+        _lowpass_downsample!(view(data, :, p1_first + j1 - 1), st, st.buffer_u1, ds)
+        isempty(children) && continue
+        st.buffer_input .= complex.(st.buffer_u1)
+        Plans.forward_transform!(st.buffer_u1_fft, st.plan, st.buffer_input)
+        for (j2, p) in zip(children, pathids)
+            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_u1_fft, wavelets[j2],
                 st.plan, st.buffer_input)
-            ScatteringCore.apply_modulus!(st.U1_buffers[j1], st.buffer_conv)
-        end
-        @inbounds for j1 in 1:num_w
-            # Broadcast real→complex (no scalar indexing): CPU + GPU compatible.
-            st.buffer_input .= complex.(st.U1_buffers[j1])
-            Plans.forward_transform!(st.U1_fft_buffers[j1], st.plan, st.buffer_input)
-        end
-        @inbounds for p in PathGraph.order_range(tree, 2)
-            idx = PathGraph.path_indices(tree, p)
-            j1, j2 = idx[1], idx[2]
-            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1],
-                st.filter_bank.wavelets[j2], st.plan, st.buffer_input)
             ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
             _lowpass_downsample!(view(data, :, p), st, st.buffer_mod, ds)
         end
@@ -281,10 +259,10 @@ function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringFi
 end
 
 # ============================================================================
-# Non-mutating, autodiff-friendly forward (Part A): composes the non-mutating spectral
-# transforms with broadcast modulus + mean. No preallocated workspace, no in-place writes —
-# so it differentiates cleanly through DifferentiationInterface and accepts Dual/Float32 inputs.
-# Numerically matches the in-place `st(signal)`.
+# Non-mutating, autodiff-friendly forward: composes the non-mutating spectral transforms with
+# broadcast modulus + mean. No preallocated workspace, no in-place writes — so it differentiates
+# cleanly through DifferentiationInterface and accepts Dual/Float32 inputs. Numerically matches the
+# in-place `st(signal)`.
 # ============================================================================
 
 function ScatteringCore.scattering(st::ScatteringTransform1D, signal::AbstractVector)

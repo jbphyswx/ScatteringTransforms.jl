@@ -12,6 +12,7 @@ ScatteringTransforms`) to enable.
 """
 
 using Distributed: Distributed
+using ComputationalBackends: ComputationalBackends as CB
 using ScatteringTransforms: ScatteringTransforms as ST
 
 # Partition 1:n into ≤ k contiguous column ranges.
@@ -20,22 +21,36 @@ function _column_chunks(n::Int, k::Int)
     return [(div((c - 1) * n, k) + 1):(div(c * n, k)) for c in 1:k]
 end
 
-function _distributed_batch(b::ST.Backends.DistributedBackend, st, X, slicer)
+# One chunk per worker, deliberately: the closure below rebuilds the transform — filter bank and
+# spectral plan — on the worker for every chunk it receives. Splitting finer would let `pmap`
+# rebalance around a straggler, but would pay that rebuild once per chunk instead of once per
+# worker. Finer chunking is only worth it alongside a per-worker transform cache.
+function _distributed_batch(b::CB.AbstractDistributedBackend, st, X, slicer)
     spec = ST.transform_spec(st)
-    inner = ST.Backends.local_backend(b)
+    inner = CB.local_backend(b)
     ncols = size(X)[end]
     chunks = _column_chunks(ncols, Distributed.nworkers())
     parts = Distributed.pmap(chunks) do cols
         st_local = ST.rebuild_transform(spec)
         ST.scattering_batch(inner, st_local, slicer(X, cols))
     end
-    return reduce(hcat, parts)
+    # Write the blocks into one preallocated output rather than growing through `reduce(hcat, …)`,
+    # which reallocates and copies the whole result once per chunk.
+    flen = size(first(parts), 1)
+    out = Matrix{eltype(first(parts))}(undef, flen, ncols)
+    @inbounds for (cols, part) in zip(chunks, parts)
+        copyto!(view(out, :, cols), part)
+    end
+    return out
 end
 
-ST.scattering_batch(b::ST.Backends.DistributedBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix) =
-    _distributed_batch(b, st, X, (A, cols) -> A[:, cols])
+ST.scattering_batch(b::CB.AbstractDistributedBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix) =
+    _distributed_batch(b, st, X, (A, cols) -> view(A, :, cols))
 
-ST.scattering_batch(b::ST.Backends.DistributedBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
-    _distributed_batch(b, st, X, (A, cols) -> A[:, :, cols])
+ST.scattering_batch(b::CB.AbstractDistributedBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
+    _distributed_batch(b, st, X, (A, cols) -> view(A, :, :, cols))
+
+ST.scattering_batch(b::CB.AbstractDistributedBackend, st::ST.Scattering3D.ScatteringTransform3D, X::AbstractArray{<:Any,4}) =
+    _distributed_batch(b, st, X, (A, cols) -> view(A, :, :, :, cols))
 
 end # module ScatteringTransformsDistributedExt

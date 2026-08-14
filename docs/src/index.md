@@ -37,7 +37,7 @@ are the same.
   orientation/phase via the spin-1 Riesz vector).
 - **Tight-frame filter bank**: `|φ|² + Σⱼ|ψⱼ|² ≡ 1` (non-expansive).
 - **Pluggable spectral backend**: in-core direct-sum default; `using FFTW` → `O(N log N)`
-  fast path (`spectral = AutoSpectral() | DirectSumBackend() | FFTBackend()`).
+  fast path (`spectral = AutoSpectralBackend() | DirectSumSpectralBackend() | FFTSpectralBackend()`).
 - **Scale**: `scattering_batch` (one plan reused), `ThreadedBackend` (OhMyThreads),
   `DistributedBackend`/`MPIBackend` (parametric over the inner backend),
   `GPUBackend` (vendor-neutral KernelAbstractions: CUDA/ROCm/oneAPI/Metal, or `KA.CPU()`).
@@ -108,7 +108,7 @@ orientation (not quantized into bins).
 Off-lattice / gappy planar data is scattered onto a uniform Fourier mode grid by a nonuniform DFT
 (`scattered_planar_scattering`); on a uniform grid it reproduces the gridded FFT transform exactly. The
 default is an in-core exact direct NUDFT (no dependencies); `using FINUFFT` enables the faster NUFFT
-path via `spectral = Plans.NUFFTBackend()`.
+path via `spectral = NUFFTSpectralBackend()`.
 
 ![Scattered planar scattering](assets/scattered_planar.png)
 

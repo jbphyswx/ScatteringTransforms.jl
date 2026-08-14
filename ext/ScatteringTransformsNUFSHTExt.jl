@@ -40,7 +40,7 @@ on scattered points the adjoint mis-scales the coefficients degree-dependently, 
 is needed for correct absolute magnitudes. Accurate inversion needs the sampling to resolve the band
 limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed points.
 """
-struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real} <: ST.SphericalCore.AbstractSphericalPlan
+struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, C} <: ST.SphericalCore.AbstractSphericalPlan
     plan::P
     M::Int
     lmax::Int
@@ -48,6 +48,27 @@ struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real} <: ST.SphericalCore.Abs
     phi::V
     rtol::T
     maxiter::Int
+    cbuf::C          # coefficient scratch filtered per band, so `sphere_apply!` allocates nothing
+end
+
+NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter) =
+    NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, zero(plan.C))
+
+Base.show(io::IO, p::NUSHTSphericalPlan) =
+    print(io, "NUSHTSphericalPlan(lmax=", p.lmax, ", M=", p.M, ")")
+
+# A `NUSHTplan` is working state, not a lookup table: every transform writes through its coefficient,
+# field and phase buffers, so tasks cannot share one. The points and band limit are retained on this
+# wrapper precisely so a task can build its own.
+#
+# Construction goes through FFTW's planner, which FFTW documents as callable from only one thread at
+# a time (of its API, only `fftw_execute` is thread safe), so the rebuild is serialised. It happens
+# once per task, not once per field.
+const PLANNER_LOCK = ReentrantLock()
+
+function ST.Plans.task_local_plan(p::NUSHTSphericalPlan)
+    plan = Base.@lock PLANNER_LOCK NUFSHT.make_plan(eltype(p.theta), p.theta, p.phi, p.lmax)
+    return NUSHTSphericalPlan(plan, p.M, p.lmax, p.theta, p.phi, p.rtol, p.maxiter, zero(plan.C))
 end
 
 # Generic per-degree spectral multiplier h(ℓ): NUFSHT's apply_transfer! dispatches on
@@ -59,14 +80,22 @@ NUFSHT.kernel_transfer(t::_FnTransfer, ℓ) = t.f(ℓ)
 
 # Analysis: the TRUE spherical-harmonic coefficients of `field` via exact CG inversion.
 function ST.SphericalCore.sphere_coeffs(plan::NUSHTSphericalPlan, field::AbstractVector)
-    C = zero(plan.plan.C)
+    return ST.SphericalCore.sphere_coeffs!(zero(plan.plan.C), plan, field)
+end
+
+function ST.SphericalCore.sphere_coeffs!(C, plan::NUSHTSphericalPlan, field::AbstractVector)
+    fill!(C, zero(eltype(C)))
     NUFSHT.nusht_solve!(C, field, plan.plan; rtol = plan.rtol, maxiter = plan.maxiter)
     return C
 end
 
+ST.SphericalCore.sphere_coeffs_buffer(plan::NUSHTSphericalPlan) = zero(plan.plan.C)
+
 # Apply the per-degree multiplier `h(ℓ)` to a copy of the coefficients and synthesise at the points.
+# The copy lands in the plan's scratch so a band allocates nothing, and `C` survives for the next one.
 function ST.SphericalCore.sphere_apply!(out::AbstractVector, plan::NUSHTSphericalPlan, C, h)
-    C2 = copy(C)
+    C2 = plan.cbuf
+    copyto!(C2, C)
     NUFSHT.apply_transfer!(C2, _FnTransfer(h), plan.lmax)
     NUFSHT.nusht_type2!(out, C2, plan.plan)
     return out
@@ -85,7 +114,7 @@ function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_ph
                                                maxiter::Int = 500) where {T<:Real}
     θ = collect(T, pts_theta)
     φ = collect(T, pts_phi)
-    return NUSHTSphericalPlan(NUFSHT.make_plan(θ, φ, lmax; T = T), length(θ), lmax, θ, φ,
+    return NUSHTSphericalPlan(NUFSHT.make_plan(T, θ, φ, lmax), length(θ), lmax, θ, φ,
                               T(rtol), maxiter)
 end
 
@@ -108,8 +137,10 @@ function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogen
     T = eltype(p.theta)
     # Complex spin-0 coefficients of the field in NUFSHT's dense spin layout (exact CG inversion,
     # so the band-pass and Riesz fields below share one consistent set of coefficients).
-    p0 = NUFSHT.make_spin_plan(p.theta, p.phi, lmax, 0; T = T)
-    p1 = NUFSHT.make_spin_plan(p.theta, p.phi, lmax, 1; T = T)
+    # NUFSHT's positional argument is the *field* element type, not the precision: a real one selects
+    # its folded real layout. The spin field here is complex, so it must be `Complex{T}`.
+    p0 = NUFSHT.make_spin_plan(Complex{T}, p.theta, p.phi, lmax, 0)
+    p1 = NUFSHT.make_spin_plan(Complex{T}, p.theta, p.phi, lmax, 1)
     a = zeros(Complex{T}, lmax + 1, 2lmax + 1)
     NUFSHT.nusht_solve_spin!(a, Complex{T}.(field), p0)
 

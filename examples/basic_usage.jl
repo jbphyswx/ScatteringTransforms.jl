@@ -7,7 +7,8 @@ Run with: `julia --project=. basic_usage.jl`
 """
 
 using ScatteringTransforms: ScatteringTransforms as ST
-using FFTW: FFTW                      # loading FFTW enables the O(N log N) fast path (spectral=:auto)
+using ComputationalBackends: ComputationalBackends as CB
+using FFTW: FFTW                      # loading FFTW enables the O(N log N) fast path (AutoSpectralBackend)
 using OhMyThreads: OhMyThreads        # loading this enables ThreadedBackend batched transforms
 using Statistics: Statistics
 using Test: Test
@@ -23,7 +24,7 @@ println("\n1. 1D averaged coefficients  S0=⟨x⟩, S1[λ]=⟨|x⋆ψ_λ|⟩, S2
 N = 1024
 t = range(0, 2π, length = N)
 x = sin.(10 .* t) .+ 0.5 .* sin.(50 .* t) .+ 0.1 .* randn(N)
-st = ST.Scattering1D.ScatteringTransform1D(N, 6; Q = 1, max_order = 2)   # spectral=:auto → FFTW (loaded above)
+st = ST.Scattering1D.ScatteringTransform1D(N, 6; Q = 1, max_order = 2)   # AutoSpectralBackend → FFTW (loaded above)
 c = st(x)
 println("   S0 = ", round(ST.Coefficients.zeroth_order(c), digits = 4),
         " | S1: ", length(ST.Coefficients.first_order(c)), " coeffs | S2: ", size(ST.Coefficients.second_order(c)))
@@ -51,7 +52,7 @@ println("\n4. Batched transform (plan + workspace reused)")
 X = randn(N, 64)
 coeffs_batch = ST.scattering_batch(st, X)
 println("   scattering_batch(st, $(size(X))) → ", size(coeffs_batch), " (coeffs × batch)")
-threaded = ST.scattering_batch(ST.Backends.ThreadedBackend(), st, X)
+threaded = ST.scattering_batch(CB.ThreadedBackend(), st, X)
 println("   threaded == serial: ", threaded ≈ coeffs_batch)
 
 # ---------------------------------------------------------------------------
@@ -78,7 +79,7 @@ println("   3D S1: ", length(ST.Coefficients.first_order(c3)), " coeffs (J × n_
 # ---------------------------------------------------------------------------
 # 7. Element types: Float32 end-to-end
 # ---------------------------------------------------------------------------
-stf = ST.Scattering1D.ScatteringTransform1D(N, 6; Q = 1, max_order = 2, T = Float32)
+stf = ST.Scattering1D.ScatteringTransform1D(Float32, N, 6; Q = 1, max_order = 2)
 cf = stf(Float32.(x))
 println("\n7. Float32 in → ", eltype(ST.Coefficients.first_order(cf)), " out")
 

@@ -84,8 +84,8 @@ Test.@testset "Dependency-free direct SH backend agrees with NUFSHT (scattered S
     for gfun in ((θ, φ) -> cos(θ)^2 - 1/3 + 0.5sin(θ) * cos(φ),
                  (θ, φ) -> cos(2θ) + 0.4sin(θ) * cos(2φ))
         f = [gfun(θ[k], φ[k]) for k in 1:M]
-        sdir = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; spectral = SC.DirectSHTBackend())
-        snu  = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; spectral = SC.NUSHTBackend())
+        sdir = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; spectral = SpectralBackends.DirectSumSpectralBackend())
+        snu  = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; spectral = SpectralBackends.NUFSHTSpectralBackend())
         Test.@test sdir.plan isa SC.DirectSHTSphericalPlan
         rdir, rnu = sdir(f), snu(f)
         Test.@test rdir.S0 ≈ rnu.S0 atol = 1e-6
@@ -105,12 +105,37 @@ Test.@testset "Dependency-free structured SHT agrees with FastSphericalHarmonics
     for gfun in ((θ, φ) -> cos(θ)^2 - 1/3 + 0.5sin(θ) * cos(φ),      # band-limited to ℓ ≤ 2
                  (θ, φ) -> sin(θ)^2 * cos(2φ) + 0.6cos(θ))
         f = [gfun(θ, φ) for θ in Θ, φ in Φ]
-        sdir = ScatteringTransforms.structured_spherical_scattering(lmax, J; spectral = SC.DirectSHTBackend())
-        sfsh = ScatteringTransforms.structured_spherical_scattering(lmax, J; spectral = SC.SHTBackend())
+        sdir = ScatteringTransforms.structured_spherical_scattering(lmax, J; spectral = SpectralBackends.DirectSumSpectralBackend())
+        sfsh = ScatteringTransforms.structured_spherical_scattering(lmax, J; spectral = SpectralBackends.FSHTSpectralBackend())
         Test.@test sdir.plan isa SC.DirectSHTSphericalPlan
         rdir, rfsh = sdir(f), sfsh(f)
         Test.@test rdir.S0 ≈ rfsh.S0 atol = 1e-8
         Test.@test maximum(abs.(rdir.S1 .- rfsh.S1)) / maximum(abs.(rfsh.S1)) < 0.01
         Test.@test maximum(abs.(rdir.S2 .- rfsh.S2)) / (maximum(abs.(rfsh.S2)) + eps()) < 0.05
+    end
+end
+
+# Both structured backends compute the spherical mean as a quadrature sum over the same node set, so
+# comparing them to each other cannot detect a wrong weight or a wrong grid — the error would cancel.
+# Pin them to closed-form means instead, on fields chosen so the exact value is known independently:
+# a constant, a degree-1 and a degree-2 zonal harmonic, and a field varying in longitude.
+Test.@testset "Structured spherical mean matches closed-form values" begin
+    SC = ScatteringTransforms.SphericalCore
+    for lmax in (8, 16, 32)
+        Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)
+        Test.@test collect(Θ) ≈ collect(FastSphericalHarmonics.sph_points(lmax + 1)[1])
+        Test.@test collect(Φ) ≈ collect(FastSphericalHarmonics.sph_points(lmax + 1)[2])
+        for (gfun, exact) in (((θ, φ) -> 1.0,                     1.0),
+                              ((θ, φ) -> cos(θ),                  0.0),
+                              ((θ, φ) -> cos(θ)^2,                1 / 3),
+                              ((θ, φ) -> sin(θ) * cos(φ),         0.0),
+                              ((θ, φ) -> 3cos(θ)^2 - 1,           0.0))
+            f = [gfun(θ, φ) for θ in Θ, φ in Φ]
+            for spec in (SpectralBackends.DirectSumSpectralBackend(),
+                         SpectralBackends.FSHTSpectralBackend())
+                plan = SC.make_structured_plan(spec, lmax, Float64)
+                Test.@test SC.sphere_mean(plan, f) ≈ exact atol = 1e-12
+            end
+        end
     end
 end

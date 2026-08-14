@@ -12,6 +12,7 @@ using LinearAlgebra: LinearAlgebra
 export ScatteringCoefficients1D, ScatteringCoefficients2D
 export zeroth_order, first_order, second_order
 export flatten1d, flatten2d, flatten1d!, flatten2d!, flatten_length
+export flat_length, flat_row_s0, flat_row_s1, flat_row_s2
 export update_S0
 
 # ============================================================================
@@ -96,11 +97,32 @@ function update_S0(c::ScatteringCoefficients1D{T,V,M,S0}, val) where {T,V,M,S0}
 end
 
 """
+    flat_length(n) -> Int
+    flat_row_s0() -> Int
+    flat_row_s1(j, n) -> Int
+    flat_row_s2(j1, j2, n) -> Int
+
+Row layout of the flattened coefficient vector `[S0; S1; vec(S2 upper triangle)]` for `n` wavelets,
+as produced by [`flatten1d!`](@ref)/[`flatten2d!`](@ref).
+
+The batched paths write straight into flattened columns rather than filling a coefficient container
+first, so they need the layout as arithmetic. Defining it here keeps the one definition that
+`flatten*!` also walks — a second copy elsewhere would silently drift.
+"""
+flat_length(n::Integer) = n * (n - 1) ÷ 2 + n + 1
+@inline flat_row_s0() = 1
+@inline flat_row_s1(j::Integer, n::Integer) = 1 + j
+# Rows are laid out `(j1, j2)` for `j2 > j1`, j1-major: skip the complete rows before `j1`, then
+# step to `j2` within it.
+@inline flat_row_s2(j1::Integer, j2::Integer, n::Integer) =
+    1 + n + ((j1 - 1) * n - ((j1 - 1) * j1) ÷ 2) + (j2 - j1)
+
+"""
     flatten_length(c) -> Int
 
 Length of the flattened coefficient vector `[S0; S1; vec(S2 upper triangle)]`.
 """
-flatten_length(c::ScatteringCoefficients1D) = c.n_wavelets * (c.n_wavelets - 1) ÷ 2 + c.n_wavelets + 1
+flatten_length(c::ScatteringCoefficients1D) = flat_length(c.n_wavelets)
 
 """
     flatten1d(coeffs::ScatteringCoefficients1D{T}) -> Vector{T}
@@ -186,7 +208,7 @@ function update_S0(c::ScatteringCoefficients2D{T,V,M,S0}, val) where {T,V,M,S0}
     return ScatteringCoefficients2D(c.S1, c.S2; S0=val, n_scales=c.n_scales, n_orientations=c.n_orientations)
 end
 
-flatten_length(c::ScatteringCoefficients2D) = c.n_wavelets * (c.n_wavelets - 1) ÷ 2 + c.n_wavelets + 1
+flatten_length(c::ScatteringCoefficients2D) = flat_length(c.n_wavelets)
 
 """
     flatten2d(coeffs::ScatteringCoefficients2D{T}) -> Vector{T}

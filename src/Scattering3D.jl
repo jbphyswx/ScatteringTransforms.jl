@@ -10,55 +10,65 @@ scales×orientations coefficient container.
 """
 
 using ..Plans: Plans
+using ComputationalBackends: ComputationalBackends as CB
+using SpectralBackends: SpectralBackends as SB
 using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Coefficients: Coefficients
 using ..PathGraph: PathGraph
 
-export ScatteringTransform3D, scattering_transform3d!
-export compute_S1_3d!, compute_S2_3d!
+export ScatteringTransform3D, scattering_transform3d!, cascade!
 
 struct ScatteringTransform3D{T, M<:AbstractArray{Complex{T},3}, R<:AbstractArray{T,3},
                              P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
-                             FB<:FilterBanks.FilterBank3D, UB<:AbstractVector, UF<:AbstractVector}
+                             FB<:FilterBanks.FilterBank3D, G<:AbstractVector}
     filter_bank::FB
     tree::Tree
+    groups::G               # (j1, children, path ids) from the tree, longest-first
     max_order::Int
     plan::P
     buffer_input::M
     buffer_signal_fft::M
     buffer_conv::M
     buffer_mod::R
-    U1_buffers::UB
-    U1_fft_buffers::UF
+    buffer_u1::R            # first-order modulus of the current j1
+    buffer_u1_fft::M        # its spectrum, reused across that j1's children
 end
 
-function ScatteringTransform3D(N::NTuple{3,Int}, J::Int;
+"""
+    ScatteringTransform3D([T=Float64,] N, J; n_orient=6, max_order=2, spectral=AutoSpectralBackend())
+
+Build a 3D volumetric scattering transform for `N = (Nz, Ny, Nx)` volumes over `J` scales and
+`n_orient` sphere directions. The element type is positional, as for `zeros(T, …)`; omit it for
+`Float64`.
+"""
+function ScatteringTransform3D(::Type{T}, N::NTuple{3,Int}, J::Int;
                                n_orient::Int=6,
                                max_order::Int=2,
-                               T::Type=Float64,
-                               spectral::Plans.AbstractSpectralBackend=Plans.AutoSpectral())
-    filter_bank = FilterBanks.build_filter_bank3d(N, J; n_orient=n_orient, T=T)
+                               spectral::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T}
+    filter_bank = FilterBanks.build_filter_bank3d(T, N, J; n_orient=n_orient)
     tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+    groups = max_order >= 2 ? PathGraph.order2_groups(tree, length(filter_bank.wavelets)) :
+             [(j, Int[], Int[]) for j in 1:length(filter_bank.wavelets)]
     plan = Plans.make_plan(spectral, T, N)
 
     dummy = zeros(Complex{T}, N)
-    num_w = length(filter_bank.wavelets)
-    buffer_input      = similar(dummy)
-    buffer_signal_fft = similar(dummy)
-    buffer_conv       = similar(dummy)
-    buffer_mod        = zeros(T, N)
-    if max_order >= 2
-        U1_buffers     = [zeros(T, N) for _ in 1:num_w]
-        U1_fft_buffers = [similar(dummy) for _ in 1:num_w]
-    else
-        U1_buffers     = Array{T,3}[]
-        U1_fft_buffers = Array{Complex{T},3}[]
-    end
-    return ScatteringTransform3D(filter_bank, tree, max_order, plan,
-                                 buffer_input, buffer_signal_fft, buffer_conv, buffer_mod,
-                                 U1_buffers, U1_fft_buffers)
+    # O(prod(N)) workspace, not O(nw·prod(N)): one first-order volume and one spectrum are live at
+    # a time, which matters most in 3D where a single volume is already large.
+    return ScatteringTransform3D(filter_bank, tree, groups, max_order, plan,
+                                 similar(dummy), similar(dummy), similar(dummy),
+                                 zeros(T, N), zeros(T, N), similar(dummy))
 end
+ScatteringTransform3D(N::NTuple{3,Int}, J::Int; kwargs...) =
+    ScatteringTransform3D(Float64, N, J; kwargs...)
+
+# Shares filter bank / tree / groups; copies only the buffers and the plan's scratch.
+ScatteringCore.task_workspace(st::ScatteringTransform3D) =
+    ScatteringTransform3D(st.filter_bank, st.tree, st.groups, st.max_order,
+                          Plans.task_local_plan(st.plan),
+                          similar(st.buffer_input), similar(st.buffer_signal_fft),
+                          similar(st.buffer_conv), similar(st.buffer_mod),
+                          similar(st.buffer_u1), similar(st.buffer_u1_fft))
 
 """
     (st::ScatteringTransform3D)(volume) -> ScatteringCoefficients2D
@@ -84,47 +94,57 @@ function scattering_transform3d!(coeffs::Coefficients.ScatteringCoefficients2D,
                                  volume::AbstractArray{<:Any,3})
     st.buffer_input .= complex.(volume)
     Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
-    compute_S1_3d!(coeffs.S1, st, st.buffer_signal_fft)
-    if st.max_order >= 2
-        compute_S2_3d!(coeffs.S2, st, st.buffer_signal_fft)
-    end
-    S0_val = ScatteringCore.spatial_average(volume)
-    return Coefficients.update_S0(coeffs, S0_val)
+    cascade!(coeffs.S1, coeffs.S2, st, st.buffer_signal_fft)
+    return Coefficients.update_S0(coeffs, ScatteringCore.spatial_average(volume))
 end
 
-function compute_S1_3d!(S1::AbstractVector, st::ScatteringTransform3D, vol_fft::AbstractArray{<:Any,3})
-    @inbounds for (j, ψ_fft) in enumerate(st.filter_bank.wavelets)
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, vol_fft, ψ_fft, st.plan, st.buffer_input)
-        ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
-        S1[j] = ScatteringCore.spatial_average(st.buffer_mod)
-    end
-    return S1
+"""
+    scattering_transform3d!(coeffs, backend, st, volume)
+
+Transform one volume on an explicit execution backend — see the 2D counterpart.
+"""
+function scattering_transform3d!(coeffs::Coefficients.ScatteringCoefficients2D,
+                                 backend::CB.AbstractExecutionBackend,
+                                 st::ScatteringTransform3D, volume::AbstractArray{<:Any,3})
+    st.buffer_input .= complex.(volume)
+    Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
+    cascade!(coeffs.S1, coeffs.S2, backend, st, st.buffer_signal_fft)
+    return Coefficients.update_S0(coeffs, ScatteringCore.spatial_average(volume))
 end
 
-function compute_S2_3d!(S2::AbstractMatrix, st::ScatteringTransform3D, vol_fft::AbstractArray{<:Any,3})
-    num_w = length(st.filter_bank.wavelets)
-    @inbounds for (j1, ψ1_fft) in enumerate(st.filter_bank.wavelets)
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, vol_fft, ψ1_fft, st.plan, st.buffer_input)
-        ScatteringCore.apply_modulus!(st.U1_buffers[j1], st.buffer_conv)
+cascade!(S1::AbstractVector, S2::AbstractMatrix, ::CB.AbstractSerialBackend,
+         st::ScatteringTransform3D, vol_fft::AbstractArray{<:Any,3}) = cascade!(S1, S2, st, vol_fft)
+
+"""
+    cascade!(S1, S2, st, vol_fft) -> (S1, S2)
+
+Both scattering orders in one grouped pass — see the 1D `cascade!` for the scheme.
+"""
+function cascade!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform3D,
+                  vol_fft::AbstractArray{<:Any,3})
+    isempty(S2) || fill!(S2, zero(eltype(S2)))
+    wavelets = st.filter_bank.wavelets
+    @inbounds for (j1, children, _) in st.groups
+        ScatteringCore.wavelet_convolve!(st.buffer_conv, vol_fft, wavelets[j1],
+                                         st.plan, st.buffer_input)
+        if isempty(children)
+            S1[j1] = ScatteringCore.modulus_mean(st.buffer_conv)
+            continue
+        end
+        S1[j1] = ScatteringCore.modulus_mean!(st.buffer_u1, st.buffer_conv)
+        st.buffer_input .= complex.(st.buffer_u1)
+        Plans.forward_transform!(st.buffer_u1_fft, st.plan, st.buffer_input)
+        for j2 in children
+            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_u1_fft, wavelets[j2],
+                                             st.plan, st.buffer_input)
+            S2[j1, j2] = ScatteringCore.modulus_mean(st.buffer_conv)
+        end
     end
-    @inbounds for j1 in 1:num_w
-        st.buffer_input .= complex.(st.U1_buffers[j1])
-        Plans.forward_transform!(st.U1_fft_buffers[j1], st.plan, st.buffer_input)
-    end
-    tree = st.tree
-    @inbounds for p in PathGraph.order_range(tree, 2)
-        idx = PathGraph.path_indices(tree, p)
-        j1, j2 = idx[1], idx[2]
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, st.U1_fft_buffers[j1],
-            st.filter_bank.wavelets[j2], st.plan, st.buffer_input)
-        ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
-        S2[j1, j2] = ScatteringCore.spatial_average(st.buffer_mod)
-    end
-    return S2
+    return S1, S2
 end
 
 # ============================================================================
-# Non-mutating, autodiff-friendly forward (Part A) — see Scattering1D for the rationale.
+# Non-mutating, autodiff-friendly forward — see Scattering1D for the rationale.
 # ============================================================================
 
 function ScatteringCore.scattering(st::ScatteringTransform3D, volume::AbstractArray{<:Any,3})

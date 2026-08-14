@@ -1,4 +1,5 @@
 using ScatteringTransforms: ScatteringTransforms as ST
+using SpectralBackends: SpectralBackends as SB
 using JET: JET
 using Test: Test
 
@@ -12,22 +13,22 @@ Test.@testset "JET type stability (hot path)" begin
     else
         # Audit the in-place, zero-alloc PRODUCTION functors. The in-core direct-sum backend keeps
         # the whole call inside ScatteringTransforms (no FFTW/CUFFT internals to analyze).
-        st1 = ST.Scattering1D.ScatteringTransform1D(64, 4; Q=2, max_order=2, spectral=ST.Plans.DirectSumBackend())
+        st1 = ST.Scattering1D.ScatteringTransform1D(64, 4; Q=2, max_order=2, spectral=SB.DirectSumSpectralBackend())
         x1 = randn(64)
         JET.@test_opt st1(x1)
         JET.@test_call st1(x1)
 
-        st2 = ST.Scattering2D.ScatteringTransform2D((16, 16), 2; L=4, max_order=2, spectral=ST.Plans.DirectSumBackend())
+        st2 = ST.Scattering2D.ScatteringTransform2D((16, 16), 2; L=4, max_order=2, spectral=SB.DirectSumSpectralBackend())
         x2 = randn(16, 16)
         JET.@test_opt st2(x2)
         JET.@test_call st2(x2)
 
-        st3 = ST.Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient=6, max_order=2, spectral=ST.Plans.DirectSumBackend())
+        st3 = ST.Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient=6, max_order=2, spectral=SB.DirectSumSpectralBackend())
         x3 = randn(8, 8, 8)
         JET.@test_opt st3(x3)
 
         # Monogenic (Riesz) production functor.
-        stm = ST.Monogenic.MonogenicScattering((16, 16), 2; Q=1, max_order=2, spectral=ST.Plans.DirectSumBackend())
+        stm = ST.Monogenic.MonogenicScattering((16, 16), 2; Q=1, max_order=2, spectral=SB.DirectSumSpectralBackend())
         JET.@test_opt stm(x2)
 
         # Filter frequency responses (built once per bank).
@@ -36,7 +37,7 @@ Test.@testset "JET type stability (hot path)" begin
         JET.@test_opt ST.Filters.frequency_response(ST.Filters.Morlet3D((8, 8, 8), 1, (0.0, 0.0, 1.0)))
 
         # Exact linear wavelet-frame inverse round trip (non-mutating, eltype-generic).
-        sti = ST.Scattering1D.ScatteringTransform1D(64, 4; Q=1, max_order=1, spectral=ST.Plans.DirectSumBackend())
+        sti = ST.Scattering1D.ScatteringTransform1D(64, 4; Q=1, max_order=1, spectral=SB.DirectSumSpectralBackend())
         JET.@test_opt ST.Inverse.iwavelet(sti, ST.Inverse.wavelet_transform(sti, x1))
     end
 end

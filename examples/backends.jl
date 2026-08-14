@@ -7,6 +7,8 @@ Spectral backends (in-core direct sum vs FFTW fast path) and compute backends
 """
 
 using ScatteringTransforms: ScatteringTransforms as ST
+using ComputationalBackends: ComputationalBackends as CB
+using SpectralBackends: SpectralBackends as SB
 using FFTW: FFTW                 # enables the FFTW fast path
 using OhMyThreads: OhMyThreads    # enables ThreadedBackend
 using Statistics: Statistics
@@ -20,8 +22,8 @@ N, J = 2048, 7
 x = randn(N)
 
 # ── spectral backend: in-core direct sum (default-available) vs FFTW fast path ─
-st_direct = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.DirectSumBackend())
-st_fftw   = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.FFTBackend())
+st_direct = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.DirectSumSpectralBackend())
+st_fftw   = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.FFTSpectralBackend())
 cd, cf = st_direct(x), st_fftw(x)
 println("\nspectral backends agree: ",
         ST.Coefficients.first_order(cd) ≈ ST.Coefficients.first_order(cf) && ST.Coefficients.second_order(cd) ≈ ST.Coefficients.second_order(cf))
@@ -32,10 +34,10 @@ println("direct sum: ", round(td * 1e3, digits=2), " ms   FFTW: ", round(tf * 1e
         " ms   (", round(td / tf, digits=1), "× faster)")
 
 # ── compute backends over a batch ─────────────────────────────────────────────
-st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)   # spectral=:auto → FFTW (loaded)
+st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)   # AutoSpectralBackend → FFTW (loaded)
 X = randn(N, 64)
 serial   = ST.scattering_batch(st, X)
-threaded = ST.scattering_batch(ST.Backends.ThreadedBackend(), st, X)   # OhMyThreads, $(Threads.nthreads()) threads
+threaded = ST.scattering_batch(CB.ThreadedBackend(), st, X)   # OhMyThreads, $(Threads.nthreads()) threads
 println("\nthreaded batch == serial batch: ", threaded ≈ serial,
         "   (", Threads.nthreads(), " threads)")
 
@@ -50,12 +52,12 @@ using AbstractFFTs: AbstractFFTs
 # Pick a device backend + matching input array: CUDA GPU if functional, else the KA CPU backend.
 gpu_backend, xdev = try
     @eval using CUDA
-    CUDA.functional() ? (ST.Backends.GPUBackend(CUDA.CUDABackend()), CUDA.CuVector{Float32}(Float32.(x))) :
-                        (ST.Backends.GPUBackend(KA.CPU()), Float32.(x))
+    CUDA.functional() ? (CB.GPUBackend(CUDA.CUDABackend()), CUDA.CuVector{Float32}(Float32.(x))) :
+                        (CB.GPUBackend(KA.CPU()), Float32.(x))
 catch
-    (ST.Backends.GPUBackend(KA.CPU()), Float32.(x))
+    (CB.GPUBackend(KA.CPU()), Float32.(x))
 end
-st_gpu = ST.Scattering1D.ScatteringTransform1D(N, J, gpu_backend; T=Float32)
+st_gpu = ST.Scattering1D.ScatteringTransform1D(Float32, N, J, gpu_backend;)
 cg = st_gpu(xdev)
 println("GPU (", typeof(gpu_backend.backend), ") transform ran; S1 length = ",
         length(ST.Coefficients.first_order(cg)))

@@ -54,7 +54,7 @@ Test.@testset "Spherical monogenic components: dependency-free direct SH backend
     θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
     φ = [2π * mod(k * gr, 1) for k in 1:M]
     SC = ScatteringTransforms.SphericalCore
-    st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J; spectral = SC.DirectSHTBackend())
+    st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J; spectral = SpectralBackends.DirectSumSpectralBackend())
     Test.@test st.plan isa SC.DirectSHTSphericalPlan
     ℓ0 = 5
     sig = SC.dog_sigma2(lmax, J, Float64)

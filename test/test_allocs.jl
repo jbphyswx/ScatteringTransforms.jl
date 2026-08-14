@@ -23,7 +23,7 @@ Test.@testset "Allocation discipline" begin
     SC  = ScatteringTransforms.ScatteringCore
     P   = ScatteringTransforms.Plans
     SF  = ScatteringTransforms.ScatteringFields
-    FB  = ScatteringTransforms.Plans.FFTBackend()
+    FB  = SpectralBackends.FFTSpectralBackend()
 
     N, J = 512, 6
     st1 = S1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=FB)
@@ -85,12 +85,22 @@ Test.@testset "Allocation discipline" begin
         Test.@test b8 == b32
     end
 
+    Test.@testset "the batched-plan cascade is exactly zero-allocation" begin
+        # The opt-in whole-stack path, measured on the cascade itself: `scattering_batch!` reaches it
+        # through a keyword argument, and the keyword call allocates independently of the cascade.
+        st2 = S2D.ScatteringTransform2D((24, 24), 3; L=4, max_order=2, spectral=FB)
+        X = randn(24, 24, 8)
+        ws = ScatteringTransforms.batch_workspace(st2, 8)
+        out = ScatteringTransforms.scattering_batch(st2, X)
+        Test.@test _alloc(ScatteringTransforms.Batched.batch_cascade!, out, ws, X) == 0
+    end
+
     Test.@testset "GPU batched `!` allocates nothing data-proportional (GPUBackend(KA.CPU()))" begin
-        gpu = ScatteringTransforms.Backends.GPUBackend(KA.CPU())
+        gpu = ComputationalBackends.GPUBackend(KA.CPU())
         kaext = Base.get_extension(ScatteringTransforms, :ScatteringTransformsKernelAbstractionsExt)
         Ny, Nx, B = 24, 24, 8
-        gst = S2D.ScatteringTransform2D((Ny, Nx), 3, gpu; L=4, max_order=2, T=Float32)
-        ws = kaext.GPUBatchWorkspace(gpu, gst, B)
+        gst = S2D.ScatteringTransform2D(Float32, (Ny, Nx), 3, gpu; L=4, max_order=2)
+        ws = kaext.gpu_batch_workspace(gpu, gst, B)
         X = randn(Float32, Ny, Nx, B)
         flen = size(ScatteringTransforms.scattering_batch(gpu, gst, X), 1)
         out = zeros(Float32, flen, B)

@@ -2,6 +2,7 @@
 ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
 AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 ExplicitImports = "7d51a73a-1435-4ff3-83d9-f097790105c7"
@@ -11,17 +12,22 @@ FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
 JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
-Mooncake = "da2b9cff-9c12-43a0-ae48-6db2b0edb7d6"
+# Mooncake = "da2b9cff-9c12-43a0-ae48-6db2b0edb7d6"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
+NonuniformFFTs = "cd96f58b-6017-4a02-bb9e-f4d81626177f"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ScatteringTransforms = "68b593e8-16bb-4169-afcb-087dab360691"
+SpectralBackends = "289ded02-b044-41b2-8b2d-71f2a47755d1"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
+ComputationalBackends = {url = "https://github.com/jbphyswx/ComputationalBackends.jl"}
 NUFSHT = {url = "https://github.com/jbphyswx/NUFSHT.jl"}
 ScatteringTransforms = {path = ".."}
+SpectralBackends = {url = "https://github.com/jbphyswx/SpectralBackends.jl"}
 
 [compat]
 julia = "1.11"

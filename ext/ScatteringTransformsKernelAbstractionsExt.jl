@@ -3,7 +3,7 @@ module ScatteringTransformsKernelAbstractionsExt
 """
     ScatteringTransformsKernelAbstractionsExt — vendor-neutral GPU scattering
 
-The device-agnostic GPU execution path, dispatched on `ST.Backends.GPUBackend{B}` where `B` is any
+The device-agnostic GPU execution path, dispatched on `CB.GPUBackend{B}` where `B` is any
 `KernelAbstractions.Backend` (CUDA/ROCm/oneAPI/Metal for real hardware, `KA.CPU()` for CPU-parity CI).
 
 The scattering engine (`ScatteringCore`, `Scattering{1,2,3}D`) is already array-type-generic — every hot
@@ -30,6 +30,7 @@ correct on device arrays.
 using KernelAbstractions: KernelAbstractions as KA
 using AbstractFFTs: AbstractFFTs
 using LinearAlgebra: LinearAlgebra
+using ComputationalBackends: ComputationalBackends as CB
 using ScatteringTransforms: ScatteringTransforms as ST
 
 # ---------------------------------------------------------------------------
@@ -47,11 +48,28 @@ struct AbstractFFTsScatteringPlan{T, FP, IP} <: ST.Plans.AbstractScatteringPlan
     inv::IP
 end
 
-function ST.Plans.abstractffts_plan(dummy::AbstractArray{Complex{T}}; region = 1:ndims(dummy)) where {T}
-    fwd = AbstractFFTs.plan_fft(dummy, region)
-    inv = AbstractFFTs.plan_ifft(dummy, region)
-    return AbstractFFTsScatteringPlan{T, typeof(fwd), typeof(inv)}(fwd, inv)
+function ST.Plans.abstractffts_plan(dummy::AbstractArray{Complex{T}}; region = 1:ndims(dummy),
+                                    fft_nthreads::Int = 1) where {T}
+    # On a host array `AbstractFFTs` dispatches to FFTW, whose thread count is process-global and is
+    # raised by unrelated packages simply being loaded — so without pinning it here, how many threads
+    # this plan uses (and therefore how many tasks it spawns, and allocates, per execution) would
+    # depend on load order. Device plans ignore this; the hook is a no-op when FFTW is absent.
+    return ST.Plans.with_fft_nthreads(fft_nthreads) do
+        fwd = AbstractFFTs.plan_fft(dummy, region)
+        inv = AbstractFFTs.plan_ifft(dummy, region)
+        return AbstractFFTsScatteringPlan{T, typeof(fwd), typeof(inv)}(fwd, inv)
+    end
 end
+
+# The default `show` of an `AbstractFFTs` plan can reach FFTW's `fftw_sprint_plan`, which can
+# segfault; and a device plan prints its whole device buffer. One line instead.
+Base.show(io::IO, ::AbstractFFTsScatteringPlan{T}) where {T} =
+    print(io, "AbstractFFTsScatteringPlan{", T, "}()")
+Base.show(io::IO, ::MIME"text/plain", p::AbstractFFTsScatteringPlan) = show(io, p)
+
+# A device plan is not reconstructible from a tag alone — it needs its device too — so it declares
+# no spectral backend and `transform_spec` refuses rather than silently reporting a host FFTW plan.
+ST.Plans.task_local_plan(p::AbstractFFTsScatteringPlan) = p
 
 ST.Plans.forward_transform!(out::AbstractArray, p::AbstractFFTsScatteringPlan, x::AbstractArray) =
     (LinearAlgebra.mul!(out, p.fwd, x); out)
@@ -82,230 +100,126 @@ end
 # Device-resident transform constructors (parity with the CUDA ext, vendor-neutral)
 # ---------------------------------------------------------------------------
 
-function ST.Scattering1D.ScatteringTransform1D(N::Int, J::Int, gpu::ST.Backends.GPUBackend;
-                                               Q::Int = 1, max_order::Int = 2, T::Type = Float32)
+function ST.Scattering1D.ScatteringTransform1D(::Type{T}, N::Int, J::Int, gpu::CB.GPUBackend;
+                                               Q::Int = 1, max_order::Int = 2) where {T}
     b = gpu.backend
-    cpu_fb = ST.FilterBanks.build_filter_bank1d(N, J; Q = Q, T = T)
+    cpu_fb = ST.FilterBanks.build_filter_bank1d(T, N, J; Q = Q)
     wavelets = [_to_device(b, ψ) for ψ in cpu_fb.wavelets]
     averaging = _to_device(b, cpu_fb.averaging)
     filter_bank = ST.FilterBanks.FilterBank1D(wavelets, averaging, cpu_fb.meta, cpu_fb.J, cpu_fb.Q)
     tree = ST.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+    groups = _groups(tree, length(wavelets), max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, (N,)))
-    num_w = length(filter_bank.wavelets)
-    buffer_input      = _dzeros(b, Complex{T}, (N,))
-    buffer_signal_fft = _dzeros(b, Complex{T}, (N,))
-    buffer_conv       = _dzeros(b, Complex{T}, (N,))
-    buffer_mod        = _dzeros(b, T, (N,))
-    U1_buffers, U1_fft_buffers = _u1_buffers(b, T, (N,), num_w, max_order)
-    return ST.Scattering1D.ScatteringTransform1D(filter_bank, tree, max_order, plan,
-        buffer_input, buffer_signal_fft, buffer_conv, buffer_mod, U1_buffers, U1_fft_buffers)
+    return ST.Scattering1D.ScatteringTransform1D(filter_bank, tree, groups, max_order, plan,
+        _dzeros(b, Complex{T}, (N,)), _dzeros(b, Complex{T}, (N,)), _dzeros(b, Complex{T}, (N,)),
+        _dzeros(b, T, (N,)), _dzeros(b, T, (N,)), _dzeros(b, Complex{T}, (N,)))
 end
+ST.Scattering1D.ScatteringTransform1D(N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) =
+    ST.Scattering1D.ScatteringTransform1D(Float32, N, J, gpu; kwargs...)
 
-function ST.Scattering2D.ScatteringTransform2D(N::NTuple{2,Int}, J::Int, gpu::ST.Backends.GPUBackend;
-                                               L::Int = 8, max_order::Int = 2, T::Type = Float32)
+function ST.Scattering2D.ScatteringTransform2D(::Type{T}, N::NTuple{2,Int}, J::Int, gpu::CB.GPUBackend;
+                                               L::Int = 8, max_order::Int = 2) where {T}
     b = gpu.backend
-    cpu_fb = ST.FilterBanks.build_filter_bank2d(N, J; L = L, T = T)
+    cpu_fb = ST.FilterBanks.build_filter_bank2d(T, N, J; L = L)
     wavelets = [_to_device(b, ψ) for ψ in cpu_fb.wavelets]
     averaging = _to_device(b, cpu_fb.averaging)
     filter_bank = ST.FilterBanks.FilterBank2D(wavelets, averaging, cpu_fb.meta, cpu_fb.J, cpu_fb.L)
     tree = ST.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+    groups = _groups(tree, length(wavelets), max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, N))
-    num_w = length(filter_bank.wavelets)
-    buffer_input      = _dzeros(b, Complex{T}, N)
-    buffer_signal_fft = _dzeros(b, Complex{T}, N)
-    buffer_conv       = _dzeros(b, Complex{T}, N)
-    buffer_mod        = _dzeros(b, T, N)
-    U1_buffers, U1_fft_buffers = _u1_buffers(b, T, N, num_w, max_order)
-    return ST.Scattering2D.ScatteringTransform2D(filter_bank, tree, max_order, plan,
-        buffer_input, buffer_signal_fft, buffer_conv, buffer_mod, U1_buffers, U1_fft_buffers)
+    return ST.Scattering2D.ScatteringTransform2D(filter_bank, tree, groups, max_order, plan,
+        _dzeros(b, Complex{T}, N), _dzeros(b, Complex{T}, N), _dzeros(b, Complex{T}, N),
+        _dzeros(b, T, N), _dzeros(b, T, N), _dzeros(b, Complex{T}, N))
 end
+ST.Scattering2D.ScatteringTransform2D(N::NTuple{2,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) =
+    ST.Scattering2D.ScatteringTransform2D(Float32, N, J, gpu; kwargs...)
 
-function ST.Scattering3D.ScatteringTransform3D(N::NTuple{3,Int}, J::Int, gpu::ST.Backends.GPUBackend;
-                                               n_orient::Int = 6, max_order::Int = 2, T::Type = Float32)
+function ST.Scattering3D.ScatteringTransform3D(::Type{T}, N::NTuple{3,Int}, J::Int, gpu::CB.GPUBackend;
+                                               n_orient::Int = 6, max_order::Int = 2) where {T}
     b = gpu.backend
-    cpu_fb = ST.FilterBanks.build_filter_bank3d(N, J; n_orient = n_orient, T = T)
+    cpu_fb = ST.FilterBanks.build_filter_bank3d(T, N, J; n_orient = n_orient)
     wavelets = [_to_device(b, ψ) for ψ in cpu_fb.wavelets]
     averaging = _to_device(b, cpu_fb.averaging)
     filter_bank = ST.FilterBanks.FilterBank3D(wavelets, averaging, cpu_fb.meta, cpu_fb.J, cpu_fb.n_orient)
     tree = ST.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
+    groups = _groups(tree, length(wavelets), max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, N))
-    num_w = length(filter_bank.wavelets)
-    buffer_input      = _dzeros(b, Complex{T}, N)
-    buffer_signal_fft = _dzeros(b, Complex{T}, N)
-    buffer_conv       = _dzeros(b, Complex{T}, N)
-    buffer_mod        = _dzeros(b, T, N)
-    U1_buffers, U1_fft_buffers = _u1_buffers(b, T, N, num_w, max_order)
-    return ST.Scattering3D.ScatteringTransform3D(filter_bank, tree, max_order, plan,
-        buffer_input, buffer_signal_fft, buffer_conv, buffer_mod, U1_buffers, U1_fft_buffers)
+    return ST.Scattering3D.ScatteringTransform3D(filter_bank, tree, groups, max_order, plan,
+        _dzeros(b, Complex{T}, N), _dzeros(b, Complex{T}, N), _dzeros(b, Complex{T}, N),
+        _dzeros(b, T, N), _dzeros(b, T, N), _dzeros(b, Complex{T}, N))
 end
+ST.Scattering3D.ScatteringTransform3D(N::NTuple{3,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) =
+    ST.Scattering3D.ScatteringTransform3D(Float32, N, J, gpu; kwargs...)
 
-# Per-wavelet order-2 scratch (empty typed vectors when max_order < 2).
-function _u1_buffers(backend, ::Type{T}, dims, num_w, max_order) where {T}
-    real_proto    = _dzeros(backend, T, dims)
-    complex_proto = _dzeros(backend, Complex{T}, dims)
-    if max_order >= 2
-        U1_buffers     = [_dzeros(backend, T, dims) for _ in 1:num_w]
-        U1_fft_buffers = [_dzeros(backend, Complex{T}, dims) for _ in 1:num_w]
-        return U1_buffers, U1_fft_buffers
-    else
-        return typeof(real_proto)[], typeof(complex_proto)[]
-    end
-end
+# The cascade's work list. Path topology is integer bookkeeping, so it stays on the host even for a
+# device-resident transform.
+_groups(tree, nw::Int, max_order::Int) =
+    max_order >= 2 ? ST.PathGraph.order2_groups(tree, nw) : [(j, Int[], Int[]) for j in 1:nw]
 
 # ---------------------------------------------------------------------------
 # Batched-FFT throughput path — the performant `scattering_batch(::GPUBackend, …)`
 # ---------------------------------------------------------------------------
 
-# Flattened-output row (1-based) of the upper-triangular S2 entry (j1, j2), j2 > j1, matching
-# `ST.Coefficients.flatten2d!`/`flatten1d!`: [S0; S1(1:n); pairs (j1,j2) for j1=1:n, j2=j1+1:n].
-@inline _tri_row(j1::Int, j2::Int, n::Int) =
-    1 + n + ((j1 - 1) * n - ((j1 - 1) * j1) ÷ 2) + (j2 - j1)
-
 """
-    GPUBatchWorkspace
+    gpu_batch_workspace(gpu, st, B) -> ST.Batched.BatchWorkspace
 
-Preallocated device state for repeated `scattering_batch!` calls at a fixed batch size `B`: the batched
-FFT plan, all scratch buffers, **device copies of the filter wavelets** (so a host-built `st` also works
-on a real GPU), and the **precomputed admissible order-2 pair structure**. Once constructed,
-`scattering_batch!` does no data-proportional allocation — every hot-loop op is in place against these
-buffers. All container/array fields are type parameters, so the struct stays concretely typed.
+Device-resident state for repeated `scattering_batch!` calls at a fixed batch size `B`: the batched
+`AbstractFFTs` plan, `(spatial…, B)` scratch, and **device copies of the filter wavelets**, so a
+host-built `st` also runs on a device.
 
-Built from `GPUBatchWorkspace(gpu, st, B)`; the transform grid and element type are taken from `st`.
+The cascade itself is [`ST.Batched.batch_cascade!`](@ref) — the same code the CPU path runs. It
+names no device: every operation is a broadcast, a plan execution, or a `mapreduce`, all of which
+dispatch on the array type. This extension therefore supplies allocation and a plan, and nothing
+else.
 """
-struct GPUBatchWorkspace{P, RA, CA, WV, G}
-    plan::P        # batched AbstractFFTs plan over the spatial dims of the (N…, B) stack
-    xr::RA         # real input,  (N…, B)
-    xf::CA         # signal FFT,  (N…, B)  (persistent across the batch)
-    c1::CA         # complex scratch A (multiply result / complexify input)
-    c2::CA         # complex scratch B (inverse output / U1 FFT)
-    c3::CA         # complex scratch C (order-2 child inverse; keeps c2=U1f intact)
-    rmod::RA       # real modulus scratch, (N…, B)
-    sbuf::RA       # spatial-reduction target, (1…, B)
-    wavelets::WV   # device copies of the filter wavelets (indexed 1:n)
-    n::Int         # number of wavelets
-    groups::G      # precomputed admissible (j1, children) pairs; empty when max_order < 2
-end
-
-function GPUBatchWorkspace(gpu::ST.Backends.GPUBackend, st, B::Int)
+function gpu_batch_workspace(gpu::CB.GPUBackend, st, B::Int)
     b = gpu.backend
     T = real(eltype(st.filter_bank.averaging))
-    spatial = size(st.buffer_mod)                 # (N,) for 1D, (Ny, Nx) for 2D
+    spatial = size(st.buffer_mod)                 # (N,) 1D, (Ny,Nx) 2D, (Nz,Ny,Nx) 3D
     D = length(spatial)
     stack = (spatial..., B)
-    xr = _dzeros(b, T, stack)
-    xf = _dzeros(b, Complex{T}, stack)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, stack); region = 1:D)
-    wavelets = [_to_device(b, ψ) for ψ in st.filter_bank.wavelets]
-    groups = _order2_groups(st.tree, length(wavelets), st.max_order)
-    return GPUBatchWorkspace(plan, xr, xf,
-        _dzeros(b, Complex{T}, stack), _dzeros(b, Complex{T}, stack), _dzeros(b, Complex{T}, stack),
-        _dzeros(b, T, stack), _dzeros(b, T, (ntuple(_ -> 1, D)..., B)),
-        wavelets, length(wavelets), groups)
+    cz() = _dzeros(b, Complex{T}, stack)
+    red = _dzeros(b, T, (ntuple(_ -> 1, D)..., B))
+    # Filters carry the trailing singleton so they broadcast over the batch axis; shaping them here
+    # keeps `reshape` (which allocates an array object) out of the cascade's inner loop.
+    wavelets = [reshape(_to_device(b, ψ), (spatial..., 1)) for ψ in st.filter_bank.wavelets]
+    return ST.Batched.BatchWorkspace(plan, _dzeros(b, T, stack), cz(), cz(), cz(), cz(),
+        _dzeros(b, T, stack), red, reshape(red, B), wavelets, length(wavelets),
+        st.groups, 1 / prod(spatial))
 end
 
-# ---- 2D batched ----
+for (Mod, TT, CF, ND, dimarg) in (
+        (:Scattering1D, :ScatteringTransform1D, :_flen1d, 2, :(size(X, 2))),
+        (:Scattering2D, :ScatteringTransform2D, :_flen2d, 3, :(size(X, 3))),
+        (:Scattering3D, :ScatteringTransform3D, :_flen3d, 4, :(size(X, 4))))
+    @eval begin
+        function ST.scattering_batch(gpu::CB.GPUBackend, st::ST.$Mod.$TT,
+                                     X::AbstractArray{<:Any,$ND})
+            T = real(eltype(st.filter_bank.averaging))
+            out = _dzeros(gpu.backend, T, ($CF(st, T), $dimarg))
+            return ST.scattering_batch!(out, gpu, st, X)
+        end
 
-function ST.scattering_batch(gpu::ST.Backends.GPUBackend, st::ST.Scattering2D.ScatteringTransform2D,
-                             X::AbstractArray{<:Any,3})
-    T = real(eltype(st.filter_bank.averaging))
-    flen = ST.Coefficients.flatten_length(
-        ST.Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.L, T;
-                                              compute_S2 = st.max_order >= 2))
-    out = _dzeros(gpu.backend, T, (flen, size(X, 3)))
-    return ST.scattering_batch!(out, gpu, st, X)
-end
-
-function ST.scattering_batch!(out::AbstractMatrix, gpu::ST.Backends.GPUBackend,
-                              st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3};
-                              workspace::GPUBatchWorkspace = GPUBatchWorkspace(gpu, st, size(X, 3)))
-    Ny, Nx, _ = size(X)
-    T = real(eltype(st.filter_bank.averaging))
-    _batch_common!(out, workspace, X, one(T) / (Ny * Nx), (Ny, Nx))
-    return out
-end
-
-# ---- 1D batched ----
-
-function ST.scattering_batch(gpu::ST.Backends.GPUBackend, st::ST.Scattering1D.ScatteringTransform1D,
-                             X::AbstractMatrix)
-    T = real(eltype(st.filter_bank.averaging))
-    nw = length(st.filter_bank.wavelets)
-    flen = ST.Coefficients.flatten_length(
-        ST.Coefficients.ScatteringCoefficients1D(nw, T; compute_S2 = st.max_order >= 2))
-    out = _dzeros(gpu.backend, T, (flen, size(X, 2)))
-    return ST.scattering_batch!(out, gpu, st, X)
-end
-
-function ST.scattering_batch!(out::AbstractMatrix, gpu::ST.Backends.GPUBackend,
-                              st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix;
-                              workspace::GPUBatchWorkspace = GPUBatchWorkspace(gpu, st, size(X, 2)))
-    N = size(X, 1)
-    T = real(eltype(st.filter_bank.averaging))
-    _batch_common!(out, workspace, X, one(T) / N, (N,))
-    return out
-end
-
-# Shared batched cascade for 1D/2D. `spatial` is the grid tuple ((N,) or (Ny,Nx)); each wavelet filter
-# is reshaped to `(spatial..., 1)` so it broadcasts over the batch axis. All ops write into the
-# preallocated workspace buffers (no data-proportional allocation).
-function _batch_common!(out::AbstractMatrix, w::GPUBatchWorkspace, X, invN, spatial::NTuple{D,Int}) where {D}
-    B = size(X)[end]
-    n = w.n
-    fshape = (spatial..., 1)
-
-    copyto!(w.xr, X)
-    @. w.c1 = complex(w.xr)
-    ST.Plans.forward_transform!(w.xf, w.plan, w.c1)                 # w.xf = FFT(input)
-
-    # S0 (row 1); clear the S2 block so non-admissible pairs read as zero (matching flatten2d!/1d!)
-    Base.sum!(w.sbuf, w.xr)
-    @views out[1, :] .= reshape(w.sbuf, B) .* invN
-    @views out[(n + 2):end, :] .= zero(eltype(out))
-
-    # S1 (rows 2 .. n+1). Reshapes are hoisted out of `@.` (which would broadcast `reshape` itself).
-    @inbounds for j in 1:n
-        ψ = reshape(w.wavelets[j], fshape)
-        @. w.c1 = w.xf * ψ
-        ST.Plans.inverse_transform!(w.c2, w.plan, w.c1)
-        @. w.rmod = abs(w.c2)
-        Base.sum!(w.sbuf, w.rmod)
-        @views out[1 + j, :] .= reshape(w.sbuf, B) .* invN
-    end
-
-    # S2 — j1-outer so only one U1/U1f buffer is live at a time
-    @inbounds for (j1, children) in w.groups
-        ψ1 = reshape(w.wavelets[j1], fshape)
-        @. w.c1 = w.xf * ψ1
-        ST.Plans.inverse_transform!(w.c2, w.plan, w.c1)
-        @. w.rmod = abs(w.c2)                                    # U1_{j1}
-        @. w.c1 = complex(w.rmod)
-        ST.Plans.forward_transform!(w.c2, w.plan, w.c1)             # w.c2 = FFT(U1_{j1})
-        for j2 in children
-            ψ2 = reshape(w.wavelets[j2], fshape)
-            @. w.c1 = w.c2 * ψ2
-            ST.Plans.inverse_transform!(w.c3, w.plan, w.c1)
-            @. w.rmod = abs(w.c3)
-            Base.sum!(w.sbuf, w.rmod)
-            @views out[_tri_row(j1, j2, n), :] .= reshape(w.sbuf, B) .* invN
+        # `workspace` is annotated so the keyword is concretely typed: an unannotated keyword is
+        # `Any`, and the call then boxes it on every invocation.
+        function ST.scattering_batch!(out::AbstractMatrix, gpu::CB.GPUBackend, st::ST.$Mod.$TT,
+                                      X::AbstractArray{<:Any,$ND};
+                                      workspace::ST.Batched.BatchWorkspace =
+                                          gpu_batch_workspace(gpu, st, $dimarg))
+            return ST.Batched.batch_cascade!(out, workspace, X)
         end
     end
-    return out
 end
 
-# Precompute the admissible order-2 structure once: for each first-order wavelet j1 with ≥1 admissible
-# child, the children j2 (from the path tree). Empty when max_order < 2.
-function _order2_groups(tree, n::Int, max_order::Int)
-    groups = Tuple{Int, Vector{Int}}[]
-    max_order >= 2 || return groups
-    for j1 in 1:n
-        children = Int[]
-        for p in ST.PathGraph.order_range(tree, 2)
-            idx = ST.PathGraph.path_indices(tree, p)
-            idx[1] == j1 && push!(children, idx[2])
-        end
-        isempty(children) || push!(groups, (j1, children))
-    end
-    return groups
-end
+_flen1d(st, ::Type{T}) where {T} = ST.Coefficients.flatten_length(
+    ST.Coefficients.ScatteringCoefficients1D(length(st.filter_bank.wavelets), T;
+                                             compute_S2 = st.max_order >= 2))
+_flen2d(st, ::Type{T}) where {T} = ST.Coefficients.flatten_length(
+    ST.Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.L, T;
+                                             compute_S2 = st.max_order >= 2))
+_flen3d(st, ::Type{T}) where {T} = ST.Coefficients.flatten_length(
+    ST.Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.n_orient, T;
+                                             compute_S2 = st.max_order >= 2))
 
 end # module ScatteringTransformsKernelAbstractionsExt

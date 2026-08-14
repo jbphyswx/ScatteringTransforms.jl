@@ -13,20 +13,21 @@ backend may be `GPUBackend{…}` for multi-GPU with CUDA-aware MPI.
 """
 
 using MPI: MPI
+using ComputationalBackends: ComputationalBackends as CB
 using ScatteringTransforms: ScatteringTransforms as ST
 
 # Contiguous, in-order block of columns assigned to `rank` (0-based) of `nranks` (may be empty).
 _rank_block(ncols::Int, nranks::Int, rank::Int) =
     (div(rank * ncols, nranks) + 1):(div((rank + 1) * ncols, nranks))
 
-function _mpi_batch(b::ST.Backends.MPIBackend, st, X, slicer)
+function _mpi_batch(b::CB.AbstractMPIBackend, st, X, slicer)
     MPI.Initialized() ||
         throw(ArgumentError("MPI is not initialized — call `MPI.Init()` before scattering_batch(MPIBackend(), …)."))
-    comm = MPI.COMM_WORLD
+    comm = b.comm === nothing ? MPI.COMM_WORLD : b.comm
     rank = MPI.Comm_rank(comm)
     nranks = MPI.Comm_size(comm)
     ncols = size(X)[end]
-    inner = ST.Backends.local_backend(b)
+    inner = CB.local_backend(b)
 
     # Each rank computes its own contiguous column block (blocks tile 1:ncols in rank order).
     localmat = ST.scattering_batch(inner, st, slicer(X, _rank_block(ncols, nranks, rank)))
@@ -40,10 +41,13 @@ function _mpi_batch(b::ST.Backends.MPIBackend, st, X, slicer)
     return reshape(recv, flen, ncols)
 end
 
-ST.scattering_batch(b::ST.Backends.MPIBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix) =
-    _mpi_batch(b, st, X, (A, cols) -> A[:, cols])
+ST.scattering_batch(b::CB.AbstractMPIBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix) =
+    _mpi_batch(b, st, X, (A, cols) -> view(A, :, cols))
 
-ST.scattering_batch(b::ST.Backends.MPIBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
-    _mpi_batch(b, st, X, (A, cols) -> A[:, :, cols])
+ST.scattering_batch(b::CB.AbstractMPIBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
+    _mpi_batch(b, st, X, (A, cols) -> view(A, :, :, cols))
+
+ST.scattering_batch(b::CB.AbstractMPIBackend, st::ST.Scattering3D.ScatteringTransform3D, X::AbstractArray{<:Any,4}) =
+    _mpi_batch(b, st, X, (A, cols) -> view(A, :, :, :, cols))
 
 end # module ScatteringTransformsMPIExt

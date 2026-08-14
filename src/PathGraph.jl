@@ -9,14 +9,12 @@ The scattering transform is a tree of paths `(λ₁, λ₂, …)` of wavelet ind
 
 - reproduces the 1D constraint `j₂ > j₁` exactly (the 1D bank is built in `j_eff`-increasing
   order, so a flat `i₂ > i₁` already meant `j_eff` increasing); and
-- *fixes* the 2D constraint: it admits all orientation pairs `(l₁, l₂)` across strictly coarser
-  scales while excluding same-scale pairs (which share `j_eff`). The previous code looped on the
-  flat wavelet index, wrongly mixing scale and orientation.
-
-This replaces any reliance on a dense matrix's sparsity pattern with an explicit path list.
+- in 2D, admits all orientation pairs `(l₁, l₂)` across strictly coarser scales while excluding
+  same-scale pairs, which share `j_eff`. Admissibility is a statement about scale alone; a flat
+  loop over the wavelet index would mix scale and orientation, since one index encodes both.
 """
 
-export ScatteringTree, build_tree, npaths, path_indices, order_range
+export ScatteringTree, build_tree, npaths, path_indices, order_range, order2_groups
 
 """
     ScatteringTree{IV,RV}
@@ -112,6 +110,33 @@ function build_tree(j_eff::AbstractVector, max_order::Integer)
     end
 
     return ScatteringTree(path_data, path_ptr, order, by_order)
+end
+
+"""
+    order2_groups(tree, nw) -> Vector{Tuple{Int,Vector{Int},Vector{Int}}}
+
+Every first-order wavelet `j1` paired with its admissible order-2 children `j2` and the tree path
+ids of those `(j1, j2)` pairs, ordered longest-first. The path ids are what the localized-field
+output is indexed by; the coefficient cascade only needs `(j1, j2)`.
+
+The cascade walks this instead of the flat order-2 path list so that a first-order modulus is
+computed and transformed **once** per `j1` and reused across its children, rather than recomputed
+per path. Longest-first ordering is for the parallel backends: the child count varies by roughly
+`3×` across scales, so equal-sized chunks of a natural-order list load-imbalance badly.
+"""
+function order2_groups(tree::ScatteringTree, nw::Integer)
+    children = [Int[] for _ in 1:nw]
+    pathids = [Int[] for _ in 1:nw]
+    if length(tree.by_order) >= 3
+        for p in order_range(tree, 2)
+            idx = path_indices(tree, p)
+            push!(children[idx[1]], idx[2])
+            push!(pathids[idx[1]], p)
+        end
+    end
+    groups = [(j1, children[j1], pathids[j1]) for j1 in 1:nw]
+    sort!(groups; by = g -> -length(g[2]))
+    return groups
 end
 
 end # module PathGraph

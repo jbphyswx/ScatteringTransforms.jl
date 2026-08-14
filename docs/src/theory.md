@@ -113,7 +113,7 @@ transforms only, via the identity `|∇_S g|² = ½Δ_S(g²) − g\,Δ_S g`.
 
 Convolutions are done in the spectral domain. The core ships a dependency-free **direct-sum
 DFT** default; loading `FFTW` selects an `O(N\log N)` fast path automatically
-(`spectral = AutoSpectral()`). Batches reuse one plan (`scattering_batch`), and `using OhMyThreads`
+(`spectral = AutoSpectralBackend()`). Batches reuse one plan (`scattering_batch`), and `using OhMyThreads`
 enables a multithreaded batched transform (`ThreadedBackend`). The hot path is written with
 broadcasts/reductions so it also runs on GPU arrays. The mutation-free `scattering(st, x)` is the
 autodiff-friendly counterpart used by synthesis.

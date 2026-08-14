@@ -14,11 +14,14 @@ Planar (Cartesian) and spherical scattering, on uniform/structured and nonunifor
 | Sphere (S²) | `structured_spherical_scattering` (exact direct SHT; FastSphericalHarmonics fast path) | `spherical_scattering` (exact direct SHT; NUFSHT fast path) |
 
 **Every cell has an in-core, dependency-free default** (direct summation), with an optional fast path
-selected by the `spectral` keyword: scattered-planar uses `Plans.DirectNUFFTBackend` (default) or
-`Plans.NUFFTBackend` (FINUFFT); scattered-sphere uses `SphericalCore.DirectSHTBackend` (default) or
-`SphericalCore.NUSHTBackend` (NUFSHT); structured-sphere uses `SphericalCore.DirectSHTBackend` (default)
-or `SphericalCore.SHTBackend` (FastSphericalHarmonics). `Plans.AutoSpectral` (the default) picks the
-fast path if its extension is loaded, else the direct sum — so nothing requires an external library.
+selected by the `spectral` keyword, which takes a
+[SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag. `DirectSumSpectralBackend`
+is the in-core default everywhere; the fast paths are `FFTSpectralBackend` (FFTW) on a grid,
+`NUFFTSpectralBackend` (FINUFFT or NonuniformFFTs) for scattered points, `NUFSHTSpectralBackend`
+(NUFSHT) for the scattered sphere, and `FSHTSpectralBackend` (FastSphericalHarmonics) for the
+structured sphere. `AutoSpectralBackend` (the default) picks the fast path if its extension is
+loaded, else the direct sum — so nothing requires an external library. Naming a backend explicitly is
+honoured exactly: if its extension is absent it raises rather than silently downgrading.
 
 Monogenic (Riesz) variants exist on both sphere paths; see below (pointwise
 `spherical_monogenic_components` additionally needs the NUFSHT spin-1 synthesis).
@@ -91,25 +94,35 @@ ScatteringTransforms.Reductions.log_coefficients
 
 ## Batching & backends
 
+Where a transform runs is chosen with a backend from
+[ComputationalBackends.jl](https://github.com/jbphyswx/ComputationalBackends.jl) — `SerialBackend`,
+`ThreadedBackend`, `GPUBackend`, `DistributedBackend`, `MPIBackend`, `AutoBackend` — passed as the
+second argument to `scattering_batch`. Which spectral algorithm it uses is chosen with a
+[SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag passed as `spectral=` at
+construction. Each is honoured exactly: naming a backend whose extension is not loaded raises rather
+than falling back.
+
 ```@docs
 ScatteringTransforms.scattering_batch
-ScatteringTransforms.Backends.SerialBackend
-ScatteringTransforms.Backends.ThreadedBackend
-ScatteringTransforms.Backends.GPUBackend
-ScatteringTransforms.Backends.DistributedBackend
-ScatteringTransforms.Backends.MPIBackend
-ScatteringTransforms.Backends.AutoBackend
-ScatteringTransforms.SubsampledScattering.SubsampledScattering1D
+ScatteringTransforms.scattering_batch!
+ScatteringTransforms.batch_coeffs
+ScatteringTransforms.flat_rows
+ScatteringTransforms.batch_workspace
+ScatteringTransforms.Batched.BatchWorkspace
+ScatteringTransforms.Batched.batch_cascade!
 ```
 
-## Domains
+## Multi-resolution second order
+
+The second order runs on a decimated grid, which is where most of a transform's work is. Opt-in and
+approximate; `oversampling` converges it to the exact transform.
 
 ```@docs
-ScatteringTransforms.Domains.Line1D
-ScatteringTransforms.Domains.Plane2D
-ScatteringTransforms.Domains.Volume3D
-ScatteringTransforms.Domains.Sphere
-ScatteringTransforms.Domains.spatial_ndims
+ScatteringTransforms.SubsampledScattering.MultiResolutionScattering
+ScatteringTransforms.SubsampledScattering.SubsampledScattering1D
+ScatteringTransforms.SubsampledScattering.SubsampledScattering2D
+ScatteringTransforms.SubsampledScattering.SubsampledScattering3D
+ScatteringTransforms.SubsampledScattering.subsampled_scattering!
 ```
 
 ## Filter banks, filters & path graph

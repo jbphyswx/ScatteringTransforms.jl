@@ -13,7 +13,7 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
     n2 = vec([Float64(j) for i in 0:Ny-1, j in 0:Nx-1])
     f = randn(Ny, Nx)
     grid = ScatteringTransforms.Scattering2D.ScatteringTransform2D((Ny, Nx), J;
-        L=L, max_order=2, spectral=ScatteringTransforms.Plans.FFTBackend())
+        L=L, max_order=2, spectral=SpectralBackends.FFTSpectralBackend())
     ref = ScatteringTransforms.Coefficients.flatten2d(grid(f))
 
     Test.@testset "uniform-grid parity reproduces the gridded FFT transform" begin
@@ -31,12 +31,12 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         # The in-core DirectNUFFTBackend uses exact direct summation, no FINUFFT: on the uniform grid it
         # must reproduce the gridded FFT transform to machine precision, and match the FINUFFT path.
         dir = ScatteringTransforms.scattered_planar_scattering(n1, n2, (Ny, Nx), J;
-            L=L, max_order=2, period=(Ny, Nx), spectral=ScatteringTransforms.Plans.DirectNUFFTBackend())
+            L=L, max_order=2, period=(Ny, Nx), spectral=SpectralBackends.DirectSumSpectralBackend())
         Test.@test dir.plan isa ScatteringTransforms.Plans.DirectNUFFTPlan
         cd = ScatteringTransforms.Coefficients.flatten2d(dir(vec(f)))
         Test.@test cd ≈ ref rtol=1e-9
         fin = ScatteringTransforms.scattered_planar_scattering(n1, n2, (Ny, Nx), J;
-            L=L, max_order=2, period=(Ny, Nx), spectral=ScatteringTransforms.Plans.NUFFTBackend())
+            L=L, max_order=2, period=(Ny, Nx), spectral=ScatteringTransforms.Plans.FINUFFTBackend())
         Test.@test cd ≈ ScatteringTransforms.Coefficients.flatten2d(fin(vec(f))) rtol=1e-6
     end
 
