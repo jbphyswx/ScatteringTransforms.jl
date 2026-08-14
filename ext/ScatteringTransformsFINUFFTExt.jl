@@ -12,10 +12,10 @@ interface as the in-core `ST.Plans.DirectNUFFTPlan`, so the cascade is identical
 
 Plans use FFT mode ordering (`modeord=1`) so the mode grid matches the filter bank's `fftfreq` lattice;
 on a uniform `0:m-1` grid Type-1/Type-2 reduce to `fft`/`ifft`. The core `scattered_planar_scattering`
-selects this plan when `spectral` is `ST.Plans.NUFFTBackend()` (or `ST.Plans.AutoSpectral()` with this
-extension loaded).
+selects this plan when `spectral` is `SB.NUFFTSpectralBackend()` (or `SB.AutoSpectralBackend()` with
+this extension loaded).
 
-**Correctness note.** The Type-1 adjoint (`solve=false`) equals the true DFT on a uniform grid and is
+The Type-1 adjoint (`solve=false`) equals the true DFT on a uniform grid and is
 accurate for adequately-sampled band-limited fields, but on gappy/irregular sampling it is only the
 adjoint, not the inverse. `solve=true` runs a conjugate-gradient least-squares inversion for the true
 band-limited coefficients — slower, but the principled choice for irregular data. The caller picks per
@@ -71,6 +71,17 @@ function _make_plan(x, y, ms::NTuple{2,Int}, ::Type{T}, period, eps, solve, maxi
     finalizer(pl -> (FINUFFT.finufft_destroy!(pl.guru1); FINUFFT.finufft_destroy!(pl.guru2)), plan)
     return plan
 end
+
+# `guru1`/`guru2` are opaque C handles; the default `show` would walk them. One line instead.
+Base.show(io::IO, p::NUFFTScatteringPlan{T}) where {T} =
+    print(io, "NUFFTScatteringPlan{", T, "}(ms=", p.ms, ", M=", p.M, ", solve=", p.solve, ")")
+Base.show(io::IO, ::MIME"text/plain", p::NUFFTScatteringPlan) = show(io, p)
+
+ST.Plans.spectral_backend(::NUFFTScatteringPlan) = ST.Plans.FINUFFTBackend()
+
+# The guru plans hold internal state that FINUFFT does not document as re-entrant, so a task takes
+# its own plan rather than sharing one.
+ST.Plans.task_local_plan(p::NUFFTScatteringPlan) = p
 
 # Fast-path plan constructor filled into the core `ST.Plans.finufft_scattered_plan` declaration; the core
 # `scattered_planar_scattering` cascade builds it when `spectral` selects the FINUFFT backend.

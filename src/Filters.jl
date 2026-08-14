@@ -57,7 +57,7 @@ struct Morlet1D{T<:Real}
     end
 end
 
-# Convenience constructor - defaults to Float64 for backward compatibility
+# Convenience constructor - defaults to Float64
 Morlet1D(N::Int, j::Real; kwargs...) = Morlet1D{Float64}(N, j; kwargs...)
 
 """

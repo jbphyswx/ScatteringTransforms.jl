@@ -1,4 +1,6 @@
 [deps]
+ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
+SpectralBackends = "289ded02-b044-41b2-8b2d-71f2a47755d1"
 AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
@@ -7,4 +9,6 @@ ScatteringTransforms = "68b593e8-16bb-4169-afcb-087dab360691"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
+ComputationalBackends = {url = "https://github.com/jbphyswx/ComputationalBackends.jl"}
+SpectralBackends = {url = "https://github.com/jbphyswx/SpectralBackends.jl"}
 ScatteringTransforms = { path = ".." }

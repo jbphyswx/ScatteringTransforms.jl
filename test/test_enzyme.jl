@@ -1,22 +1,35 @@
-# Reverse-mode autodiff coverage (Mooncake backend, via DifferentiationInterface).
+# Reverse-mode autodiff coverage (Enzyme backend, via DifferentiationInterface).
 #
-# Mooncake's abstract-interpreter hooks Julia's compiler internals, so it fails to precompile on
-# pre-release Julia (nightly/rc). Unlike JET — which ships a no-op stub, so `using JET` survives
-# (see test_jet.jl) — loading Mooncake hard-errors there, and an unconditional load would crash the
-# whole suite. So gate the load *and* the tests on released Julia with `@static if`, mirroring the JET
-# gate. The autodiff checks run on every released version in CI; nightly skips only these (and still
-# exercises the rest of the package, giving genuine early-warning signal).
+# Gated on released Julia: Enzyme compiles against LLVM internals and does not reliably build on
+# pre-release versions, so an unconditional load would take the whole suite down on nightly. The
+# gate mirrors test_jet.jl, so nightly still exercises everything except these checks.
 using ScatteringTransforms: ScatteringTransforms
+using SpectralBackends: SpectralBackends
 using DifferentiationInterface: DifferentiationInterface as DI
-using ADTypes: AutoMooncake
+using ADTypes: AutoEnzyme
 using Random: Random
 using Test: Test
 
 @static if isempty(VERSION.prerelease)
-    using Mooncake: Mooncake   # loads DifferentiationInterface's Mooncake extension used below
+    using Enzyme: Enzyme   # loads DifferentiationInterface's Enzyme extension used below
 
-    Test.@testset "Autodiff through scattering(st,x): Mooncake gradient matches finite differences" begin
-        Random.seed!(1)   # reproducibility (this AD-vs-FD check is seed-robust anyway: rel err ~1e-9)
+    # Reverse mode: the objective is scalar in a length-N vector, so one reverse pass gives the
+    # whole gradient. `Const` on the closure marks the captured transform as non-differentiable —
+    # its filter bank and plan tables are constants of the problem, not parameters.
+    #
+    # No custom AD rule is needed: the direct-sum plan's non-mutating transform is plain scalar
+    # arithmetic over its twiddle table. A dense-matrix formulation would need one, because Enzyme
+    # has no derivative for complex `gemm`.
+    #
+    # Runtime activity is on because `scattering` maps closures over the filter bank, so each
+    # closure captures constant filters alongside the active input and static activity analysis
+    # cannot separate them. This is Enzyme's documented remedy for mixed activity, not a workaround
+    # for a defect in the transform.
+    enzyme_backend() = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+                                  function_annotation = Enzyme.Const)
+
+    Test.@testset "Autodiff through scattering(st,x): Enzyme gradient matches finite differences" begin
+        Random.seed!(1)   # reproducibility (this AD-vs-FD check is seed-robust anyway)
         N, J = 32, 3
         st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2,
                                                         spectral=SpectralBackends.DirectSumSpectralBackend())
@@ -27,7 +40,7 @@ using Test: Test
         loss(x) = sum(abs2, ScatteringTransforms.Coefficients.first_order(ScatteringTransforms.ScatteringCore.scattering(st, x)) .- t1) +
                   sum(abs2, ScatteringTransforms.Coefficients.second_order(ScatteringTransforms.ScatteringCore.scattering(st, x)) .- t2)
 
-        backend = AutoMooncake()
+        backend = enzyme_backend()
         x0 = randn(N)
         prep = DI.prepare_gradient(loss, backend, x0)
         val, grad = DI.value_and_gradient(loss, prep, backend, x0)
@@ -40,12 +53,11 @@ using Test: Test
         Test.@test isapprox(sum(grad .* d), fd; rtol=1e-3, atol=1e-8)
     end
 
-    Test.@testset "Gradient-descent synthesis (DifferentiationInterface ext, Mooncake)" begin
+    Test.@testset "Gradient-descent synthesis (DifferentiationInterface ext, Enzyme)" begin
         # synthesize: from noise, descend ‖S(x̂) − S(target)‖² so the coefficients converge.
         # `iters=400` is a converged budget: the coefficient error decreases monotonically with
-        # iterations (≈0.014→0.0007 from 150→1000 on the hardest init sampled), so at 400 steps *any*
-        # random init lands well under the 0.1 relative-error bar — the seed below is only for
-        # reproducibility, not to dodge slow-converging inits.
+        # iterations, so at 400 steps any random init lands well under the 0.1 relative-error bar —
+        # the seed below is only for reproducibility, not to dodge slow-converging inits.
         Random.seed!(1)
         N, J = 48, 4
         iters = 400
@@ -53,7 +65,7 @@ using Test: Test
                                                         spectral=SpectralBackends.DirectSumSpectralBackend())
         xtarget = cumsum(randn(N)); xtarget .-= sum(xtarget) / N
         res = ScatteringTransforms.synthesize(st, xtarget;
-                                              backend=AutoMooncake(), init=randn(N), iters=iters, lr=0.05)
+                                              backend=enzyme_backend(), init=randn(N), iters=iters, lr=0.05)
         Test.@test length(res.losses) == iters
         Test.@test all(isfinite, res.field)
         Test.@test res.losses[end] < res.losses[1] / 5           # objective drops substantially
@@ -66,12 +78,12 @@ using Test: Test
         Test.@test rel < 0.1
 
         # Target may also be passed as a precomputed coefficient container.
-        res2 = ScatteringTransforms.synthesize(st, ct; backend=AutoMooncake(), init=randn(N), iters=20)
+        res2 = ScatteringTransforms.synthesize(st, ct; backend=enzyme_backend(), init=randn(N), iters=20)
         Test.@test res2.losses[end] < res2.losses[1]
     end
 else
-    Test.@testset "Mooncake autodiff (skipped on pre-release Julia)" begin
-        @info "Skipping Mooncake autodiff checks: Mooncake fails to precompile on pre-release Julia $(VERSION)"
+    Test.@testset "Enzyme autodiff (skipped on pre-release Julia)" begin
+        @info "Skipping Enzyme autodiff checks: Enzyme does not build on pre-release Julia $(VERSION)"
         Test.@test_skip true
     end
 end

@@ -72,7 +72,8 @@ end
 """
     WaveletMeta{T}
 
-Concrete per-wavelet metadata (replaces the abstract `Vector{NamedTuple}`).
+Concrete per-wavelet metadata: a struct rather than a `NamedTuple`, so the container stays
+concretely typed.
 
 # Fields
 - `scale::Int`: octave index `j`
@@ -128,7 +129,7 @@ Build a 1D Morlet filter bank with dyadic scales.
 # Returns
 - `FilterBank1D`: Complete filter bank with J scales
 """
-function build_filter_bank1d(N::Int, J::Int; Q::Int=1, T::Type{<:Real}=Float64)
+function build_filter_bank1d(::Type{T}, N::Int, J::Int; Q::Int=1) where {T<:Real}
     # Create first wavelet to get the array type
     morlet = Filters.Morlet1D{T}(N, 0; Q=Q)
     ψ_sample = Filters.frequency_response(morlet)
@@ -154,6 +155,7 @@ function build_filter_bank1d(N::Int, J::Int; Q::Int=1, T::Type{<:Real}=Float64)
 
     return FilterBank1D(wavelets, ϕ, meta, J, Q)
 end
+build_filter_bank1d(N::Int, J::Int; kwargs...) = build_filter_bank1d(Float64, N, J; kwargs...)
 
 """
     FilterBank2D{T,M,W,MV}
@@ -190,7 +192,7 @@ Build a 2D oriented Morlet filter bank.
 # Returns
 - `FilterBank2D`: Complete 2D filter bank
 """
-function build_filter_bank2d(N::NTuple{2,Int}, J::Int; L::Int=8, T::Type{<:Real}=Float64)
+function build_filter_bank2d(::Type{T}, N::NTuple{2,Int}, J::Int; L::Int=8) where {T<:Real}
     # Create sample wavelet to get matrix type
     morlet = Filters.Morlet2D{T}(N, 0, 0.0; L=L)
     ψ_sample = Filters.frequency_response(morlet)
@@ -218,6 +220,7 @@ function build_filter_bank2d(N::NTuple{2,Int}, J::Int; L::Int=8, T::Type{<:Real}
 
     return FilterBank2D(wavelets, ϕ, meta, J, L)
 end
+build_filter_bank2d(N::NTuple{2,Int}, J::Int; kwargs...) = build_filter_bank2d(Float64, N, J; kwargs...)
 
 """
     FilterBank3D{T,A<:AbstractArray{Complex{T},3}}
@@ -239,7 +242,7 @@ end
 Build a 3D oriented Morlet filter bank with `J` dyadic scales and `n_orient` near-uniform
 orientations on the sphere (Fibonacci spiral).
 """
-function build_filter_bank3d(N::NTuple{3,Int}, J::Int; n_orient::Int=6, T::Type{<:Real}=Float64)
+function build_filter_bank3d(::Type{T}, N::NTuple{3,Int}, J::Int; n_orient::Int=6) where {T<:Real}
     dirs = Filters.fibonacci_directions(n_orient, T)
     morlet = Filters.Morlet3D{T}(N, 0, dirs[1])
     ψ_sample = Filters.frequency_response(morlet)
@@ -258,5 +261,6 @@ function build_filter_bank3d(N::NTuple{3,Int}, J::Int; n_orient::Int=6, T::Type{
     ϕ = _tight_frame_lowpass!(wavelets)
     return FilterBank3D(wavelets, ϕ, meta, J, n_orient)
 end
+build_filter_bank3d(N::NTuple{3,Int}, J::Int; kwargs...) = build_filter_bank3d(Float64, N, J; kwargs...)
 
 end # module FilterBanks

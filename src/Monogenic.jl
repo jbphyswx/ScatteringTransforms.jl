@@ -27,6 +27,7 @@ partition `Σ_d |R_d(k)|² = 1` off-DC, so no frequency is amplified.
 using ..Filters: Filters
 using ..FilterBanks: FilterBanks
 using ..Plans: Plans
+using SpectralBackends: SpectralBackends as SB
 using ..PathGraph: PathGraph
 using ..Coefficients: Coefficients
 using ..ScatteringCore: ScatteringCore
@@ -97,15 +98,17 @@ struct MonogenicFilterBank{D, T, A<:AbstractArray{Complex{T},D}, W<:AbstractVect
 end
 
 """
-    build_monogenic_bank(dims::NTuple{D,Int}, J; Q=1, T=Float64) -> MonogenicFilterBank
+    build_monogenic_bank([T=Float64,] dims::NTuple{D,Int}, J; Q=1) -> MonogenicFilterBank
 
 Build a `D`-dimensional isotropic Morlet-style monogenic filter bank: `J` octaves × `Q`
 sub-octaves of radial band-pass wavelets (center frequency `ξ_j = ξ₀·2^{-j/Q}`, widths from the
 Lostanlen/Kymatio rule, reusing [`Filters.Morlet1D`](@ref) for the radial profile), the Riesz
 multipliers, and the tight-frame complementary low-pass.
 """
-function build_monogenic_bank(dims::NTuple{D,Int}, J::Int; Q::Int=1,
-                              T::Type{<:Real}=Float64) where {D}
+build_monogenic_bank(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
+    build_monogenic_bank(Float64, dims, J; kwargs...)
+
+function build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1) where {T<:Real,D}
     A = Array{Complex{T},D}
     wavelets = Vector{A}(undef, 0)
     meta = Vector{FilterBanks.WaveletMeta{T}}(undef, 0)
@@ -161,14 +164,14 @@ struct MonogenicScattering{D, T, FB<:MonogenicFilterBank, Tree<:PathGraph.Scatte
 end
 
 """
-    MonogenicScattering(dims, J; Q=1, max_order=2, T=Float64, spectral=AutoSpectral())
+    MonogenicScattering([T=Float64,] dims, J; Q=1, max_order=2, spectral=AutoSpectralBackend())
 
 Construct a monogenic scattering transform for fields of size `dims` (`Int` or `NTuple{D,Int}`).
+The element type is positional, as for `zeros(T, …)`; omit it for `Float64`.
 """
-function MonogenicScattering(dims::NTuple{D,Int}, J::Int; Q::Int=1, max_order::Int=2,
-                             T::Type=Float64,
-                             spectral::Plans.AbstractSpectralBackend=Plans.AutoSpectral()) where {D}
-    fb = build_monogenic_bank(dims, J; Q=Q, T=T)
+function MonogenicScattering(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1, max_order::Int=2,
+                             spectral::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T,D}
+    fb = build_monogenic_bank(T, dims, J; Q=Q)
     tree = PathGraph.build_tree([m.j_eff for m in fb.meta], max_order)
     plan = Plans.make_plan(spectral, T, dims)
     cb() = zeros(Complex{T}, dims)
@@ -178,7 +181,11 @@ function MonogenicScattering(dims::NTuple{D,Int}, J::Int; Q::Int=1, max_order::I
                                typeof(cb()),typeof(zeros(T, dims)),typeof(U1_fft)}(
         fb, tree, max_order, plan, dims, cb(), cb(), cb(), cb(), zeros(T, dims), U1_fft)
 end
-MonogenicScattering(N::Int, J::Int; kwargs...) = MonogenicScattering((N,), J; kwargs...)
+MonogenicScattering(::Type{T}, N::Int, J::Int; kwargs...) where {T} =
+    MonogenicScattering(T, (N,), J; kwargs...)
+MonogenicScattering(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
+    MonogenicScattering(Float64, dims, J; kwargs...)
+MonogenicScattering(N::Int, J::Int; kwargs...) = MonogenicScattering(Float64, (N,), J; kwargs...)
 
 # In-place monogenic amplitude of the field whose FFT is `Xf`, band-passed by wavelet `ψ`.
 # Writes √(m₀² + Σ_d m_d²) into `dst`. Reuses buffer_freq/buffer_conv; leaves Xf intact.

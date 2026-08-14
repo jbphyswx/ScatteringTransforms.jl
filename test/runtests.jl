@@ -6,6 +6,8 @@ using ExplicitImports: ExplicitImports as EI
 
 # Use the required import style: using X: X
 using ScatteringTransforms: ScatteringTransforms
+using ComputationalBackends: ComputationalBackends
+using SpectralBackends: SpectralBackends
 using FFTW: FFTW
 using OhMyThreads: OhMyThreads
 using Distributed: Distributed
@@ -50,9 +52,15 @@ end
 # where JET refuses to run — see test_jet.jl).
 include("test_jet.jl")
 
-# Reverse-mode autodiff coverage (Mooncake via DifferentiationInterface); Mooncake can't precompile
-# on pre-release Julia, so its load + tests are gated to released versions there — see test_mooncake.jl.
-include("test_mooncake.jl")
+# Reverse-mode autodiff coverage via DifferentiationInterface. Enzyme is the backend under test;
+# the equivalent Mooncake suite is kept but off by default, because Mooncake currently conflicts
+# with the CUDA version FINUFFT is pinned to. Run it with `ST_TEST_MOONCAKE=1`.
+include("test_enzyme.jl")
+get(ENV, "ST_TEST_MOONCAKE", "0") == "1" && include("test_mooncake.jl")
+
+# Structural gates: spectral-execution counts, workspace scaling, backend honesty — the properties
+# that a performance regression would break first, asserted by counting rather than by timing.
+include("test_structure.jl")
 
 Test.@testset "Type stability (concrete struct fields + inferred transforms)" begin
     # Every field of the transform struct must be concretely typed — in particular the FFT plan
@@ -75,7 +83,7 @@ Test.@testset "Type stability (concrete struct fields + inferred transforms)" be
     Test.@test (Test.@inferred st2(image); true)
 
     # Element type is preserved end-to-end (Float32 in -> Float32 out).
-    stf = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, T=Float32)
+    stf = ScatteringTransforms.Scattering1D.ScatteringTransform1D(Float32, N, J; Q=1, max_order=2)
     cf = stf(Float32.(signal))
     Test.@test eltype(ScatteringTransforms.Coefficients.first_order(cf)) == Float32
     Test.@test ScatteringTransforms.Coefficients.zeroth_order(cf) isa Float32
@@ -500,8 +508,8 @@ Test.@testset "3D volumetric scattering transform" begin
     end
 
     # in-core direct sum matches the FFTW fast path in 3D
-    st_d = ScatteringTransforms.Scattering3D.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=ScatteringTransforms.Plans.DirectSumBackend())
-    st_f = ScatteringTransforms.Scattering3D.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=ScatteringTransforms.Plans.FFTBackend())
+    st_d = ScatteringTransforms.Scattering3D.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=SpectralBackends.DirectSumSpectralBackend())
+    st_f = ScatteringTransforms.Scattering3D.ScatteringTransform3D(N, J; n_orient=n_orient, max_order=2, spectral=SpectralBackends.FFTSpectralBackend())
     Test.@test isapprox(ScatteringTransforms.Coefficients.first_order(st_d(vol)),
                         ScatteringTransforms.Coefficients.first_order(st_f(vol)); rtol=1e-6)
     Test.@test isapprox(ScatteringTransforms.Coefficients.second_order(st_d(vol)),
@@ -667,12 +675,12 @@ Test.@testset "Threaded batch (OhMyThreads) matches serial batch" begin
     st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     X = randn(N, 6)
     serial = ScatteringTransforms.scattering_batch(st, X)
-    threaded = ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.ThreadedBackend(), st, X)
+    threaded = ScatteringTransforms.scattering_batch(ComputationalBackends.ThreadedBackend(), st, X)
     Test.@test threaded ≈ serial
 
     st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
     X2 = randn(24, 24, 5)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.ThreadedBackend(), st2, X2) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ComputationalBackends.ThreadedBackend(), st2, X2) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
 end
 
@@ -684,12 +692,12 @@ Test.@testset "Distributed batch (single process) matches serial" begin
     J = 4
     st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     X = randn(N, 6)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.DistributedBackend(), st, X) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ComputationalBackends.DistributedBackend(), st, X) ≈
                ScatteringTransforms.scattering_batch(st, X)
 
     st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
     X2 = randn(24, 24, 5)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.DistributedBackend(), st2, X2) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ComputationalBackends.DistributedBackend(), st2, X2) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
 end
 
@@ -702,11 +710,11 @@ Test.@testset "MPI batch (single rank) matches serial" begin
     J = 4
     st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
     X = randn(N, 6)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.MPIBackend(), st, X) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ComputationalBackends.MPIBackend(), st, X) ≈
                ScatteringTransforms.scattering_batch(st, X)
     st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((24, 24), 3; L=4, max_order=2)
     X2 = randn(24, 24, 5)
-    Test.@test ScatteringTransforms.scattering_batch(ScatteringTransforms.Backends.MPIBackend(), st2, X2) ≈
+    Test.@test ScatteringTransforms.scattering_batch(ComputationalBackends.MPIBackend(), st2, X2) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
 end
 
@@ -715,16 +723,16 @@ Test.@testset "Spectral plans: in-core direct sum matches FFTW fast path" begin
     N = 128
     J = 4
     signal = randn(N)
-    st_d = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ScatteringTransforms.Plans.DirectSumBackend())
-    st_f = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ScatteringTransforms.Plans.FFTBackend())
+    st_d = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SpectralBackends.DirectSumSpectralBackend())
+    st_f = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SpectralBackends.FFTSpectralBackend())
     cd, cf = st_d(signal), st_f(signal)
     Test.@test isapprox(ScatteringTransforms.Coefficients.zeroth_order(cd), ScatteringTransforms.Coefficients.zeroth_order(cf); rtol=1e-6)
     Test.@test isapprox(ScatteringTransforms.Coefficients.first_order(cd), ScatteringTransforms.Coefficients.first_order(cf); rtol=1e-6)
     Test.@test isapprox(ScatteringTransforms.Coefficients.second_order(cd), ScatteringTransforms.Coefficients.second_order(cf); rtol=1e-6)
 
     img = randn(32, 32)
-    s2d = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=ScatteringTransforms.Plans.DirectSumBackend())
-    s2f = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=ScatteringTransforms.Plans.FFTBackend())
+    s2d = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=SpectralBackends.DirectSumSpectralBackend())
+    s2f = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, spectral=SpectralBackends.FFTSpectralBackend())
     Test.@test isapprox(ScatteringTransforms.Coefficients.first_order(s2d(img)),
                         ScatteringTransforms.Coefficients.first_order(s2f(img)); rtol=1e-6)
     Test.@test isapprox(ScatteringTransforms.Coefficients.second_order(s2d(img)),
@@ -843,7 +851,7 @@ Test.@testset "Non-mutating scattering(st,x) matches the in-place st(x) (1D/2D/3
     let
         N, J = 64, 4
         x = randn(N)
-        for spec in (ScatteringTransforms.Plans.DirectSumBackend(), ScatteringTransforms.Plans.FFTBackend())
+        for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.FFTSpectralBackend())
             st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=2, max_order=2, spectral=spec)
             cm = st(x); cs = ScatteringTransforms.ScatteringCore.scattering(st, x)
             Test.@test ScatteringTransforms.Coefficients.zeroth_order(cm) ≈ ScatteringTransforms.Coefficients.zeroth_order(cs)
@@ -867,7 +875,7 @@ Test.@testset "Non-mutating scattering(st,x) matches the in-place st(x) (1D/2D/3
     end
     # Element-type genericity: Float32 in -> Float32 out through the non-mutating path.
     let
-        st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(32, 3; Q=1, max_order=2, T=Float32)
+        st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(Float32, 32, 3; Q=1, max_order=2)
         cs = ScatteringTransforms.ScatteringCore.scattering(st, randn(Float32, 32))
         Test.@test eltype(ScatteringTransforms.Coefficients.first_order(cs)) == Float32
     end
@@ -948,7 +956,7 @@ Test.@testset "Monogenic (Riesz) scattering: partition, tight frame, transforms"
         Test.@test all(isfinite, ScatteringTransforms.Coefficients.second_order(c))
     end
     let
-        stf = ScatteringTransforms.Monogenic.MonogenicScattering((32, 32), 2; Q=1, max_order=2, T=Float32)
+        stf = ScatteringTransforms.Monogenic.MonogenicScattering(Float32, (32, 32), 2; Q=1, max_order=2)
         cf = stf(randn(Float32, 32, 32))
         Test.@test eltype(ScatteringTransforms.Coefficients.first_order(cf)) == Float32
     end

@@ -29,9 +29,12 @@ Fast, generic wavelet scattering transforms in Julia.
   faster paths selected via the `spectral` keyword.
 - **Pluggable spectral backend**: dependency-free direct-sum default; `using FFTW` switches on
   an `O(N log N)` fast path automatically
-  (`spectral = AutoSpectral() | DirectSumBackend() | FFTBackend()`).
-- **Batching & threading**: `scattering_batch` reuses one plan/workspace; `using OhMyThreads`
-  enables `scattering_batch(ThreadedBackend(), …)`.
+  (`spectral = AutoSpectralBackend() | DirectSumSpectralBackend() | FFTSpectralBackend()`).
+- **Batching & threading**: `scattering_batch` reuses one plan/workspace across the batch, on every
+  surface — gridded 1D/2D/3D, scattered planar, and the sphere; `using OhMyThreads` enables
+  `scattering_batch(ThreadedBackend(), …)`, which is bit-identical to serial.
+- **Multi-resolution second order**: `SubsampledScattering1D/2D/3D` run the order-2 cascade on a
+  decimated grid, converging to the exact transform as `oversampling` grows.
 - **Vendor-neutral GPU**: `using KernelAbstractions, AbstractFFTs` + a device backend (e.g.
   `using CUDA`) gives a device-resident transform via `GPUBackend(CUDA.CUDABackend())` and a
   batched-throughput `scattering_batch(gpu, st, X)` — CUDA/ROCm/oneAPI/Metal, validated on `KA.CPU()`.

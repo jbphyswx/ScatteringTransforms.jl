@@ -16,10 +16,12 @@ Run with: `julia --project=. synthesis_and_inverse.jl`
 """
 
 using ScatteringTransforms: ScatteringTransforms as ST
+using SpectralBackends: SpectralBackends as SB
 using FFTW: FFTW                                       # O(N log N) spectral fast path
 using DifferentiationInterface: DifferentiationInterface as DI
-using ADTypes: AutoMooncake
-import Mooncake                                        # the AD backend implementation
+using ADTypes: ADTypes
+# using Mooncake: Mooncake                                        # the AD backend implementation
+using Enzyme: Enzyme
 using Statistics: Statistics
 using Test: Test
 
@@ -37,7 +39,7 @@ end
 N, J = 256, 6
 sig = spectral_signal(N, -5/3)
 # FFTW fast path for the (AD-free) exact inverse and phase retrieval.
-st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.FFTBackend())
+st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.FFTSpectralBackend())
 
 # ── 1. exact linear inverse ───────────────────────────────────────────────────
 wt = ST.Inverse.wavelet_transform(st, sig)            # complex (pre-modulus) wavelet + low-pass fields
@@ -57,8 +59,9 @@ println("2. phase retrieval:        modulus rel. err = ", round(mod_relerr; sigd
 # ── 3. gradient-descent synthesis from scattering coefficients ────────────────
 # Use the in-core direct-sum forward: it is differentiable by *every* AD backend with no special
 # rules (FFTW-fast-path reverse-mode AD needs the backend's FFT rules — see the docs).
-st_ad = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.DirectSumBackend())
-res = ST.synthesize(st_ad, sig; backend=AutoMooncake(), init=randn(N), iters=300, lr=0.05)
+st_ad = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.DirectSumSpectralBackend())
+# res = ST.synthesize(st_ad, sig; backend=ADTypes.AutoMooncake(), init=randn(N), iters=300, lr=0.05)
+res = ST.synthesize(st_ad, sig; backend=ADTypes.AutoEnzyme(), init=randn(N), iters=300, lr=0.05)
 cT, cS = ST.ScatteringCore.scattering(st_ad, sig), ST.ScatteringCore.scattering(st_ad, res.field)
 s1_relerr = sqrt(sum(abs2, ST.Coefficients.first_order(cS) .- ST.Coefficients.first_order(cT))) /
             sqrt(sum(abs2, ST.Coefficients.first_order(cT)))

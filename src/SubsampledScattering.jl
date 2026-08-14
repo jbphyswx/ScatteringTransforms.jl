@@ -4,121 +4,244 @@ module SubsampledScattering
     SubsampledScattering.jl — fast second order via intermediate subsampling
 
 The first-order modulus field `U₁ = |x ⋆ ψ_{j₁}|` is a low-frequency envelope (the modulus
-demodulates the narrow-band wavelet response), so it is oversampled at full resolution `N` and
-can be decimated by `2^(scale - oversampling)` before the second wavelet transform — making the
-order-2 FFTs run on shorter arrays. This needs the second-stage wavelets at the reduced
+demodulates the narrow-band wavelet response), so it is oversampled at the full grid and can be
+decimated by `2^(scale - oversampling)` on every axis before the second wavelet transform — making
+the order-2 transforms run on a smaller grid. This needs the second-stage wavelets at the reduced
 resolution (a multi-resolution bank), and decimation is mildly approximate (controlled by
 `oversampling`). Opt-in; with a large `oversampling` it reproduces the exact transform.
+
+Decimating in space is periodising in frequency, so the strided view below is the exact operation;
+what is approximate is the assumption that `U₁` carries no energy above the reduced Nyquist. That
+error is what `oversampling` buys down.
+
+The saving grows with dimension: decimating by `ds` shrinks the grid by `ds^D`, so on a 3D volume a
+factor of two costs the second order eight times less work.
 """
 
 using ..Plans: Plans
-using ..Filters: Filters
+using ComputationalBackends: ComputationalBackends as CB
+using SpectralBackends: SpectralBackends as SB
 using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Coefficients: Coefficients
 using ..PathGraph: PathGraph
 
-export SubsampledScattering1D
+export MultiResolutionScattering
+export SubsampledScattering1D, SubsampledScattering2D, SubsampledScattering3D
+export subsampled_scattering!
 
 """
-    SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=1, T=Float64, spectral=:auto)
+    Level{WV,P,CA,RA}
 
-A 1D scattering transform with fast second order via intermediate subsampling: the first-order
-modulus envelope is decimated by `2^(scale - oversampling)` before the second wavelet transform
-(multi-resolution wavelet bank). Opt-in and approximate — a large `oversampling` reproduces the
-exact [`ScatteringTransform1D`](@ref ScatteringTransforms.Scattering1D.ScatteringTransform1D);
-aggressive values trade a little accuracy for speed.
+One resolution of the multi-resolution cascade: the wavelet bank and spectral plan on the decimated
+grid, plus the buffers the second order runs in there. Buffers live on the level, so a path costs no
+allocation.
 """
-struct SubsampledScattering1D{T, Tree<:PathGraph.ScatteringTree,
-                              MV<:AbstractVector{FilterBanks.WaveletMeta{T}}, WF<:AbstractVector,
-                              PF<:Plans.AbstractScatteringPlan, LV<:AbstractDict}
-    N::Int
+struct Level{WV, P, CA, RA}
+    ds::Int
+    wavelets::WV
+    plan::P
+    uc::CA        # complexified (decimated) first-order field
+    uf::CA        # its spectrum — computed once per j1, reused by every child
+    conv::CA      # inverse-transform output
+    mult::CA      # multiply scratch
+    u::RA         # decimated first-order field, gathered from the strided view
+end
+
+"""
+    MultiResolutionScattering{T,D}
+
+Scattering transform with a multi-resolution second order, on a `D`-dimensional grid. Build one with
+[`SubsampledScattering1D`](@ref), [`SubsampledScattering2D`](@ref) or
+[`SubsampledScattering3D`](@ref); they differ only in which filter bank they build, and share this
+type and one cascade.
+"""
+struct MultiResolutionScattering{T, D, FB, Tree <: PathGraph.ScatteringTree, G <: AbstractVector,
+                            PF <: Plans.AbstractScatteringPlan, CA <: AbstractArray{Complex{T}},
+                            RA <: AbstractArray{T}, LV <: AbstractDict}
+    dims::NTuple{D, Int}
     J::Int
-    Q::Int
     max_order::Int
     oversampling::Int
+    filter_bank::FB                # full-resolution bank (wavelets, averaging, meta, J, Q/L/n_orient)
     tree::Tree
-    meta::MV
-    wavelets_full::WF              # ψ_i at full N
-    plan_full::PF                  # full-resolution spectral plan (concrete type param)
-    levels::LV                     # ds > 1 ⇒ (reduced-resolution wavelets, reduced-resolution plan)
+    groups::G                      # (j1, children, path ids), longest-first
+    plan_full::PF
+    xc::CA                         # complexified input
+    xfft::CA                       # its spectrum, read-only across the cascade
+    conv::CA                       # full-resolution inverse-transform output
+    mult::CA                       # full-resolution multiply scratch
+    u1::RA                         # full-resolution first-order modulus
+    levels::LV                     # ds => Level, covering every ds the tree uses (including 1)
 end
 
 # Decimation factor for a first-order wavelet of octave `scale`.
 _ds(scale::Int, oversampling::Int) = 1 << max(0, scale - oversampling)
 
-function SubsampledScattering1D(N::Int, J::Int; Q::Int = 1, max_order::Int = 2, oversampling::Int = 1,
-                                T::Type = Float64,
-                                spectral::Plans.AbstractSpectralBackend = Plans.AutoSpectral())
-    fb = FilterBanks.build_filter_bank1d(N, J; Q = Q, T = T)
-    meta = fb.meta
-    wavelets_full = fb.wavelets
-    tree = PathGraph.build_tree([m.j_eff for m in meta], max_order)
-    plan_full = Plans.make_plan(spectral, T, (N,))
+# Orientations per scale, however the bank spells it — the second index of the 2D/3D container.
+_orient_count(fb::FilterBanks.FilterBank1D) = fb.Q
+_orient_count(fb::FilterBanks.FilterBank2D) = fb.L
+_orient_count(fb::FilterBanks.FilterBank3D) = fb.n_orient
 
-    # Reduced-resolution wavelet bank + plan for each distinct ds > 1 (concrete Dict value type).
-    levels = Dict{Int, Tuple{typeof(wavelets_full), typeof(plan_full)}}()
-    for m in meta
+"""
+    _build(T, dims, bank_at; J, max_order, oversampling, spectral) -> MultiResolutionScattering
+
+Shared construction. `bank_at(dims)` builds the filter bank on a given grid, so the caller supplies
+the dimension-specific bank and everything else is common.
+
+Reduced-resolution banks go through the same builder as the full one, which is what applies the
+tight-frame normalisation. Building them from bare frequency responses instead leaves out that
+factor (measured `0.90` in 1D and `0.38` in 2D, i.e. not close to 1), which would rescale every
+decimated second-order coefficient.
+"""
+function _build(::Type{T}, dims::NTuple{D, Int}, bank_at; J::Int, max_order::Int,
+                oversampling::Int, spectral::SB.AbstractSpectralBackend) where {T, D}
+    fb = bank_at(dims)
+    tree = PathGraph.build_tree([m.j_eff for m in fb.meta], max_order)
+    nw = length(fb.wavelets)
+    groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) : [(j, Int[], Int[]) for j in 1:nw]
+    plan_full = Plans.make_plan(spectral, T, dims)
+
+    lvl(ds, wl, pl, rd) = Level(ds, wl, pl, Array{Complex{T}, D}(undef, rd),
+                                Array{Complex{T}, D}(undef, rd), Array{Complex{T}, D}(undef, rd),
+                                Array{Complex{T}, D}(undef, rd), Array{T, D}(undef, rd))
+    LT = typeof(lvl(1, fb.wavelets, plan_full, dims))
+    levels = Dict{Int, LT}()
+    for m in fb.meta
         ds = _ds(m.scale, oversampling)
-        (ds == 1 || haskey(levels, ds)) && continue
-        N1 = N ÷ ds
-        N1 * ds == N || throw(ArgumentError("oversampling/scale gives ds=$ds not dividing N=$N"))
-        wl = [Filters.frequency_response(Filters.Morlet1D{T}(N1, mm.scale * Q + mm.q; Q = Q)) for mm in meta]
-        levels[ds] = (wl, Plans.make_plan(spectral, T, (N1,)))
+        haskey(levels, ds) && continue
+        if ds == 1
+            levels[1] = lvl(1, fb.wavelets, plan_full, dims)
+            continue
+        end
+        rd = map(n -> n ÷ ds, dims)
+        all(map((r, n) -> r * ds == n, rd, dims)) ||
+            throw(ArgumentError("oversampling/scale gives ds=$ds, which does not divide dims=$dims"))
+        levels[ds] = lvl(ds, bank_at(rd).wavelets, Plans.make_plan(spectral, T, rd), rd)
     end
-    return SubsampledScattering1D{T, typeof(tree), typeof(meta), typeof(wavelets_full),
-                                  typeof(plan_full), typeof(levels)}(
-        N, J, Q, max_order, oversampling, tree, meta, wavelets_full, plan_full, levels)
+
+    return MultiResolutionScattering{T, D, typeof(fb), typeof(tree), typeof(groups), typeof(plan_full),
+                                Array{Complex{T}, D}, Array{T, D}, typeof(levels)}(
+        dims, J, max_order, oversampling, fb, tree, groups, plan_full,
+        Array{Complex{T}, D}(undef, dims), Array{Complex{T}, D}(undef, dims),
+        Array{Complex{T}, D}(undef, dims), Array{Complex{T}, D}(undef, dims),
+        Array{T, D}(undef, dims), levels)
 end
 
-function (st::SubsampledScattering1D{T})(signal::AbstractVector) where {T}
-    N = st.N
-    num_w = length(st.wavelets_full)
-    coeffs = Coefficients.ScatteringCoefficients1D(num_w, T; compute_S2 = st.max_order >= 2)
+"""
+    SubsampledScattering1D([T=Float64,] N, J; Q=1, max_order=2, oversampling=1,
+                           spectral=AutoSpectralBackend())
 
-    xc = complex.(T.(signal))
-    xfft = similar(xc)
-    Plans.forward_transform!(xfft, st.plan_full, xc)
+1D scattering with a multi-resolution second order: the first-order modulus envelope is decimated by
+`2^(scale - oversampling)` before the second wavelet transform. Opt-in and approximate — a large
+`oversampling` reproduces the exact
+[`ScatteringTransform1D`](@ref ScatteringTransforms.Scattering1D.ScatteringTransform1D); aggressive
+values trade a little accuracy for speed.
+"""
+SubsampledScattering1D(::Type{T}, N::Int, J::Int; Q::Int = 1, max_order::Int = 2,
+                       oversampling::Int = 1,
+                       spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {T} =
+    _build(T, (N,), d -> FilterBanks.build_filter_bank1d(T, d[1], J; Q = Q);
+           J = J, max_order = max_order, oversampling = oversampling, spectral = spectral)
+SubsampledScattering1D(N::Int, J::Int; kwargs...) = SubsampledScattering1D(Float64, N, J; kwargs...)
 
-    conv = similar(xc)
-    mult = similar(xc)
-    modbuf = Vector{T}(undef, N)
+"""
+    SubsampledScattering2D([T=Float64,] (Ny, Nx), J; L=8, max_order=2, oversampling=1,
+                           spectral=AutoSpectralBackend())
 
-    # first order (full resolution)
-    U1 = [Vector{T}(undef, N) for _ in 1:num_w]
-    @inbounds for i in 1:num_w
-        ScatteringCore.wavelet_convolve!(conv, xfft, st.wavelets_full[i], st.plan_full, mult)
-        ScatteringCore.apply_modulus!(U1[i], conv)
-        coeffs.S1[i] = ScatteringCore.spatial_average(U1[i])
-    end
+2D counterpart of [`SubsampledScattering1D`](@ref). Decimating by `ds` shrinks the second order's
+grid by `ds²`.
+"""
+SubsampledScattering2D(::Type{T}, N::NTuple{2, Int}, J::Int; L::Int = 8, max_order::Int = 2,
+                       oversampling::Int = 1,
+                       spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {T} =
+    _build(T, N, d -> FilterBanks.build_filter_bank2d(T, d, J; L = L);
+           J = J, max_order = max_order, oversampling = oversampling, spectral = spectral)
+SubsampledScattering2D(N::NTuple{2, Int}, J::Int; kwargs...) =
+    SubsampledScattering2D(Float64, N, J; kwargs...)
 
-    # second order with intermediate subsampling of U1
-    if st.max_order >= 2
-        for p in PathGraph.order_range(st.tree, 2)
-            idx = PathGraph.path_indices(st.tree, p)
-            i1, i2 = idx[1], idx[2]
-            ds = _ds(st.meta[i1].scale, st.oversampling)
-            if ds == 1
-                ψ = st.wavelets_full[i2]; plan = st.plan_full; u = U1[i1]
-            else
-                wl, plan = st.levels[ds]
-                ψ = wl[i2]
-                u = @view U1[i1][1:ds:(1 + (N ÷ ds - 1) * ds)]   # decimate the envelope
-            end
-            n1 = length(u)
-            uc = complex.(u)
-            uf = similar(uc)
-            Plans.forward_transform!(uf, plan, uc)
-            c2 = similar(uc); m2 = similar(uc)
-            ScatteringCore.wavelet_convolve!(c2, uf, ψ, plan, m2)
-            mb = Vector{T}(undef, n1)
-            ScatteringCore.apply_modulus!(mb, c2)
-            coeffs.S2[i1, i2] = ScatteringCore.spatial_average(mb)
+"""
+    SubsampledScattering3D([T=Float64,] (Nz, Ny, Nx), J; n_orient=6, max_order=2, oversampling=1,
+                           spectral=AutoSpectralBackend())
+
+3D counterpart of [`SubsampledScattering1D`](@ref). Decimating by `ds` shrinks the second order's
+grid by `ds³`, which is where this path pays off most.
+"""
+SubsampledScattering3D(::Type{T}, N::NTuple{3, Int}, J::Int; n_orient::Int = 6,
+                       max_order::Int = 2, oversampling::Int = 1,
+                       spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {T} =
+    _build(T, N, d -> FilterBanks.build_filter_bank3d(T, d, J; n_orient = n_orient);
+           J = J, max_order = max_order, oversampling = oversampling, spectral = spectral)
+SubsampledScattering3D(N::NTuple{3, Int}, J::Int; kwargs...) =
+    SubsampledScattering3D(Float64, N, J; kwargs...)
+
+Base.show(io::IO, st::MultiResolutionScattering{T, D}) where {T, D} =
+    print(io, "MultiResolutionScattering{", T, ",", D, "}(dims=", st.dims, ", J=", st.J,
+          ", oversampling=", st.oversampling, ")")
+
+# Decimation in space == periodisation in frequency: a strided read on every axis.
+@inline _decimated(u::AbstractArray{<:Any, D}, ds::Int, rd::NTuple{D, Int}) where {D} =
+    view(u, ntuple(d -> 1:ds:(1 + (rd[d] - 1) * ds), D)...)
+
+"""
+    subsampled_scattering!(coeffs, st, field) -> coeffs
+
+In-place multi-resolution scattering into a pre-allocated coefficient container. Allocation-free.
+
+Grouped by first-order wavelet, so each `U₁` is decimated and transformed **once** and reused by
+every one of its children, rather than once per order-2 path.
+"""
+function subsampled_scattering!(coeffs, st::MultiResolutionScattering{T, D},
+                                field::AbstractArray{<:Any, D}) where {T, D}
+    st.xc .= complex.(field)
+    Plans.forward_transform!(st.xfft, st.plan_full, st.xc)
+    isempty(coeffs.S2) || fill!(coeffs.S2, zero(eltype(coeffs.S2)))
+    wavelets, meta = st.filter_bank.wavelets, st.filter_bank.meta
+
+    @inbounds for (j1, children, _) in st.groups
+        ScatteringCore.wavelet_convolve!(st.conv, st.xfft, wavelets[j1], st.plan_full, st.mult)
+        coeffs.S1[j1] = ScatteringCore.modulus_mean!(st.u1, st.conv)
+        isempty(children) && continue
+
+        lev = st.levels[_ds(meta[j1].scale, st.oversampling)]
+        if lev.ds == 1
+            copyto!(lev.u, st.u1)
+        else
+            copyto!(lev.u, _decimated(st.u1, lev.ds, size(lev.u)))
+        end
+        lev.uc .= complex.(lev.u)
+        Plans.forward_transform!(lev.uf, lev.plan, lev.uc)
+        for j2 in children
+            ScatteringCore.wavelet_convolve!(lev.conv, lev.uf, lev.wavelets[j2],
+                                             lev.plan, lev.mult)
+            coeffs.S2[j1, j2] = ScatteringCore.modulus_mean(lev.conv)
         end
     end
+    return Coefficients.update_S0(coeffs, ScatteringCore.spatial_average(field))
+end
 
-    S0 = ScatteringCore.spatial_average(signal)
-    return Coefficients.update_S0(coeffs, S0)
+# 1D reports scales along one axis; 2D and 3D report scales × orientations, as their exact
+# counterparts do.
+coeff_container(st::MultiResolutionScattering{T, 1}) where {T} =
+    Coefficients.ScatteringCoefficients1D(length(st.filter_bank.wavelets), T;
+                                          compute_S2 = st.max_order >= 2)
+coeff_container(st::MultiResolutionScattering{T}) where {T} =
+    Coefficients.ScatteringCoefficients2D(st.filter_bank.J, _orient_count(st.filter_bank), T;
+                                          compute_S2 = st.max_order >= 2)
+
+(st::MultiResolutionScattering{T, D})(field::AbstractArray{<:Any, D}) where {T, D} =
+    subsampled_scattering!(coeff_container(st), st, field)
+
+# Shares the read-only banks, tree and plan tables; copies only the buffers.
+function ScatteringCore.task_workspace(st::MultiResolutionScattering)
+    lv = typeof(st.levels)()
+    for (ds, l) in st.levels
+        lv[ds] = Level(l.ds, l.wavelets, Plans.task_local_plan(l.plan), similar(l.uc),
+                       similar(l.uf), similar(l.conv), similar(l.mult), similar(l.u))
+    end
+    return typeof(st)(st.dims, st.J, st.max_order, st.oversampling, st.filter_bank, st.tree,
+                      st.groups, Plans.task_local_plan(st.plan_full), similar(st.xc),
+                      similar(st.xfft), similar(st.conv), similar(st.mult), similar(st.u1), lv)
 end
 
 end # module SubsampledScattering

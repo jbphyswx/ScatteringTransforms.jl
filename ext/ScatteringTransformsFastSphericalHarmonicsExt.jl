@@ -10,26 +10,68 @@ Clenshaw–Curtis grid of `FastSphericalHarmonics`
 `sph_evaluate!`. The DoG band-pass bank, S0/S1/S2 cascade, and the spin-0 Bochner monogenic amplitude
 are shared with `SphericalCore`; this extension only supplies the plan and the two interface methods.
 
-The spherical average (`sphere_mean`) is the exact Clenshaw–Curtis quadrature integral, read directly
-from the degree-0 harmonic coefficient (`c₀₀ · Y₀₀`, `Y₀₀ = 1/√(4π)`).
+The spherical average (`sphere_mean`) is the exact quadrature integral, evaluated directly as a
+weighted sum over the grid. Reading it from the degree-0 harmonic coefficient instead would be
+equally exact but would cost a full forward SHT — and the cascade takes `J + J(J−1)/2 + 1` means
+per transform.
 """
 
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
+using LinearAlgebra: LinearAlgebra
 using ScatteringTransforms: ScatteringTransforms as ST
 
 """
-    SHTSphericalPlan{T} <: SphericalCore.AbstractSphericalPlan
+    SHTSphericalPlan{T,V,M} <: SphericalCore.AbstractSphericalPlan
 
 Structured spherical plan on a Clenshaw–Curtis grid (`N = lmax+1` colatitudes, `2N-1` longitudes),
 backed by `FastSphericalHarmonics`. The forward SHT is exact for band-limited fields, so this backend
 needs no iterative solve. `FastSphericalHarmonics` supports `Float64` only, so `T == Float64`.
+
+`θweights` are the colatitude quadrature weights (Fejér first rule, summing to 2 as `∫sinθ dθ` does);
+`cbuf` is the coefficient scratch `sphere_apply!` filters in, so a band costs no allocation.
 """
-struct SHTSphericalPlan{T} <: ST.SphericalCore.AbstractSphericalPlan
+struct SHTSphericalPlan{T, V <: AbstractVector{T}, M <: AbstractMatrix{T}, C} <: ST.SphericalCore.AbstractSphericalPlan
     lmax::Int
-    inv_sqrt4pi::T         # Y₀₀ = 1/√(4π): turns the ℓ=0 coefficient into the spherical mean
+    inv_sqrt4pi::T         # Y₀₀ = 1/√(4π)
+    θweights::V            # (Nθ) quadrature weights over colatitude
+    invnφ::T               # 1/Nφ — the longitude average, which is uniform
+    cbuf::M                # (Nθ, Nφ) coefficient scratch
+    cache::C               # FastSphericalHarmonics transform plans, built once (see below)
 end
 
-SHTSphericalPlan(lmax::Int) = SHTSphericalPlan{Float64}(lmax, 1 / sqrt(4π))
+# `sph_transform!`/`sph_evaluate!` take the plan cache as a keyword argument whose default
+# constructs a *fresh, empty* cache — so calling them without one rebuilds both FastTransforms
+# plans on every single call, and the cascade calls them once per field plus once per band. Owning
+# the cache on our plan builds them once instead.
+#
+# Their construction goes through FFTW's planner, which is documented as callable from only one
+# thread at a time (only `fftw_execute` is thread safe), so every cache is populated under this
+# lock — including the per-task copies below, which are built inside spawned tasks.
+const PLANNER_LOCK = ReentrantLock()
+
+function _warmed_cache(nθ::Int, nφ::Int)
+    cache = FSH.SphPlanCache{Float64}()
+    scratch = zeros(Float64, nθ, nφ)
+    Base.@lock PLANNER_LOCK begin
+        FSH.sph_transform!(scratch; cache = cache)
+        FSH.sph_evaluate!(scratch; cache = cache)
+    end
+    return cache
+end
+
+function SHTSphericalPlan(lmax::Int)
+    nθ, nφ = lmax + 1, 2lmax + 1
+    return SHTSphericalPlan(lmax, 1 / sqrt(4π), ST.SphericalCore._fejer1_weights(nθ, Float64),
+                            1 / nφ, Matrix{Float64}(undef, nθ, nφ), _warmed_cache(nθ, nφ))
+end
+
+Base.show(io::IO, p::SHTSphericalPlan{T}) where {T} =
+    print(io, "SHTSphericalPlan{", T, "}(lmax=", p.lmax, ")")
+
+# `cbuf` is mutated per band and the cached plans hold their own scratch, so a task needs both.
+ST.Plans.task_local_plan(p::SHTSphericalPlan) =
+    SHTSphericalPlan(p.lmax, p.inv_sqrt4pi, p.θweights, p.invnφ, similar(p.cbuf),
+                     _warmed_cache(size(p.cbuf)...))
 
 # Multiply each spherical-harmonic coefficient of degree ℓ by h(ℓ), in the FastSphericalHarmonics
 # triangular `sph_mode` layout (in place).
@@ -45,27 +87,41 @@ end
 
 # Analysis: exact forward SHT (grid → SH coefficients).
 function ST.SphericalCore.sphere_coeffs(plan::SHTSphericalPlan, field::AbstractMatrix)
-    C = Matrix{Float64}(undef, size(field))
+    return ST.SphericalCore.sphere_coeffs!(Matrix{Float64}(undef, size(field)), plan, field)
+end
+
+function ST.SphericalCore.sphere_coeffs!(C::AbstractMatrix, plan::SHTSphericalPlan,
+                                         field::AbstractMatrix)
     copyto!(C, field)
-    FSH.sph_transform!(C)
+    FSH.sph_transform!(C; cache = plan.cache)
     return C
 end
 
+ST.SphericalCore.sphere_coeffs_buffer(plan::SHTSphericalPlan) =
+    Matrix{Float64}(undef, plan.lmax + 1, 2plan.lmax + 1)
+
 # Apply the per-degree multiplier h(ℓ) to a copy of the coefficients and synthesise back to the grid.
+# The copy goes into the plan's scratch, so a band allocates nothing; `C` itself is left intact for
+# the next band.
 function ST.SphericalCore.sphere_apply!(out::AbstractMatrix, plan::SHTSphericalPlan, C, h)
-    C2 = copy(C)
+    C2 = plan.cbuf
+    copyto!(C2, C)
     _apply_degree_multiplier!(C2, h, plan.lmax)
-    FSH.sph_evaluate!(C2)
+    FSH.sph_evaluate!(C2; cache = plan.cache)
     copyto!(out, C2)
     return out
 end
 
-# Exact spherical average via the degree-0 coefficient: ⟨f⟩ = c₀₀ · Y₀₀ (Clenshaw–Curtis quadrature).
-function ST.SphericalCore.sphere_mean(plan::SHTSphericalPlan, field::AbstractMatrix)
-    C = Matrix{Float64}(undef, size(field))
-    copyto!(C, field)
-    FSH.sph_transform!(C)
-    return C[FSH.sph_mode(0, 0)] * plan.inv_sqrt4pi
+# ⟨f⟩ = (1/4π)∬ f sinθ dθ dφ. Longitude is uniform, so its integral is the plain row mean; colatitude
+# uses the Fejér weights, which integrate ∫₀^π g sinθ dθ exactly for band-limited `g` and sum to 2 —
+# hence the trailing ½. Equal to the degree-0 coefficient route, without its forward SHT.
+function ST.SphericalCore.sphere_mean(plan::SHTSphericalPlan{T}, field::AbstractMatrix) where {T}
+    nθ, nφ = size(field)
+    acc = zero(T)
+    @inbounds for k in 1:nφ, j in 1:nθ
+        acc += plan.θweights[j] * field[j, k]
+    end
+    return acc * plan.invnφ / 2
 end
 
 # ---------------------------------------------------------------------------
