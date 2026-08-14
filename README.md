@@ -2,6 +2,7 @@
 
 [![Build Status](https://github.com/jbphyswx/ScatteringTransforms.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/jbphyswx/ScatteringTransforms.jl/actions/workflows/CI.yml)
 [![Dev Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://jbphyswx.github.io/ScatteringTransforms.jl/dev/)
+[![Coverage](https://codecov.io/gh/jbphyswx/ScatteringTransforms.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/jbphyswx/ScatteringTransforms.jl)
 
 Fast, generic wavelet scattering transforms in Julia.
 
