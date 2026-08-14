@@ -1,8 +1,13 @@
 # ScatteringTransforms.jl
 
-[![Build Status](https://github.com/jbphyswx/ScatteringTransforms.jl/workflows/CI/badge.svg)](https://github.com/jbphyswx/ScatteringTransforms.jl/actions)
+[![Build Status](https://github.com/jbphyswx/ScatteringTransforms.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/jbphyswx/ScatteringTransforms.jl/actions/workflows/CI.yml)
+[![Dev Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://jbphyswx.github.io/ScatteringTransforms.jl/dev/)
 
 Fast, generic wavelet scattering transforms in Julia.
+
+**[Documentation](https://jbphyswx.github.io/ScatteringTransforms.jl/dev/)** —
+[API reference](https://jbphyswx.github.io/ScatteringTransforms.jl/dev/api/) ·
+[theory](https://jbphyswx.github.io/ScatteringTransforms.jl/dev/theory/)
 
 ## Features
 
