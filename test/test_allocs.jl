@@ -108,25 +108,34 @@ Test.@testset "Allocation discipline" begin
         Test.@test a < sizeof(X)         # no temporary that scales with the field data
     end
 
-    Test.@testset "batched scattered-planar cascade allocates nothing" begin
+    Test.@testset "batched scattered-planar cascade allocates nothing per field" begin
         # The batched cascade multiplies a `(ms…, B)` mode array by a `(ms)` filter, which only
         # broadcasts if the filter carries a trailing singleton. Building that view per wavelet and
         # per path would allocate an array header on every call, so the views are built once with the
         # transform; this asserts they stay there.
+        #
+        # Asserted as proportional to `B` rather than as zero. FFTW.jl allocates per execution once
+        # its multithreading is active (JuliaMath/FFTW.jl#240), and merely loading
+        # FastSphericalHarmonics activates it, so no FFT-executing path can reach zero here — measured
+        # at 139104 B for `B = 4` and exactly twice that for `B = 8`. A view rebuilt per wavelet would
+        # add a *constant* instead, which breaks proportionality at any thread count (and this is
+        # exactly zero when FFTW threading was never enabled, where 2*0 == 0 still holds).
         SP = ScatteringTransforms.ScatteredPlanar
-        M, ms, Bp = 500, (16, 16), 4
+        M, ms = 500, (16, 16)
         px, py = rand(M), rand(M)
-        stb = SP.build(Float64, px, py, ms, 3; L = 4, max_order = 2,
-                       spectral = ScatteringTransforms.Plans.FINUFFTBackend(), ntrans = Bp)
-        # Asserted rather than used as a guard: a plan that quietly came back single-field would make
-        # the allocation check below measure the per-field cascade and pass without testing anything.
-        Test.@test ScatteringTransforms.Plans.batch_width(stb.plan) == Bp
-        nwp = length(stb.filter_bank.wavelets)
-        S0 = Vector{Float64}(undef, Bp)
-        S1 = Matrix{Float64}(undef, nwp, Bp)
-        S2 = zeros(Float64, nwp, nwp, Bp)
-        Xb = randn(M, Bp)
-        Test.@test _alloc(SP.scattered_planar_scattering_batch!, S0, S1, S2, stb, Xb) == 0
+        function batched_alloc(B)
+            stb = SP.build(Float64, px, py, ms, 3; L = 4, max_order = 2,
+                           spectral = ScatteringTransforms.Plans.FINUFFTBackend(), ntrans = B)
+            # Asserted, not assumed: a plan that quietly came back single-field would make the
+            # measurement below time the per-field cascade and agree for the wrong reason.
+            Test.@test ScatteringTransforms.Plans.batch_width(stb.plan) == B
+            nwp = length(stb.filter_bank.wavelets)
+            S0 = Vector{Float64}(undef, B)
+            S1 = Matrix{Float64}(undef, nwp, B)
+            S2 = zeros(Float64, nwp, nwp, B)
+            return _alloc(SP.scattered_planar_scattering_batch!, S0, S1, S2, stb, randn(M, B))
+        end
+        Test.@test 2 * batched_alloc(4) == batched_alloc(8)
     end
 
     Test.@testset "st(x) allocates only its coefficient container (size-independent)" begin

@@ -73,7 +73,18 @@ end
 
 # FFTW reads its global thread count when a plan is built and bakes it in, so the count only has to
 # hold for the duration of construction.
+# Asking for a single thread does not touch `set_num_threads` at all, because calling it is what puts
+# FFTW.jl on its multi-threaded execution path — and that path allocates on *every* execution, about
+# 4 KiB per transform, which a cascade pays once per wavelet and once per path. It only shows up when
+# `Threads.nthreads() > 1`, and it survives a later `set_num_threads(1)`: once the setter has been
+# called there is no way back.
+#
+# Skipping the call keeps a process that only ever asks for one thread on the non-allocating path. It
+# is not a guarantee, since any other package can enable threading first — loading
+# FastSphericalHarmonics raises the count to 4 by itself — which is why the allocation gates compare
+# two batch widths rather than asserting zero.
 function ST.Plans.with_fft_nthreads(f, n::Integer)
+    n <= 1 && return f()
     prev = FFTW.get_num_threads()
     try
         FFTW.set_num_threads(n)
