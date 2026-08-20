@@ -655,9 +655,10 @@ Build the scattered-sphere plan selected by `spectral` over points `(θ, φ)` an
 `SpectralBackends.DirectSumSpectralBackend` is the dependency-free default;
 `SpectralBackends.NUFSHTSpectralBackend` (or `SpectralBackends.AutoSpectralBackend` once the NUFSHT
 extension is loaded) uses the NUFSHT fast path.
+
+The in-core plan transforms one field per call, so `ntrans` is accepted and ignored rather than
+rejected: a caller asking for a batch still gets correct results, just not the batched transform.
 """
-# The in-core plan transforms one field per call, so `ntrans` is accepted and ignored rather than
-# rejected: a caller asking for a batch still gets correct results, just not the batched transform.
 function make_spherical_plan(s::SB.AbstractDirectSumSpectralBackend, θ, φ, lmax, ::Type{T};
                              rtol::Real = default_rtol(s), maxiter::Int = 500, weights = nothing,
                              ntrans::Int = 1,

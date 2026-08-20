@@ -60,6 +60,12 @@ end
 # Convenience constructor - defaults to Float64
 Morlet1D(N::Int, j::Real; kwargs...) = Morlet1D{Float64}(N, j; kwargs...)
 
+# Inline fftfreq for a single bin k (0-indexed) of length N.
+# Equivalent to FFTW.fftfreq(N)[k+1]. No allocation.
+# For even N: bins 0..N÷2-1 are positive, bins N÷2..N-1 are negative (Nyquist goes negative).
+# For odd N: bins 0..(N-1)÷2 are positive, rest negative.
+@inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
+
 """
     frequency_response(m::Morlet1D{T}) -> Vector{Complex{T}}
 
@@ -69,12 +75,6 @@ Returns a length-N vector with the Fourier-domain filter coefficients.
 The response is analytic (zero for negative frequencies) for proper
 wavelet transform. Element type matches the wavelet's precision.
 """
-# Inline fftfreq for a single bin k (0-indexed) of length N.
-# Equivalent to FFTW.fftfreq(N)[k+1]. No allocation.
-# For even N: bins 0..N÷2-1 are positive, bins N÷2..N-1 are negative (Nyquist goes negative).
-# For odd N: bins 0..(N-1)÷2 are positive, rest negative.
-@inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
-
 function frequency_response(m::Morlet1D{T}) where T<:Real
     N = m.N
     ξ = m.center_freq
