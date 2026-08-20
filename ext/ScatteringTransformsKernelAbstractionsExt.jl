@@ -114,6 +114,19 @@ function ST.Scattering1D.ScatteringTransform1D(::Type{T}, N::Int, J::Int, gpu::C
         _dzeros(b, Complex{T}, (N,)), _dzeros(b, Complex{T}, (N,)), _dzeros(b, Complex{T}, (N,)),
         _dzeros(b, T, (N,)), _dzeros(b, T, (N,)), _dzeros(b, Complex{T}, (N,)))
 end
+# Scattered-planar parity: everything downstream of the points follows their array type, so the
+# device constructor only has to put the points on the device. Which NUFFT runs there is the
+# caller's `spectral` choice — NonuniformFFTs is the KernelAbstractions-native one.
+function ST.ScatteredPlanar.build(::Type{T}, x::AbstractVector, y::AbstractVector,
+                                  ms::NTuple{2,Int}, J::Int, gpu::CB.GPUBackend;
+                                  kwargs...) where {T}
+    b = gpu.backend
+    return ST.ScatteredPlanar.build(T, _to_device(b, T.(x)), _to_device(b, T.(y)), ms, J; kwargs...)
+end
+ST.ScatteredPlanar.build(x::AbstractVector, y::AbstractVector, ms::NTuple{2,Int}, J::Int,
+                         gpu::CB.GPUBackend; kwargs...) =
+    ST.ScatteredPlanar.build(Float32, x, y, ms, J, gpu; kwargs...)
+
 ST.Scattering1D.ScatteringTransform1D(N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) =
     ST.Scattering1D.ScatteringTransform1D(Float32, N, J, gpu; kwargs...)
 

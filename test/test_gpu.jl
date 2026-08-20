@@ -94,4 +94,21 @@ Test.@testset "GPU vendor-neutral path (GPUBackend(KA.CPU()))" begin
         fref = ScatteringTransforms.ScatteringFields.scattering_field(ref, x)
         Test.@test Array(field.data) ≈ Array(fref.data) rtol=1e-4
     end
+    Test.@testset "scattered planar builds on a device backend and matches the host" begin
+        # Everything downstream of the points follows their array type, so the device constructor
+        # only relocates the points. NonuniformFFTs is the KernelAbstractions-native NUFFT, so it is
+        # the one that can actually run there; the coefficients must be the host ones either way.
+        SP = ScatteringTransforms.ScatteredPlanar
+        M, ms, J, L = 400, (16, 16), 3, 4
+        Random.seed!(11)
+        px, py, f = rand(M), rand(M), randn(M)
+        spec = ScatteringTransforms.Plans.NonuniformFFTsBackend()
+        host = SP.build(Float64, px, py, ms, J; L = L, spectral = spec)
+        dev = SP.build(Float64, px, py, ms, J, gpu; L = L, spectral = spec)
+        Test.@test Array(ScatteringTransforms.Coefficients.flatten2d(dev(f))) ≈
+                   Array(ScatteringTransforms.Coefficients.flatten2d(host(f)))
+        X = randn(M, 4)
+        Test.@test Array(ScatteringTransforms.scattering_batch(dev, X)) ≈
+                   Array(ScatteringTransforms.scattering_batch(host, X))
+    end
 end

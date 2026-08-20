@@ -53,6 +53,15 @@ struct ScatteredPlanarScattering{T, FB, Tree, G<:AbstractVector, P, WV<:Abstract
     buf_u1_modes::MM         # (ms) its mode coefficients, reused across that j1's children
 end
 
+# A copy of `A` living wherever `ref` lives. `similar` is the only device hook the cascade needs:
+# it keeps this file free of any device package while still producing a device-resident transform
+# when the caller hands in device points.
+function _like(ref::AbstractArray, A::AbstractArray)
+    d = similar(ref, eltype(A), size(A))
+    copyto!(d, A)
+    return d
+end
+
 function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, J::Int;
                L::Int = 8, max_order::Int = 2,
                spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
@@ -60,7 +69,12 @@ function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, In
                eps = nothing, maxiter::Int = 100, rtol::Real = 1.0e-8,
                ntrans::Int = 1) where {T}
     M = length(x)
-    fb = FilterBanks.build_filter_bank2d(T, ms, J; L = L)
+    cpu_fb = FilterBanks.build_filter_bank2d(T, ms, J; L = L)
+    # The transform lives wherever its points do. Every array is `similar` to `x`, so host points
+    # give a host transform and device points a device-resident one through the same code — there is
+    # no separate device constructor, and no device package is referenced here.
+    fb = FilterBanks.FilterBank2D([_like(x, ψ) for ψ in cpu_fb.wavelets],
+                                  _like(x, cpu_fb.averaging), cpu_fb.meta, cpu_fb.J, cpu_fb.L)
     tree = PathGraph.build_tree([m.j_eff for m in fb.meta], max_order)
     plan = Plans.make_scattered_plan(spectral, x, y, ms, T;
                                      period = period, solve = solve, maxiter = maxiter,
@@ -68,15 +82,15 @@ function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, In
     # The buffers must match what the plan will actually execute, which is its own width — a backend
     # that cannot batch reports 1 regardless of what was asked for.
     B = Plans.batch_width(plan)
-    w = weights === nothing ? fill(one(T) / M, M) : T.(weights) ./ sum(weights)
+    w = _like(x, weights === nothing ? fill(one(T) / M, M) : T.(weights) ./ sum(weights))
     nw = length(fb.wavelets)
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
              [(j, Int[], Int[]) for j in 1:nw]
     # One first-order field and one mode array, not `nw` of each: the cascade finishes every child of
     # a wavelet before starting the next.
-    cpts() = B == 1 ? Vector{Complex{T}}(undef, M) : Matrix{Complex{T}}(undef, M, B)
-    rpts() = B == 1 ? Vector{T}(undef, M) : Matrix{T}(undef, M, B)
-    modes() = B == 1 ? Matrix{Complex{T}}(undef, ms) : Array{Complex{T}}(undef, ms..., B)
+    cpts() = B == 1 ? similar(x, Complex{T}, M) : similar(x, Complex{T}, M, B)
+    rpts() = B == 1 ? similar(x, T, M) : similar(x, T, M, B)
+    modes() = B == 1 ? similar(x, Complex{T}, ms) : similar(x, Complex{T}, (ms..., B))
     wav_b = [reshape(ψ, ms..., 1) for ψ in fb.wavelets]
     return ScatteredPlanarScattering(
         fb, tree, groups, max_order, plan, w, wav_b,

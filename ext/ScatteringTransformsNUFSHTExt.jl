@@ -187,8 +187,11 @@ function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_ph
                                                maxiter::Int = 500,
                                                ntrans::Int = 1,
                                                nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {T<:Real}
-    θ = collect(T, pts_theta)
-    φ = collect(T, pts_phi)
+    # Broadcast rather than `collect`: both copy (the plan must own its points, so a spec rebuilt
+    # from them is independent), but `collect` materialises to a host `Array` and would strand a
+    # device-resident transform on the CPU regardless of which NUFFT NUFSHT is using.
+    θ = T.(pts_theta)
+    φ = T.(pts_phi)
     # Resolve before building, and build against the concrete result. Handing `Auto` straight to
     # `make_plan` works, but then nothing downstream — not the plan, not `show`, not a benchmark —
     # can say whether the fast NUFFT or the O(M·K) direct-sum fallback is actually running.

@@ -44,6 +44,10 @@ Fast, generic wavelet scattering transforms in Julia.
 - **Vendor-neutral GPU**: `using KernelAbstractions, AbstractFFTs` + a device backend (e.g.
   `using CUDA`) gives a device-resident transform via `GPUBackend(CUDA.CUDABackend())` and a
   batched-throughput `scattering_batch(gpu, st, X)` — CUDA/ROCm/oneAPI/Metal, validated on `KA.CPU()`.
+  Covers the gridded 1D/2D/3D surfaces and the scattered-planar one; on scattered points the device
+  transform needs `NonuniformFFTs` (pure Julia, KernelAbstractions-native), since FINUFFT and the
+  spherical libraries are host-only. Everything down-stream of the points follows their array type,
+  so there is one cascade, not a device copy of it.
 - **Generic & type-stable**: `Float32`/`Float64`, autodiff-friendly, GPU-array-ready hot path,
   in-place `!` methods over pre-allocated buffers.
 

@@ -27,7 +27,7 @@ using LinearAlgebra: LinearAlgebra
 using ScatteringTransforms: ScatteringTransforms as ST
 
 """
-    NonuniformFFTsScatteringPlan{T,P,CV,MM}
+    NonuniformFFTsScatteringPlan{T,P,CV,MM,RV}
 
 Scattered-planar spectral plan backed by a `NonuniformFFTs.PlanNUFFT` over fixed points `(x, y)`
 and a uniform mode grid `ms`. `solve` selects the conjugate-gradient least-squares inversion over
@@ -60,17 +60,21 @@ function ST.Plans.task_local_plan(p::NonuniformFFTsScatteringPlan{T}) where {T}
     return _plan_at(p.ms, p.M, p.sx, p.sy, p.halfsupport, T, p.solve, p.maxiter, p.rtol)
 end
 
+# Where the plan lives follows the points, so there is nothing to pass: `get_backend` reads the
+# KernelAbstractions backend off `sx` and every buffer is `similar` to it. Host points give a host
+# plan, device points a device-resident one, through the same code — and a task's rebuilt plan lands
+# on the same device, because it rebuilds from these same points.
 function _plan_at(ms::NTuple{2, Int}, M::Int, sx, sy, halfsupport::Int, ::Type{T}, solve, maxiter,
                   rtol::T) where {T}
     plan = NonuniformFFTs.PlanNUFFT(Complex{T}, ms;
-                                    m = NonuniformFFTs.HalfSupport(halfsupport))
+                                    m = NonuniformFFTs.HalfSupport(halfsupport),
+                                    backend = NonuniformFFTs.KA.get_backend(sx))
     NonuniformFFTs.set_points!(plan, (sx, sy))
-    return NonuniformFFTsScatteringPlan{T, typeof(plan), Vector{Complex{T}}, Matrix{Complex{T}},
-                                        typeof(sx)}(
+    pts() = similar(sx, Complex{T}, M)
+    modes() = similar(sx, Complex{T}, ms)
+    return NonuniformFFTsScatteringPlan(
         plan, ms, M, one(T) / prod(ms), solve, maxiter, rtol, sx, sy, halfsupport,
-        Vector{Complex{T}}(undef, M),
-        Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms),
-        Vector{Complex{T}}(undef, M))
+        pts(), modes(), modes(), modes(), pts())
 end
 
 # The plan holds device/threading state and scratch, so it prints as one line rather than dumping

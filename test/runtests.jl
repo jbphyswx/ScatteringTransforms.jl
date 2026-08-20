@@ -13,6 +13,11 @@ using OhMyThreads: OhMyThreads
 using Distributed: Distributed
 using MPI: MPI
 using NUFSHT: NUFSHT
+# Both fast NUFFT backends are loaded here rather than inside a single test file, so which one
+# an `Auto` spectral backend resolves to does not depend on include order. Without this the
+# earlier test files silently exercise the in-core reference instead of a fast path.
+using FINUFFT: FINUFFT
+using NonuniformFFTs: NonuniformFFTs
 using Statistics: Statistics
 using Random: Random
 using DifferentiationInterface: DifferentiationInterface as DI  # loaded so its extension is present for the explicit-imports audit below

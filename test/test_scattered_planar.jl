@@ -2,7 +2,6 @@
 # analysis/synthesis reduce to fft/ifft, so scattered-planar scattering must reproduce the gridded
 # ScatteringTransform2D exactly (to NUFFT tolerance); on irregular points the CG-solve path recovers
 # a band-limited field.
-using FINUFFT: FINUFFT
 using Random: Random
 
 Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
@@ -110,5 +109,24 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         # Its buffers and guru plan are `B` wide, so any other stack size is refused, not reshaped.
         Test.@test_throws DimensionMismatch ScatteringTransforms.scattering_batch(batched,
                                                                                  Xb[:, 1:3])
+    end
+
+    Test.@testset "NonuniformFFTs backend agrees with FINUFFT and direct summation" begin
+        # Three independent transforms of the same field on the same points: exact direct
+        # summation, FINUFFT, and NonuniformFFTs. They lay their modes out on the same fftfreq
+        # lattice, so the coefficients must agree to the loosest of the three tolerances.
+        Random.seed!(7)
+        M2 = 600
+        xs, ys = rand(M2), rand(M2)
+        fs = randn(M2)
+        coeffs(spec) = ScatteringTransforms.Coefficients.flatten2d(
+            ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
+                                                             L = 4, spectral = spec)(fs))
+        direct = coeffs(SpectralBackends.DirectSumSpectralBackend())
+        finufft = coeffs(ScatteringTransforms.Plans.FINUFFTBackend())
+        nuffts = coeffs(ScatteringTransforms.Plans.NonuniformFFTsBackend())
+        Test.@test finufft ≈ direct rtol=1e-6
+        Test.@test nuffts ≈ direct rtol=1e-6
+        Test.@test nuffts ≈ finufft rtol=1e-6
     end
 end

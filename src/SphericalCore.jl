@@ -523,6 +523,9 @@ function DirectSHTSphericalPlan(θ::AbstractVector, φ::AbstractVector, lmax::In
     M = length(θ)
     length(φ) == M || throw(DimensionMismatch("θ and φ must have equal length"))
     w = weights === nothing ? fill(one(T) / M, M) : (T.(weights) ./ sum(weights))
+    # Brought to the host deliberately, unlike the NUFSHT plan: `Y` below is filled by scalar
+    # indexing over the Legendre recurrence, which is what makes this the exact reference rather
+    # than a fast path. A device-resident spherical transform goes through NUFSHT.
     θT, φT = collect(T, θ), collect(T, φ)
     K = (lmax + 1)^2
     Y = Matrix{T}(undef, M, K)
