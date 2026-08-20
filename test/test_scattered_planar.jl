@@ -65,4 +65,50 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         Test.@test all(S2[j1, j2] == 0 for j1 in 1:n for j2 in 1:j1)
         Test.@test any(S2[j1, j2] > 0 for j1 in 1:n for j2 in (j1 + 1):n)
     end
+
+    Test.@testset "threaded batch, on every NUFFT backend" begin
+        # A nonuniform plan carries the buffers each execution writes through, so tasks must not
+        # share one. Sharing does not fail loudly — it silently corrupts concurrent transforms — so
+        # this runs the threaded batch on each backend and requires it to reproduce the serial
+        # result. The in-core plan alone would not catch it: the fast backends own the state.
+        Random.seed!(2)
+        M2, B = 800, 8
+        xs, ys = rand(M2), rand(M2)
+        Xb = randn(M2, B)
+        for spec in (ScatteringTransforms.Plans.FINUFFTBackend(),
+                     SpectralBackends.DirectSumSpectralBackend())
+            sp = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
+                                                                  L = 4, spectral = spec)
+            serial = ScatteringTransforms.scattering_batch(sp, Xb)
+            threaded = ScatteringTransforms.scattering_batch(
+                ComputationalBackends.ThreadedBackend(), sp, Xb)
+            Test.@test all(isfinite, threaded)
+            Test.@test threaded ≈ serial rtol=1e-10
+        end
+    end
+
+    Test.@testset "ntrans batching matches the per-field loop" begin
+        # FINUFFT transforms `ntrans` co-located fields per execution, so a transform built that way
+        # runs each cascade step once for the whole stack instead of once per field. The coefficients
+        # must be identical either way — the batching is an execution detail, not an approximation.
+        Random.seed!(3)
+        M2, B = 600, 4
+        xs, ys = rand(M2), rand(M2)
+        Xb = randn(M2, B)
+        base = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
+            L = 4, spectral = ScatteringTransforms.Plans.FINUFFTBackend())
+        batched = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (16, 16), 3;
+            L = 4, spectral = ScatteringTransforms.Plans.FINUFFTBackend(), ntrans = B)
+        # Asserted, not assumed: if the plan silently came back single-field the comparison below
+        # would pass while testing nothing.
+        Test.@test ScatteringTransforms.Plans.batch_width(batched.plan) == B
+        Test.@test ScatteringTransforms.scattering_batch(batched, Xb) ≈
+                   ScatteringTransforms.scattering_batch(base, Xb) rtol=1e-12
+        Test.@test ScatteringTransforms.scattering_batch(
+                       ComputationalBackends.ThreadedBackend(), batched, Xb) ≈
+                   ScatteringTransforms.scattering_batch(base, Xb) rtol=1e-12
+        # Its buffers and guru plan are `B` wide, so any other stack size is refused, not reshaped.
+        Test.@test_throws DimensionMismatch ScatteringTransforms.scattering_batch(batched,
+                                                                                 Xb[:, 1:3])
+    end
 end

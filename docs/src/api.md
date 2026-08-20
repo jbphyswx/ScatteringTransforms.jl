@@ -174,6 +174,7 @@ ScatteringTransforms.Plans.make_plan
 ScatteringTransforms.Plans.make_scattered_plan
 ScatteringTransforms.Plans.spectral_backend
 ScatteringTransforms.Plans.task_local_plan
+ScatteringTransforms.Plans.batch_width
 ScatteringTransforms.Plans.with_fft_nthreads
 ScatteringTransforms.ScatteringCore.wavelet_convolve
 ScatteringTransforms.ScatteringCore.wavelet_convolve!
@@ -220,6 +221,7 @@ ScatteringTransforms.Scattering2D.cascade!
 ScatteringTransforms.Scattering3D.cascade!
 ScatteringTransforms.ScatteredPlanar.ScatteredPlanarScattering
 ScatteringTransforms.ScatteredPlanar.scattered_planar_scattering!
+ScatteringTransforms.ScatteredPlanar.scattered_planar_scattering_batch!
 ScatteringTransforms.SubsampledScattering.Level
 ```
 
@@ -247,6 +249,11 @@ ScatteringTransforms.SphericalCore.task_local
 ScatteringTransforms.SphericalCore.band_multiplier
 ScatteringTransforms.SphericalCore.dog_sigma2
 ScatteringTransforms.SphericalCore.structured_grid
+ScatteringTransforms.SphericalCore.batch_plan
+ScatteringTransforms.SphericalCore.supports_batch
+ScatteringTransforms.SphericalCore.plan_nufft
+ScatteringTransforms.SphericalCore.AnalysisNotConverged
+ScatteringTransforms.SphericalCore.default_rtol
 ScatteringTransforms.SphericalCore.make_spherical_plan
 ScatteringTransforms.SphericalCore.make_structured_plan
 ScatteringTransforms.SphericalCore.nusht_spherical_plan

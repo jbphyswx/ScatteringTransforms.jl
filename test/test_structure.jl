@@ -176,7 +176,8 @@ Test.@testset "Every surface has a batch entry point, matching its per-field res
     end
 
     M = 200
-    sp = ScatteringTransforms.scattered_planar_scattering(rand(M), rand(M), (16, 16), 3;
+    ppx, ppy = rand(M), rand(M)
+    sp = ScatteringTransforms.scattered_planar_scattering(ppx, ppy, (16, 16), 3;
                                                           L = 4, max_order = 2)
     Xp = randn(M, 4)
     outp = ScatteringTransforms.scattering_batch(sp, Xp)

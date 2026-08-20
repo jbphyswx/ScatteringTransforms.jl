@@ -18,6 +18,7 @@ per transform.
 
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using LinearAlgebra: LinearAlgebra
+using SpectralBackends: SpectralBackends as SB
 using ScatteringTransforms: ScatteringTransforms as ST
 
 """
@@ -49,12 +50,30 @@ end
 # lock — including the per-task copies below, which are built inside spawned tasks.
 const PLANNER_LOCK = ReentrantLock()
 
+# FastTransforms is not re-entrant from a task sharing the caller's OS thread: running it
+# multithreaded from such a task silently changes what an already-built plan returns, permanently and
+# with no error.
+#
+# `ft_set_num_threads` has no getter, but it forwards to OpenMP and `omp_get_max_threads` tracks it,
+# so the count is restored afterwards rather than left mutated behind the caller's back.
+function with_serial_ft(f)
+    prev = ccall((:omp_get_max_threads, "libomp"), Cint, ())
+    FSH.FastTransforms.ft_set_num_threads(1)
+    try
+        return f()
+    finally
+        FSH.FastTransforms.ft_set_num_threads(prev)
+    end
+end
+
 function _warmed_cache(nθ::Int, nφ::Int)
     cache = FSH.SphPlanCache{Float64}()
     scratch = zeros(Float64, nθ, nφ)
     Base.@lock PLANNER_LOCK begin
-        FSH.sph_transform!(scratch; cache = cache)
-        FSH.sph_evaluate!(scratch; cache = cache)
+        with_serial_ft() do
+            FSH.sph_transform!(scratch; cache = cache)
+            FSH.sph_evaluate!(scratch; cache = cache)
+        end
     end
     return cache
 end
@@ -69,6 +88,13 @@ Base.show(io::IO, p::SHTSphericalPlan{T}) where {T} =
     print(io, "SHTSphericalPlan{", T, "}(lmax=", p.lmax, ")")
 
 # `cbuf` is mutated per band and the cached plans hold their own scratch, so a task needs both.
+# A structured plan is defined by its band limit alone, so it carries no points to rebuild from and
+# its quadrature follows from the grid. Analysis is an exact transform, not an iterative solve.
+ST.SphericalCore.plan_points(::SHTSphericalPlan) = nothing
+ST.SphericalCore.plan_weights(::SHTSphericalPlan) = nothing
+ST.SphericalCore.plan_solver(::SHTSphericalPlan) = nothing
+ST.Plans.spectral_backend(::SHTSphericalPlan) = SB.FSHTSpectralBackend()
+
 ST.Plans.task_local_plan(p::SHTSphericalPlan) =
     SHTSphericalPlan(p.lmax, p.inv_sqrt4pi, p.θweights, p.invnφ, similar(p.cbuf),
                      _warmed_cache(size(p.cbuf)...))
@@ -93,7 +119,7 @@ end
 function ST.SphericalCore.sphere_coeffs!(C::AbstractMatrix, plan::SHTSphericalPlan,
                                          field::AbstractMatrix)
     copyto!(C, field)
-    FSH.sph_transform!(C; cache = plan.cache)
+    with_serial_ft(() -> FSH.sph_transform!(C; cache = plan.cache))
     return C
 end
 
@@ -107,7 +133,7 @@ function ST.SphericalCore.sphere_apply!(out::AbstractMatrix, plan::SHTSphericalP
     C2 = plan.cbuf
     copyto!(C2, C)
     _apply_degree_multiplier!(C2, h, plan.lmax)
-    FSH.sph_evaluate!(C2; cache = plan.cache)
+    with_serial_ft(() -> FSH.sph_evaluate!(C2; cache = plan.cache))
     copyto!(out, C2)
     return out
 end

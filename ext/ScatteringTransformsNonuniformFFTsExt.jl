@@ -35,7 +35,8 @@ the plain Type-1 adjoint; `r`/`p`/`Ap`/`tmp_pts` are that solver's workspace, so
 nothing per call.
 """
 struct NonuniformFFTsScatteringPlan{T, P, CV <: AbstractVector{Complex{T}},
-                                    MM <: AbstractMatrix{Complex{T}}} <: ST.Plans.AbstractScatteringPlan
+                                    MM <: AbstractMatrix{Complex{T}},
+                                    RV <: AbstractVector{T}} <: ST.Plans.AbstractScatteringPlan
     plan::P
     ms::NTuple{2, Int}
     M::Int
@@ -43,11 +44,33 @@ struct NonuniformFFTsScatteringPlan{T, P, CV <: AbstractVector{Complex{T}},
     solve::Bool
     maxiter::Int
     rtol::T
+    sx::RV                  # (M) points already scaled to the 2π-periodic domain, retained so a
+    sy::RV                  #     task can build its own plan
+    halfsupport::Int        # the accuracy the plan was built with
     cj::CV                  # (M) nonuniform exec buffer
     r::MM                   # (ms) CG residual / rhs
     p::MM                   # (ms) CG search direction
     Ap::MM                  # (ms) CG A†A·p
     tmp_pts::CV             # (M) CG scratch
+end
+
+# `PlanNUFFT` holds the scratch every execution writes through, so tasks cannot share one. The
+# points are retained above precisely so a task can build its own.
+function ST.Plans.task_local_plan(p::NonuniformFFTsScatteringPlan{T}) where {T}
+    return _plan_at(p.ms, p.M, p.sx, p.sy, p.halfsupport, T, p.solve, p.maxiter, p.rtol)
+end
+
+function _plan_at(ms::NTuple{2, Int}, M::Int, sx, sy, halfsupport::Int, ::Type{T}, solve, maxiter,
+                  rtol::T) where {T}
+    plan = NonuniformFFTs.PlanNUFFT(Complex{T}, ms;
+                                    m = NonuniformFFTs.HalfSupport(halfsupport))
+    NonuniformFFTs.set_points!(plan, (sx, sy))
+    return NonuniformFFTsScatteringPlan{T, typeof(plan), Vector{Complex{T}}, Matrix{Complex{T}},
+                                        typeof(sx)}(
+        plan, ms, M, one(T) / prod(ms), solve, maxiter, rtol, sx, sy, halfsupport,
+        Vector{Complex{T}}(undef, M),
+        Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms),
+        Vector{Complex{T}}(undef, M))
 end
 
 # The plan holds device/threading state and scratch, so it prints as one line rather than dumping
@@ -58,6 +81,7 @@ Base.show(io::IO, p::NonuniformFFTsScatteringPlan{T}) where {T} =
 Base.show(io::IO, ::MIME"text/plain", p::NonuniformFFTsScatteringPlan) = show(io, p)
 
 ST.Plans.spectral_backend(::NonuniformFFTsScatteringPlan) = ST.Plans.NonuniformFFTsBackend()
+ST.Plans.plan_points(p::NonuniformFFTsScatteringPlan) = (p.sx, p.sy)
 
 # NonuniformFFTs expresses accuracy as the convolution kernel's half-support, not as a tolerance
 # (its documented default, `m = 4` with `σ = 2.0`, gives ~1e-7 relative for `Float64`). The `eps`
@@ -68,7 +92,12 @@ _half_support(tol::Real) = tol >= 1.0e-4 ? 2 : tol >= 1.0e-7 ? 4 : tol >= 1.0e-1
 function ST.Plans.nonuniformffts_scattered_plan(x, y, ms::NTuple{2, Int}, ::Type{T};
                                                 period = nothing, solve::Bool = false,
                                                 maxiter::Int = 100, rtol::Real = 1.0e-8,
-                                                eps = nothing) where {T}
+                                                eps = nothing, ntrans::Int = 1) where {T}
+    # Accepted so the caller need not know which backend it will get, and deliberately not acted on:
+    # this plan reports `batch_width == 1`, so the cascade keeps its per-field loop. NonuniformFFTs
+    # does expose `ntransforms`, but measured against the same transforms issued one at a time it is
+    # 1.16x at `B = 8` and 0.70x at `B = 32` on this package's mode-grid sizes — batching it would
+    # cost throughput at the batch sizes that matter.
     M = length(x)
     length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
     xmin, ymin = T(minimum(x)), T(minimum(y))
@@ -79,15 +108,7 @@ function ST.Plans.nonuniformffts_scattered_plan(x, y, ms::NTuple{2, Int}, ::Type
     sy = T(2π) .* (T.(y) .- ymin) ./ py
 
     tol = eps === nothing ? (T === Float32 ? 1.0e-6 : 1.0e-9) : Float64(eps)
-    plan = NonuniformFFTs.PlanNUFFT(Complex{T}, ms;
-                                    m = NonuniformFFTs.HalfSupport(_half_support(tol)))
-    NonuniformFFTs.set_points!(plan, (sx, sy))
-
-    return NonuniformFFTsScatteringPlan{T, typeof(plan), Vector{Complex{T}}, Matrix{Complex{T}}}(
-        plan, ms, M, one(T) / prod(ms), solve, maxiter, T(rtol),
-        Vector{Complex{T}}(undef, M),
-        Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms),
-        Vector{Complex{T}}(undef, M))
+    return _plan_at(ms, M, sx, sy, _half_support(tol), T, solve, maxiter, T(rtol))
 end
 
 # Synthesis: modes → points (Type-2), scaled by 1/prod(ms) so it is the ifft-convention inverse.

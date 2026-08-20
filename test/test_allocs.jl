@@ -108,6 +108,27 @@ Test.@testset "Allocation discipline" begin
         Test.@test a < sizeof(X)         # no temporary that scales with the field data
     end
 
+    Test.@testset "batched scattered-planar cascade allocates nothing" begin
+        # The batched cascade multiplies a `(ms…, B)` mode array by a `(ms)` filter, which only
+        # broadcasts if the filter carries a trailing singleton. Building that view per wavelet and
+        # per path would allocate an array header on every call, so the views are built once with the
+        # transform; this asserts they stay there.
+        SP = ScatteringTransforms.ScatteredPlanar
+        M, ms, Bp = 500, (16, 16), 4
+        px, py = rand(M), rand(M)
+        stb = SP.build(Float64, px, py, ms, 3; L = 4, max_order = 2,
+                       spectral = ScatteringTransforms.Plans.FINUFFTBackend(), ntrans = Bp)
+        # Asserted rather than used as a guard: a plan that quietly came back single-field would make
+        # the allocation check below measure the per-field cascade and pass without testing anything.
+        Test.@test ScatteringTransforms.Plans.batch_width(stb.plan) == Bp
+        nwp = length(stb.filter_bank.wavelets)
+        S0 = Vector{Float64}(undef, Bp)
+        S1 = Matrix{Float64}(undef, nwp, Bp)
+        S2 = zeros(Float64, nwp, nwp, Bp)
+        Xb = randn(M, Bp)
+        Test.@test _alloc(SP.scattered_planar_scattering_batch!, S0, S1, S2, stb, Xb) == 0
+    end
+
     Test.@testset "st(x) allocates only its coefficient container (size-independent)" begin
         # The non-mutating callable is documented to allocate coefficient storage once; that cost
         # depends on the number of wavelets, not the signal length.

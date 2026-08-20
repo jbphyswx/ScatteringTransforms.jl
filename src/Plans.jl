@@ -81,6 +81,17 @@ spectral_backend(plan::AbstractScatteringPlan) = throw(ArgumentError(
     "rebuilt from a serialisable spec — construct the transform on each worker explicitly."))
 
 """
+    batch_width(plan) -> Int
+
+Number of co-located fields this plan transforms per execution — `1` unless it was built for a batch.
+
+A nonuniform plan's batch width is fixed when its guru plan is built and cannot vary per execution,
+so a plan is either single-field or batched. Callers use this to decide whether a stack can go
+through one execution per cascade step instead of one per field.
+"""
+batch_width(::Any) = 1
+
+"""
     task_local_plan(plan) -> plan
 
 A plan equivalent to `plan` that is safe to use concurrently with it. Stateless plans (FFTW,
@@ -198,8 +209,8 @@ NUDFT; [`FINUFFTBackend`](@ref) and [`NonuniformFFTsBackend`](@ref) select a spe
 """
 make_scattered_plan(::SB.AbstractDirectSumSpectralBackend, x, y, ms, ::Type{T}; period = nothing,
                     solve::Bool = false, maxiter::Int = 100, rtol::Real = 1.0e-8,
-                    eps = nothing) where {T} =
-    DirectNUFFTPlan(x, y, ms, T; period, solve, maxiter, rtol)
+                    eps = nothing, ntrans::Int = 1) where {T} =
+    DirectNUFFTPlan(x, y, ms, T; period, solve, maxiter, rtol, ntrans)
 
 make_scattered_plan(::FINUFFTBackend, x, y, ms, ::Type{T}; kwargs...) where {T} =
     finufft_scattered_plan(x, y, ms, T; kwargs...)
@@ -456,13 +467,16 @@ end
 _fftfreqs(m::Int) = Int[i <= (m - 1) ÷ 2 ? i : i - m for i in 0:(m - 1)]
 
 struct DirectNUFFTPlan{T, EM <: AbstractMatrix{Complex{T}},
-                       CV <: AbstractVector{Complex{T}}} <: AbstractScatteringPlan
+                       CV <: AbstractVector{Complex{T}},
+                       RV <: AbstractVector{T}} <: AbstractScatteringPlan
     ms::NTuple{2, Int}
     M::Int
     invN::T                 # 1/prod(ms) — makes synthesis the ifft-convention inverse
     solve::Bool
     maxiter::Int
     rtol::T
+    sx::RV                  # (M) points on the 2π-periodic domain, retained so the plan can be
+    sy::RV                  #     rebuilt elsewhere — see `plan_points`
     Ex::EM                  # (ms[1], M)  e^{-i f₁[k]·sx_n}
     Ey::EM                  # (M, ms[2])  e^{-i f₂[k]·sy_n}   (point index contiguous)
     Exc::EM                 # (ms[1], M)  conj(Ex)
@@ -476,9 +490,12 @@ struct DirectNUFFTPlan{T, EM <: AbstractMatrix{Complex{T}},
     tmp_pts::CV             # (M) CG scratch (points)
 end
 
+# `ntrans` is accepted so a caller can request a batch width without first asking which backend it
+# will get, and ignored because direct summation transforms one field per call. The plan reports
+# `batch_width == 1`, so nothing downstream feeds it a stack it cannot take.
 function DirectNUFFTPlan(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, ::Type{T};
                          period = nothing, solve::Bool = false, maxiter::Int = 100,
-                         rtol::Real = 1.0e-8, eps = nothing) where {T}
+                         rtol::Real = 1.0e-8, eps = nothing, ntrans::Int = 1) where {T}
     M = length(x)
     length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
     xmin, ymin = T(minimum(x)), T(minimum(y))
@@ -490,8 +507,8 @@ function DirectNUFFTPlan(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int
     f1, f2 = _fftfreqs(ms[1]), _fftfreqs(ms[2])
     Ex = Complex{T}[cis(-f1[k] * sx[n]) for k in 1:ms[1], n in 1:M]
     Ey = Complex{T}[cis(-f2[k] * sy[n]) for n in 1:M, k in 1:ms[2]]
-    return DirectNUFFTPlan{T, Matrix{Complex{T}}, Vector{Complex{T}}}(
-        ms, M, one(T) / prod(ms), solve, maxiter, T(rtol),
+    return DirectNUFFTPlan{T, Matrix{Complex{T}}, Vector{Complex{T}}, Vector{T}}(
+        ms, M, one(T) / prod(ms), solve, maxiter, T(rtol), sx, sy,
         Ex, Ey, conj.(Ex), Matrix(conj.(transpose(Ey))),
         Vector{Complex{T}}(undef, M),
         Matrix{Complex{T}}(undef, M, ms[2]), Matrix{Complex{T}}(undef, ms[1], M),
@@ -504,12 +521,21 @@ Base.show(io::IO, p::DirectNUFFTPlan{T}) where {T} =
 
 spectral_backend(::DirectNUFFTPlan) = SB.DirectSumSpectralBackend()
 
-function task_local_plan(p::DirectNUFFTPlan{T, EM, CV}) where {T, EM, CV}
-    return DirectNUFFTPlan{T, EM, CV}(
-        p.ms, p.M, p.invN, p.solve, p.maxiter, p.rtol, p.Ex, p.Ey, p.Exc, p.Eyc,
+function task_local_plan(p::DirectNUFFTPlan{T, EM, CV, RV}) where {T, EM, CV, RV}
+    return DirectNUFFTPlan{T, EM, CV, RV}(
+        p.ms, p.M, p.invN, p.solve, p.maxiter, p.rtol, p.sx, p.sy, p.Ex, p.Ey, p.Exc, p.Eyc,
         similar(p.cj), similar(p.Sbuf), similar(p.T1), similar(p.r), similar(p.p), similar(p.Ap),
         similar(p.tmp_pts))
 end
+
+"""
+    plan_points(plan) -> (x, y)
+
+The scattered sample locations a nonuniform plan was built on, already mapped onto its `2π`-periodic
+domain. This is what lets a transform be rebuilt on another process, where the plan itself cannot
+travel. Rebuilding from these requires `period = (2π, 2π)`, since they are already scaled.
+"""
+plan_points(p::DirectNUFFTPlan) = (p.sx, p.sy)
 
 # Type-1 (points → modes): X = Ex · (c ⊙ Ey), all preallocated.
 function _nudft_type1!(X::AbstractMatrix, plan::DirectNUFFTPlan, c::AbstractVector)

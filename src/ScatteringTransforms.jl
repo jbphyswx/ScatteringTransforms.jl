@@ -296,7 +296,29 @@ end
 function scattering_batch!(out::AbstractMatrix, st::ScatteredPlanar.ScatteredPlanarScattering,
                            X::AbstractMatrix)
     coeffs = batch_coeffs(st, eltype(out))
-    @inbounds for b in 1:size(X, 2)
+    B = size(X, 2)
+    W = Plans.batch_width(st.plan)
+    # A transform built with `ntrans = W` runs the whole stack through one execution per cascade
+    # step. Its buffers and its guru plan are that width, so it cannot transform any other number of
+    # fields — not even one — and a mismatch is refused rather than silently reshaped.
+    W == 1 || W == B || throw(DimensionMismatch(
+        "this transform was built with ntrans = $W, so it transforms exactly $W fields per call; " *
+        "got a batch of $B. Rebuild with ntrans = $B, or with ntrans = 1 for a per-field loop."))
+    if W > 1
+        T = eltype(out)
+        nw = length(st.filter_bank.wavelets)
+        S0 = Vector{T}(undef, B)
+        S1 = Matrix{T}(undef, nw, B)
+        S2 = st.max_order >= 2 ? zeros(T, nw, nw, B) : Array{T, 3}(undef, 0, 0, 0)
+        r = ScatteredPlanar.scattered_planar_scattering_batch!(S0, S1, S2, st, X)
+        @inbounds for b in 1:B
+            copyto!(coeffs.S1, view(r.S1, :, b))
+            isempty(coeffs.S2) || copyto!(coeffs.S2, view(r.S2, :, :, b))
+            Coefficients.flatten2d!(view(out, :, b), Coefficients.update_S0(coeffs, r.S0[b]))
+        end
+        return out
+    end
+    @inbounds for b in 1:B
         c = ScatteredPlanar.scattered_planar_scattering!(coeffs, st, view(X, :, b))
         Coefficients.flatten2d!(view(out, :, b), c)
     end
@@ -336,9 +358,12 @@ end
 for (TT, WS, fun) in (
         (:SphericalScattering, :SphericalWorkspace, :spherical_scattering!),
         (:SphericalMonogenicScattering, :SphericalMonogenicWorkspace, :spherical_monogenic_scattering!))
-    @eval function scattering_batch!(out::AbstractMatrix, st::SphericalCore.$TT{T},
-                                     X::AbstractArray) where {T}
+    @eval function _spherical_batch_perfield!(out::AbstractMatrix, st::SphericalCore.$TT{T},
+                                              X::AbstractArray) where {T}
         D = ndims(X)
+        # An MPI rank block is empty whenever there are more ranks than batch columns, and the
+        # workspace is sized from the first field — so there is nothing to size it from.
+        size(X, D) == 0 && return out
         field1 = selectdim(X, D, 1)
         ws = SphericalCore.$WS(st, field1)
         S1 = zeros(T, st.J)
@@ -349,6 +374,38 @@ for (TT, WS, fun) in (
         end
         return out
     end
+end
+
+# The monogenic cascade has no batched form: its amplitude needs the Riesz gradient, which is built
+# from per-field spin-0 transforms.
+scattering_batch!(out::AbstractMatrix, st::SphericalCore.SphericalMonogenicScattering,
+                  X::AbstractArray) = _spherical_batch_perfield!(out, st, X)
+
+# A batch of one gains nothing from a widened plan, and only the scattered `(M, B)` layout maps onto
+# one — a structured grid's fields are already matrices.
+_spherical_batches(plan, X::AbstractArray) =
+    size(X)[end] > 1 && ndims(X) == 2 && SphericalCore.supports_batch(plan)
+
+# Scattered-point backends that transform several co-located fields per call (`batch_plan`) run one
+# transform per cascade step for the whole stack rather than one per field. Structured and in-core
+# plans have no batched form and take the per-field loop.
+function scattering_batch!(out::AbstractMatrix, st::SphericalCore.SphericalScattering{T},
+                           X::AbstractArray) where {T}
+    B = size(X)[end]
+    _spherical_batches(st.plan, X) || return _spherical_batch_perfield!(out, st, X)
+
+    bp = SphericalCore.batch_plan(st.plan, B)
+    stb = SphericalCore.SphericalScattering(st.lmax, st.J, st.max_order, bp, st.sigma2)
+    ws = SphericalCore.SphericalWorkspace(stb, X)
+    S1 = zeros(T, st.J, B)
+    S2 = st.max_order >= 2 ? zeros(T, st.J, st.J, B) : Array{T, 3}(undef, 0, 0, 0)
+    r = SphericalCore.spherical_scattering_batch!(S1, S2, stb, ws, X)
+    empty2 = Matrix{T}(undef, 0, 0)
+    @inbounds for b in 1:B
+        S2b = isempty(r.S2) ? empty2 : view(r.S2, :, :, b)
+        _flatten_spherical!(view(out, :, b), r.S0[b], view(r.S1, :, b), S2b, st.J)
+    end
+    return out
 end
 
 # Serializable build spec for reconstructing a transform on a remote worker (FFTW/device plans are
@@ -368,6 +425,61 @@ transform_spec(st::Scattering3D.ScatteringTransform3D) =
      n_orient = st.filter_bank.n_orient, max_order = st.max_order,
      T = real(eltype(st.filter_bank.averaging)), spectral = Plans.spectral_backend(st.plan))
 
+# The nonuniform and spherical surfaces are defined by their sample locations, so those travel in
+# the spec — a worker cannot rebuild the plan without them. They are `O(M)`, sent once per worker,
+# against a batch the worker then transforms entirely locally.
+transform_spec(st::SubsampledScattering.MultiResolutionScattering{T, 1}) where {T} =
+    (kind = :mr1d, N = st.dims[1], J = st.J, Q = st.filter_bank.Q, max_order = st.max_order,
+     oversampling = st.oversampling, T = T, spectral = Plans.spectral_backend(st.plan_full))
+transform_spec(st::SubsampledScattering.MultiResolutionScattering{T, 2}) where {T} =
+    (kind = :mr2d, N = st.dims, J = st.J, L = st.filter_bank.L, max_order = st.max_order,
+     oversampling = st.oversampling, T = T, spectral = Plans.spectral_backend(st.plan_full))
+transform_spec(st::SubsampledScattering.MultiResolutionScattering{T, 3}) where {T} =
+    (kind = :mr3d, N = st.dims, J = st.J, n_orient = st.filter_bank.n_orient,
+     max_order = st.max_order, oversampling = st.oversampling, T = T,
+     spectral = Plans.spectral_backend(st.plan_full))
+
+# The batch width is deliberately not carried: a rebuilt transform is handed whatever column block
+# its worker was assigned, and a plan fixed at the origin's width would reject every block that did
+# not happen to match. Workers therefore rebuild single-field and loop, which is correct at any block
+# size — batching a distributed run means rebuilding at the block's own width, not at the origin's.
+function transform_spec(st::ScatteredPlanar.ScatteredPlanarScattering)
+    x, y = Plans.plan_points(st.plan)
+    return (kind = :planar, x = x, y = y, ms = st.plan.ms, J = st.filter_bank.J,
+            L = st.filter_bank.L, max_order = st.max_order, weights = st.weights,
+            T = real(eltype(st.filter_bank.averaging)), spectral = Plans.spectral_backend(st.plan))
+end
+
+# The spec carries everything the plan was built from rather than re-deriving any of it. In
+# particular the quadrature weights travel: a plan on a structured grid is a plan on *points with
+# Fejér weights*, and rebuilding it from the points alone silently substitutes a uniform average —
+# the weights vary by ~5x across colatitudes, so every coefficient moves. The solver tolerance
+# travels for the same reason: a rebuilt plan must invert to the tolerance the original used, not to
+# the constructor default.
+for (TT, scat, struc) in ((:SphericalScattering, :sphere, :sphere_struct),
+                          (:SphericalMonogenicScattering, :sphere_mono, :sphere_mono_struct))
+    @eval function transform_spec(st::SphericalCore.$TT{T}) where {T}
+        pts = SphericalCore.plan_points(st.plan)
+        spectral = Plans.spectral_backend(st.plan)
+        # No points means the plan is defined by its band limit alone (a structured backend).
+        pts === nothing &&
+            return (kind = $(QuoteNode(struc)), lmax = st.lmax, J = st.J,
+                    max_order = st.max_order, T = T, spectral = spectral)
+        # Every scattered plan analyses by iterative solve, so it has solver settings; only the
+        # structured backends return `nothing`, and those left through the branch above.
+        solver = SphericalCore.plan_solver(st.plan)
+        # Copied, not aliased: `plan_points`/`plan_weights` hand back the plan's own arrays, and a
+        # spec is meant to be an independent description. Passing those arrays straight into another
+        # plan constructor leaves the two transforms sharing state and corrupts the original.
+        w = SphericalCore.plan_weights(st.plan)
+        return (kind = $(QuoteNode(scat)), theta = copy(pts[1]), phi = copy(pts[2]),
+                weights = w === nothing ? nothing : copy(w),
+                rtol = solver.rtol, maxiter = solver.maxiter,
+                nufft = SphericalCore.plan_nufft(st.plan),
+                lmax = st.lmax, J = st.J, max_order = st.max_order, T = T, spectral = spectral)
+    end
+end
+
 function rebuild_transform(spec)
     if spec.kind === :st1d
         return Scattering1D.ScatteringTransform1D(spec.T, spec.N, spec.J; Q = spec.Q,
@@ -378,6 +490,37 @@ function rebuild_transform(spec)
     elseif spec.kind === :st3d
         return Scattering3D.ScatteringTransform3D(spec.T, spec.N, spec.J; n_orient = spec.n_orient,
                                                   max_order = spec.max_order, spectral = spec.spectral)
+    elseif spec.kind === :mr1d
+        return SubsampledScattering.SubsampledScattering1D(spec.T, spec.N, spec.J; Q = spec.Q,
+            max_order = spec.max_order, oversampling = spec.oversampling, spectral = spec.spectral)
+    elseif spec.kind === :mr2d
+        return SubsampledScattering.SubsampledScattering2D(spec.T, spec.N, spec.J; L = spec.L,
+            max_order = spec.max_order, oversampling = spec.oversampling, spectral = spec.spectral)
+    elseif spec.kind === :mr3d
+        return SubsampledScattering.SubsampledScattering3D(spec.T, spec.N, spec.J;
+            n_orient = spec.n_orient, max_order = spec.max_order,
+            oversampling = spec.oversampling, spectral = spec.spectral)
+    elseif spec.kind === :planar
+        # The retained points are already on the plan's periodic domain, so the period is passed
+        # explicitly rather than re-derived from their extent.
+        return ScatteredPlanar.build(spec.T, spec.x, spec.y, spec.ms, spec.J; L = spec.L,
+            max_order = spec.max_order, spectral = spec.spectral, weights = spec.weights,
+            period = (2π, 2π))
+    elseif spec.kind === :sphere
+        # The element type follows from the retained points, so it is not passed separately.
+        return spherical_scattering(spec.theta, spec.phi, spec.lmax, spec.J;
+            max_order = spec.max_order, spectral = spec.spectral, weights = spec.weights,
+            rtol = spec.rtol, maxiter = spec.maxiter, nufft = spec.nufft)
+    elseif spec.kind === :sphere_mono
+        return spherical_monogenic_scattering(spec.theta, spec.phi, spec.lmax, spec.J;
+            max_order = spec.max_order, spectral = spec.spectral, weights = spec.weights,
+            rtol = spec.rtol, maxiter = spec.maxiter, nufft = spec.nufft)
+    elseif spec.kind === :sphere_struct
+        return structured_spherical_scattering(spec.T, spec.lmax, spec.J;
+            max_order = spec.max_order, spectral = spec.spectral)
+    elseif spec.kind === :sphere_mono_struct
+        return structured_spherical_monogenic_scattering(spec.T, spec.lmax, spec.J;
+            max_order = spec.max_order, spectral = spec.spectral)
     else
         throw(ArgumentError("unknown transform spec kind $(spec.kind)"))
     end
@@ -431,7 +574,8 @@ scattered_planar_scattering(x::AbstractVector, y::AbstractVector, ms::NTuple{2, 
 # least-squares transform in `SphericalCore`); the NUFSHT extension supplies a faster spectral plan.
 """
     spherical_scattering(pts_theta, pts_phi, lmax, J; max_order=2,
-                         spectral=SpectralBackends.AutoSpectralBackend(), rtol=1e-8, maxiter=500)
+                         spectral=SpectralBackends.AutoSpectralBackend(),
+                         rtol=SphericalCore.default_rtol(spectral), maxiter=500)
 
 Build a spherical scattering transform for a scalar field at scattered points `(θ, φ)` on S², using
 smooth difference-of-Gaussians band-pass wavelets. `spectral` selects the spherical-harmonic transform:
@@ -444,10 +588,13 @@ needs the sampling to resolve the band limit, i.e. roughly `M ≳ (lmax+1)²` we
 function spherical_scattering(pts_theta::AbstractVector{TT}, pts_phi::AbstractVector, lmax::Int, J::Int;
                               max_order::Int = 2,
                               spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
-                              rtol::Real = 1.0e-8, maxiter::Int = 500) where {TT<:Real}
+                              rtol::Real = SphericalCore.default_rtol(spectral),
+                              maxiter::Int = 500, weights = nothing, ntrans::Int = 1,
+                              nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {TT<:Real}
     T = float(TT)
     plan = SphericalCore.make_spherical_plan(spectral, pts_theta, pts_phi, lmax, T;
-                                             rtol = rtol, maxiter = maxiter)
+                                             rtol = rtol, maxiter = maxiter, weights = weights,
+                                             ntrans = ntrans, nufft = nufft)
     return SphericalCore.SphericalScattering(lmax, J, max_order, plan,
                                              SphericalCore.dog_sigma2(lmax, J, T))
 end
@@ -468,10 +615,13 @@ direct SH transform by default, NUFSHT fast path when loaded).
 function spherical_monogenic_scattering(pts_theta::AbstractVector{TT}, pts_phi::AbstractVector,
                                         lmax::Int, J::Int; max_order::Int = 2,
                                         spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
-                                        rtol::Real = 1.0e-8, maxiter::Int = 500) where {TT<:Real}
+                                        rtol::Real = SphericalCore.default_rtol(spectral),
+                                        maxiter::Int = 500, weights = nothing,
+                                        nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {TT<:Real}
     T = float(TT)
     plan = SphericalCore.make_spherical_plan(spectral, pts_theta, pts_phi, lmax, T;
-                                             rtol = rtol, maxiter = maxiter)
+                                             rtol = rtol, maxiter = maxiter, weights = weights,
+                                             nufft = nufft)
     return SphericalCore.SphericalMonogenicScattering(lmax, J, max_order, plan,
                                                       SphericalCore.dog_sigma2(lmax, J, T))
 end

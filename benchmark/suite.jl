@@ -25,6 +25,10 @@ Run:  julia --project=benchmark -t<threads> benchmark/suite.jl [quick|full]
 using FFTW: FFTW
 using OhMyThreads: OhMyThreads
 using FastSphericalHarmonics: FastSphericalHarmonics
+# Loaded for their extensions, not called directly: without them the nonuniform surfaces resolve to
+# the in-core reference and the suite times that instead of the transform.
+using FINUFFT: FINUFFT
+using NUFSHT: NUFSHT
 using ComputationalBackends: ComputationalBackends as CB
 using SpectralBackends: SpectralBackends as SB
 using ScatteringTransforms: ScatteringTransforms as ST
@@ -178,9 +182,27 @@ end
 
 # ---------------------------------------------------------------------------
 
+# A timing that does not name the backend it resolved to is not a measurement. Every `Auto*` backend
+# falls back to the in-core reference — `O(N²)` gridded, `O(M·K)` nonuniform — when its extension is
+# absent, and that reads as a slow transform rather than as a missing dependency.
+_ext(name) = Base.get_extension(ST, name) !== nothing
+
+function loaded_fast_paths()
+    have = String[]
+    _ext(:ScatteringTransformsFFTWExt) && push!(have, "FFTW")
+    _ext(:ScatteringTransformsFINUFFTExt) && push!(have, "FINUFFT")
+    _ext(:ScatteringTransformsNonuniformFFTsExt) && push!(have, "NonuniformFFTs")
+    _ext(:ScatteringTransformsFastSphericalHarmonicsExt) && push!(have, "FastSphericalHarmonics")
+    _ext(:ScatteringTransformsNUFSHTExt) && push!(have, "NUFSHT")
+    _ext(:ScatteringTransformsOhMyThreadsExt) && push!(have, "OhMyThreads")
+    isempty(have) && push!(have, "NONE — every surface is on its in-core reference path")
+    return have
+end
+
 function main()
     println("threads = ", Threads.nthreads(), "   FFTW threads = ", FFTW.get_num_threads(),
             "   tier = ", TIER)
+    println("loaded fast paths: ", join(loaded_fast_paths(), ", "))
 
     header("Gridded surfaces — roofline and parallel efficiency")
     # `Q` is swept as well as `N`/`J`: it multiplies the wavelet count without changing the grid, so
@@ -219,13 +241,27 @@ function main()
 
     header("Nonuniform and spherical surfaces — batch reuse and threading")
     M = 2000
-    sp = ST.scattered_planar_scattering(rand(M), rand(M), (32, 32), 3; L = 4)
-    Xp = randn(M, 8)
+    Bp = 8
+    px, py = rand(M), rand(M)
+    sp = ST.scattered_planar_scattering(px, py, (32, 32), 3; L = 4)
+    println("scattered planar plan: ", sp.plan)
+    Xp = randn(M, Bp)
+    ts = bench(() -> ST.scattering_batch(sp, Xp))
+    tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sp, Xp))
     Printf.@printf("%-24s serial %8.1f ms   threaded %8.1f ms   %.2fx\n", "scattered planar M=$M",
-                   1e3 * bench(() -> ST.scattering_batch(sp, Xp)),
-                   1e3 * bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sp, Xp)),
-                   bench(() -> ST.scattering_batch(sp, Xp)) /
-                   bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sp, Xp)))
+                   ts * 1e3, tt * 1e3, ts / tt)
+    # The batch axis is also a *transform* axis here: a plan built with `ntrans = B` runs the whole
+    # stack through one NUFFT execution per cascade step instead of one per field. Reported against
+    # the per-field loop above, since the two compose with threading rather than replacing it.
+    spb = ST.ScatteredPlanar.build(Float64, px, py, (32, 32), 3; L = 4, ntrans = Bp)
+    if ST.Plans.batch_width(spb.plan) == Bp
+        tb = bench(() -> ST.scattering_batch(spb, Xp))
+        tbt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), spb, Xp))
+        Printf.@printf("%-24s batched %8.1f ms   %.2fx over per-field   threaded %8.1f ms   %.2fx\n",
+                       "  ntrans=$Bp", tb * 1e3, ts / tb, tbt * 1e3, tb / tbt)
+    else
+        println("  ntrans=$Bp: unavailable — this NUFFT backend transforms one field per call")
+    end
     for lmax in (TIER == "full" ? (16, 32, 64) : (24,))
         ss = ST.structured_spherical_scattering(lmax, 4)
         Θ, Φ = ST.SphericalCore.structured_grid(lmax, Float64)
@@ -234,6 +270,30 @@ function main()
         tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), ss, Xg))
         Printf.@printf("%-24s serial %8.1f ms   threaded %8.1f ms   %.2fx\n",
                        "structured sphere lmax=$lmax", ts * 1e3, tt * 1e3, ts / tt)
+    end
+
+    # Scattered sphere reports per-field against batched because it is the one CPU surface where the
+    # batched plan wins: the gridded cascade is bandwidth bound, so its `batch_cascade!` loses to a
+    # per-slice loop, while here each step is an iterative solve whose transforms NUFSHT batches over
+    # `ntrans`. Threading is reported against the batched time, since the two compose.
+    if _ext(:ScatteringTransformsNUFSHTExt)
+        for (lmax, M) in (TIER == "full" ? ((8, 500), (16, 1500), (32, 5000)) : ((8, 500),))
+            ga = π * (3 - sqrt(5.0))
+            θ = [acos(1 - 2 * (i - 0.5) / M) for i in 1:M]
+            φ = [mod(ga * i, 2π) for i in 1:M]
+            sc = ST.spherical_scattering(θ, φ, lmax, 3)
+            Xc = randn(M, 8)
+            println("scattered sphere plan: ", sc.plan)
+            tb = bench(() -> ST.scattering_batch(sc, Xc))
+            tf = bench(() -> ST._spherical_batch_perfield!(
+                Matrix{Float64}(undef, ST.flat_rows(sc), size(Xc, 2)), sc, Xc))
+            tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sc, Xc))
+            Printf.@printf("%-24s per-field %8.1f ms   batched %8.1f ms   %.2fx   threaded %8.1f ms   %.2fx\n",
+                           "scattered sphere lmax=$lmax", tf * 1e3, tb * 1e3, tf / tb, tt * 1e3, tb / tt)
+        end
+    else
+        println("scattered sphere: skipped — NUFSHT not loaded (its in-core O(M·K) reference would " *
+                "be reported as the transform's speed)")
     end
 
     allocations()

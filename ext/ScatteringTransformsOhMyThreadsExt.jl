@@ -182,6 +182,44 @@ end
 function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
                               st::ST.ScatteredPlanar.ScatteredPlanarScattering, X::AbstractMatrix)
     T = eltype(out)
+    W = ST.Plans.batch_width(st.plan)
+    W == 1 && return _planar_threaded_perfield!(out, st, X)
+
+    # A batched transform's buffers and guru plan are `W` wide, so the parallel unit is a chunk of
+    # exactly `W` columns rather than one field. Threads and batching are independent multipliers and
+    # both are used: `B ÷ W` tasks, each issuing one execution per cascade step for its own chunk.
+    B = size(X, 2)
+    B % W == 0 || throw(DimensionMismatch(
+        "this transform was built with ntrans = $W, so a threaded batch must be a multiple of $W; " *
+        "got $B."))
+    nw = length(st.filter_bank.wavelets)
+    with_serial_blas() do
+        OMT.@tasks for c0 in 1:W:B
+            @local begin
+                ws = ST.ScatteringCore.task_workspace(st)
+                coeffs = ST.batch_coeffs(st, T)
+                S0 = Vector{T}(undef, W)
+                S1 = Matrix{T}(undef, nw, W)
+                S2 = st.max_order >= 2 ? zeros(T, nw, nw, W) : Array{T, 3}(undef, 0, 0, 0)
+            end
+            cols = c0:(c0 + W - 1)
+            r = ST.ScatteredPlanar.scattered_planar_scattering_batch!(S0, S1, S2, ws,
+                                                                      view(X, :, cols))
+            for (i, b) in enumerate(cols)
+                copyto!(coeffs.S1, view(r.S1, :, i))
+                isempty(coeffs.S2) || copyto!(coeffs.S2, view(r.S2, :, :, i))
+                ST.Coefficients.flatten2d!(view(out, :, b),
+                                           ST.Coefficients.update_S0(coeffs, r.S0[i]))
+            end
+        end
+    end
+    return out
+end
+
+function _planar_threaded_perfield!(out::AbstractMatrix,
+                                    st::ST.ScatteredPlanar.ScatteredPlanarScattering,
+                                    X::AbstractMatrix)
+    T = eltype(out)
     with_serial_blas() do
         OMT.@tasks for b in 1:size(X, 2)
             @local begin
@@ -198,8 +236,9 @@ end
 for (TT, WS, fun) in (
         (:SphericalScattering, :SphericalWorkspace, :spherical_scattering!),
         (:SphericalMonogenicScattering, :SphericalMonogenicWorkspace, :spherical_monogenic_scattering!))
-    @eval function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
-                                        st::ST.SphericalCore.$TT{T}, X::AbstractArray) where {T}
+    @eval function _spherical_threaded_perfield!(out::AbstractMatrix,
+                                                 st::ST.SphericalCore.$TT{T},
+                                                 X::AbstractArray) where {T}
         D = ndims(X)
         with_serial_blas() do
             OMT.@tasks for b in 1:size(X, D)
@@ -218,6 +257,47 @@ for (TT, WS, fun) in (
         end
         return out
     end
+end
+
+# The monogenic amplitude is built from per-field spin-0 transforms, so its only parallel axis is the
+# batch, one field per task.
+ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
+                     st::ST.SphericalCore.SphericalMonogenicScattering, X::AbstractArray) =
+    _spherical_threaded_perfield!(out, st, X)
+
+# Partition 1:n into ≤ k contiguous column ranges.
+_column_chunks(n::Int, k::Int) =
+    (k = max(1, min(k, n)); [(div((c - 1) * n, k) + 1):(div(c * n, k)) for c in 1:k])
+
+# Threads and batched transforms are independent multipliers here, so both are used: one task per
+# column chunk, and inside each task one transform per cascade step covering that whole chunk. A
+# chunk gets its own widened plan, which is what makes it task-local — the batched cascade writes
+# through the plan's own buffers, so tasks cannot share one.
+function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
+                              st::ST.SphericalCore.SphericalScattering{T},
+                              X::AbstractArray) where {T}
+    ST._spherical_batches(st.plan, X) || return _spherical_threaded_perfield!(out, st, X)
+    B = size(X, 2)
+    chunks = _column_chunks(B, Threads.nthreads())
+    with_serial_blas() do
+        OMT.@tasks for cols in chunks
+            k = length(cols)
+            Xc = view(X, :, cols)
+            stb = ST.SphericalCore.SphericalScattering(st.lmax, st.J, st.max_order,
+                                                       ST.SphericalCore.batch_plan(st.plan, k),
+                                                       st.sigma2)
+            ws = ST.SphericalCore.SphericalWorkspace(stb, Xc)
+            S1 = zeros(T, st.J, k)
+            S2 = st.max_order >= 2 ? zeros(T, st.J, st.J, k) : Array{T, 3}(undef, 0, 0, 0)
+            r = ST.SphericalCore.spherical_scattering_batch!(S1, S2, stb, ws, Xc)
+            empty2 = Matrix{T}(undef, 0, 0)
+            for (i, b) in enumerate(cols)
+                S2b = isempty(r.S2) ? empty2 : view(r.S2, :, :, i)
+                ST._flatten_spherical!(view(out, :, b), r.S0[i], view(r.S1, :, i), S2b, st.J)
+            end
+        end
+    end
+    return out
 end
 
 ST.scattering_batch(b::CB.AbstractThreadedBackend,

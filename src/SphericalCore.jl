@@ -95,6 +95,94 @@ scattered points, the exact quadrature integral for a structured grid. Provided 
 """
 function sphere_mean end
 
+"""
+    plan_points(plan) -> (θ, φ) or nothing
+
+The sample locations a spherical plan was built on, or `nothing` when the plan is defined by its
+band limit alone (a structured grid). This is what a transform needs to be rebuilt on another
+process, where the plan itself cannot travel.
+"""
+function plan_points end
+
+"""
+    plan_weights(plan) -> weights or nothing
+
+The quadrature weights the plan averages with, or `nothing` for a backend that takes the unweighted
+sample mean.
+
+These have to be carried, not re-derived: a structured grid's Fejér weights vary by a factor of ~5
+across colatitudes, so rebuilding a plan on the same points without them silently substitutes a
+uniform average and shifts every coefficient.
+"""
+function plan_weights end
+
+"""
+    plan_solver(plan) -> (; rtol, maxiter)
+
+The iterative-solver settings a plan analyses with, so a rebuilt plan inverts to the same tolerance
+rather than to whatever the constructor defaults to.
+"""
+function plan_solver end
+
+"""
+    batch_plan(plan, B) -> plan or nothing
+
+An equivalent plan that transforms `B` co-located fields per call, or `nothing` if this backend has
+no batched form. Same points, band limit, weights and solver settings — only the batch width differs.
+
+A backend that returns a plan here lets [`spherical_scattering_batch!`](@ref) issue one transform per
+cascade step for the whole stack instead of one per field. Returning `nothing` is not a defect; it
+means the per-field loop is the only path, and callers fall back to it.
+"""
+batch_plan(::Any, ::Integer) = nothing
+
+"""
+    supports_batch(plan) -> Bool
+
+Whether [`batch_plan`](@ref) can widen this plan. Asked before building anything, so a caller can
+choose between the batched and per-field cascades without paying for a plan it may not use.
+"""
+supports_batch(::Any) = false
+
+"""
+    plan_nufft(plan) -> SpectralBackends.AbstractSpectralBackend
+
+The NUFFT backend a scattered-sphere plan resolved to, or `AutoSpectralBackend()` for a plan that
+runs none.
+
+`Plans.spectral_backend` cannot express this: it reports `NUFSHTSpectralBackend` whether the
+transform is driven by FINUFFT, NonuniformFFTs, or direct summation. Carrying it separately is what
+lets a rebuilt transform — on a distributed worker, say — run the same transform as the original
+instead of silently re-resolving to whatever that process happens to have loaded.
+"""
+plan_nufft(::Any) = SB.AutoSpectralBackend()
+
+"""
+    AnalysisNotConverged <: Exception
+
+Thrown when an iterative spherical analysis stops at `maxiter` still above its tolerance.
+
+Such a solve does not return an imprecise answer, it returns a meaningless one — conjugate gradients
+on the normal equations can grow without bound, so the coefficients may exceed the field by many
+orders of magnitude. Returning them silently would propagate that into every coefficient downstream,
+so the analysis refuses instead.
+"""
+struct AnalysisNotConverged <: Exception
+    residual::Float64
+    rtol::Float64
+    iters::Int
+    maxiter::Int
+    ntrans::Int
+end
+
+function Base.showerror(io::IO, e::AnalysisNotConverged)
+    print(io, "AnalysisNotConverged: spherical analysis reached relative residual ", e.residual,
+          " after ", e.iters, " of ", e.maxiter, " iterations, against rtol = ", e.rtol,
+          " (ntrans = ", e.ntrans, "). ")
+    return print(io, "The sampling may not resolve the band limit — accurate analysis needs roughly ",
+                 "M ≳ (lmax+1)² well-distributed points — or `maxiter` may be too small.")
+end
+
 # ---------------------------------------------------------------------------
 # Dyadic difference-of-Gaussians band-pass bank (pure math).
 # ---------------------------------------------------------------------------
@@ -222,6 +310,37 @@ function spherical_scattering!(S1::AbstractVector, S2::AbstractMatrix,
     end
     return (S0 = S0, S1 = S1, S2 = S2)
 end
+
+"""
+    spherical_scattering_batch!(S1, S2, st, ws, X) -> (; S0, S1, S2)
+
+Cascade over a stack of `B` fields sampled at the same points: `X` is `(M, B)`, `S1` is `(J, B)` and
+`S2` is `(J, J, B)`. Every transform covers all `B` fields in one call, so the per-call setup is paid
+once per cascade step rather than `B` times — `st.plan` must have been built with a matching batch
+size for that to hold.
+"""
+function spherical_scattering_batch!(S1::AbstractMatrix, S2::AbstractArray,
+                                     st::SphericalScattering, ws::SphericalWorkspace,
+                                     X::AbstractMatrix)
+    J = st.J
+    S0 = sphere_mean(st.plan, X)
+    isempty(S2) || fill!(S2, zero(eltype(S2)))
+    sphere_coeffs!(ws.C, st.plan, X)
+    for j1 in 1:J
+        sphere_apply!(ws.band, st.plan, ws.C, band_multiplier(st.sigma2[j1 + 1], st.sigma2[j1]))
+        @. ws.u1 = abs(ws.band)
+        S1[j1, :] .= sphere_mean(st.plan, ws.u1)
+        (st.max_order >= 2 && j1 > 1) || continue
+        sphere_coeffs!(ws.C1, st.plan, ws.u1)
+        for j2 in 1:(j1 - 1)
+            sphere_apply!(ws.band, st.plan, ws.C1, band_multiplier(st.sigma2[j2 + 1], st.sigma2[j2]))
+            @. ws.band = abs(ws.band)
+            S2[j1, j2, :] .= sphere_mean(st.plan, ws.band)
+        end
+    end
+    return (S0 = S0, S1 = S1, S2 = S2)
+end
+
 
 """
     SphericalMonogenicScattering{T,P}
@@ -390,6 +509,11 @@ end
 
 # `Y`, `G`, `ldeg`, the point set and the quadrature weights are read-only and shared; the CG and
 # synthesis scratch is per-task, because analysis writes its result through it.
+plan_points(p::DirectSHTSphericalPlan) = (p.theta, p.phi)
+plan_weights(p::DirectSHTSphericalPlan) = p.weights
+plan_solver(p::DirectSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter)
+Plans.spectral_backend(::DirectSHTSphericalPlan) = SB.DirectSumSpectralBackend()
+
 Plans.task_local_plan(p::DirectSHTSphericalPlan) = DirectSHTSphericalPlan(
     p.lmax, p.M, p.K, p.Y, p.G, p.ldeg, p.theta, p.phi, p.rtol, p.maxiter, p.weights,
     similar(p.rhs), similar(p.r), similar(p.p), similar(p.Gp), similar(p.ha))
@@ -505,6 +629,23 @@ nusht_spherical_plan(args...; kwargs...) = throw(ArgumentError(
     "NUFSHTSpectralBackend requires the NUFSHT extension. Run `using NUFSHT`."))
 
 """
+    default_rtol(spectral) -> Real
+
+Conjugate-gradient tolerance for the scattered-sphere analysis solve under `spectral`.
+
+The solve cannot resolve the field better than the transform it is built on, so the useful tolerance
+is backend-specific. In-core direct summation evaluates `Y` exactly, so the solve tolerance *is* the
+analysis accuracy and `1e-8` buys real digits. NUFSHT analysis instead floors at its own
+approximation error — measured against the exact in-core transform, ~2e-4 at `lmax = 8`, `M = 500`
+and ~2e-5 at `lmax = 16`, `M = 1500` — and `1e-4` reaches that floor, matching `1e-8`'s accuracy in
+up to 3× less time. `1e-2` does not: it lands about twice as far off.
+"""
+default_rtol(::SB.AbstractSpectralBackend) = 1.0e-8
+default_rtol(::SB.AbstractNUFSHTSpectralBackend) = 1.0e-4
+default_rtol(::SB.AbstractAutoSpectralBackend) =
+    _have_nufsht() ? default_rtol(SB.NUFSHTSpectralBackend()) : default_rtol(SB.DirectSumSpectralBackend())
+
+"""
     make_spherical_plan(spectral, θ, φ, lmax, T; rtol, maxiter) -> AbstractSphericalPlan
 
 Build the scattered-sphere plan selected by `spectral` over points `(θ, φ)` and band limit `lmax`.
@@ -512,14 +653,26 @@ Build the scattered-sphere plan selected by `spectral` over points `(θ, φ)` an
 `SpectralBackends.NUFSHTSpectralBackend` (or `SpectralBackends.AutoSpectralBackend` once the NUFSHT
 extension is loaded) uses the NUFSHT fast path.
 """
-function make_spherical_plan(::SB.AbstractDirectSumSpectralBackend, θ, φ, lmax, ::Type{T};
-                             rtol::Real = 1.0e-8, maxiter::Int = 500) where {T}
-    return DirectSHTSphericalPlan(θ, φ, lmax, T; rtol = rtol, maxiter = maxiter)
+# The in-core plan transforms one field per call, so `ntrans` is accepted and ignored rather than
+# rejected: a caller asking for a batch still gets correct results, just not the batched transform.
+function make_spherical_plan(s::SB.AbstractDirectSumSpectralBackend, θ, φ, lmax, ::Type{T};
+                             rtol::Real = default_rtol(s), maxiter::Int = 500, weights = nothing,
+                             ntrans::Int = 1,
+                             nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {T}
+    # Refused rather than ignored: this plan evaluates `Y` directly and runs no NUFFT, so honouring a
+    # named one is impossible and silently dropping it would misreport what the transform does.
+    nufft isa SB.AbstractAutoSpectralBackend || throw(ArgumentError(
+        "the in-core spherical plan performs no NUFFT, so `nufft = $nufft` cannot be honoured; " *
+        "pass spectral = SpectralBackends.NUFSHTSpectralBackend() for a NUFFT-backed transform."))
+    return DirectSHTSphericalPlan(θ, φ, lmax, T; rtol = rtol, maxiter = maxiter, weights = weights)
 end
-make_spherical_plan(::SB.AbstractNUFSHTSpectralBackend, θ, φ, lmax, ::Type{T}; kwargs...) where {T} =
+# NUFSHT takes the unweighted sample mean, so it has no quadrature to accept; `weights` is dropped
+# rather than silently ignored further down.
+make_spherical_plan(::SB.AbstractNUFSHTSpectralBackend, θ, φ, lmax, ::Type{T};
+                    weights = nothing, kwargs...) where {T} =
     nusht_spherical_plan(θ, φ, lmax, T; kwargs...)
 make_spherical_plan(::SB.AbstractAutoSpectralBackend, θ, φ, lmax, ::Type{T}; kwargs...) where {T} =
-    _have_nufsht() ? nusht_spherical_plan(θ, φ, lmax, T; kwargs...) :
+    _have_nufsht() ? make_spherical_plan(SB.NUFSHTSpectralBackend(), θ, φ, lmax, T; kwargs...) :
     make_spherical_plan(SB.DirectSumSpectralBackend(), θ, φ, lmax, T; kwargs...)
 
 # ---------------------------------------------------------------------------

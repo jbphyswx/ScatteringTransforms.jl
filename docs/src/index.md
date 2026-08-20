@@ -130,6 +130,20 @@ fast path automatically (identical results). `scattering_batch` reuses one plan/
 a stack; `using OhMyThreads`, `using Distributed`, or `using MPI` enable
 `scattering_batch(ThreadedBackend(), …)`, `DistributedBackend(…)`, and `MPIBackend(…)`.
 
+On the scattered surfaces the batch is also a *transform* axis: NUFFT and NUFSHT libraries transform
+several co-located fields per call, so building with `ntrans = B` runs each cascade step as one
+transform over the whole stack rather than one per field.
+
+```julia
+sp = ST.ScatteredPlanar.build(Float64, x, y, (32, 32), 3; L = 4, ntrans = 8)
+ST.scattering_batch(sp, X)                          # X is (M, 8)
+ST.scattering_batch(ThreadedBackend(), sp, X)       # composes with threads
+```
+
+A plan's batch width is fixed when it is built, so such a transform takes stacks of exactly that
+width (a multiple of it when threaded) and refuses any other rather than reshaping silently. Backends
+that transform one field per call report a width of `1` and keep the per-field loop.
+
 ![Backend performance](assets/backend_performance.png)
 
 ## Documentation
