@@ -31,17 +31,19 @@ using ScatteringTransforms: ScatteringTransforms as ST
 # Implements the `ST.Plans.AbstractScatteringPlan` interface so the cascade reuses `wavelet_convolve!`.
 # ---------------------------------------------------------------------------
 
-# `finufft_plan` is itself mutable and owns the C plan, so the finalizer that frees it goes there
-# (see `_plan_at`) and this wrapper stays immutable.
+# The guru plans are themselves mutable and own their C plans, so the finalizer that frees one goes
+# there (see `nufft_guru_make`) and this wrapper stays immutable.
 #
 # The buffers carry no fixed rank: a guru plan's `ntrans` is chosen at build time and cannot vary per
 # execution, so a `B = 1` plan holds `(M)` / `(ms)` buffers and a batched one `(M, B)` / `(ms…, B)`.
 # A plan is therefore either single-field or batched, never both.
-struct NUFFTScatteringPlan{T, CV<:AbstractArray{Complex{T}},
+struct NUFFTScatteringPlan{T, G, CV<:AbstractArray{Complex{T}},
                            MM<:AbstractArray{Complex{T}},
                            RV<:AbstractVector{T}} <: ST.Plans.AbstractScatteringPlan
-    guru1::FINUFFT.finufft_plan{T}   # Type-1 (points → modes), iflag −1, FFT mode order
-    guru2::FINUFFT.finufft_plan{T}   # Type-2 (modes → points), iflag +1, FFT mode order
+    # A type parameter rather than `finufft_plan{T}`, so the same wrapper holds a host guru plan or a
+    # cuFINUFFT one. Concrete either way — it is fixed per instantiation.
+    guru1::G                      # Type-1 (points → modes), iflag −1, FFT mode order
+    guru2::G                      # Type-2 (modes → points), iflag +1, FFT mode order
     ms::NTuple{2,Int}
     M::Int
     B::Int                        # fields transformed per execution (FINUFFT `ntrans`)
@@ -76,21 +78,34 @@ end
 # time, so plan construction is serialised. It happens once per task, never per transform.
 const PLANNER_LOCK = ReentrantLock()
 
+# Host seam. `finufft_plan` is mutable and owns the C plan, so the finalizer that frees it goes there
+# and this package's wrapper stays immutable; `finufft_destroy!` is idempotent, so an explicit destroy
+# before collection is harmless.
+function ST.Plans.nufft_guru_make(::AbstractArray, type::Integer, ms::NTuple{2, Int},
+                                  iflag::Integer, ntrans::Integer, eps::Real, ::Type{T}) where {T}
+    g = FINUFFT.finufft_makeplan(type, collect(ms), iflag, ntrans, eps; dtype = T, modeord = 1)
+    finalizer(FINUFFT.finufft_destroy!, g)
+    return g
+end
+
+ST.Plans.nufft_guru_setpts!(g::FINUFFT.finufft_plan, x, y) = (FINUFFT.finufft_setpts!(g, x, y); g)
+ST.Plans.nufft_guru_exec!(g::FINUFFT.finufft_plan, input, output) =
+    (FINUFFT.finufft_exec!(g, input, output); output)
+
 function _plan_at(ms::NTuple{2,Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, maxiter,
                   rtol::T, B::Int = 1) where {T}
     guru1, guru2 = Base.@lock PLANNER_LOCK begin
-        g1 = FINUFFT.finufft_makeplan(1, collect(ms), -1, B, eps; dtype = T, modeord = 1)
-        g2 = FINUFFT.finufft_makeplan(2, collect(ms), +1, B, eps; dtype = T, modeord = 1)
-        FINUFFT.finufft_setpts!(g1, sx, sy)
-        FINUFFT.finufft_setpts!(g2, sx, sy)
-        # Each guru plan owns its C plan, so each frees its own. `finufft_destroy!` is idempotent, so
-        # an explicit destroy before collection is harmless.
-        finalizer(FINUFFT.finufft_destroy!, g1)
-        finalizer(FINUFFT.finufft_destroy!, g2)
+        # Built through the seam, so device points get a cuFINUFFT plan and host points a host one.
+        g1 = ST.Plans.nufft_guru_make(sx, 1, ms, -1, B, eps, T)
+        g2 = ST.Plans.nufft_guru_make(sx, 2, ms, +1, B, eps, T)
+        ST.Plans.nufft_guru_setpts!(g1, sx, sy)
+        ST.Plans.nufft_guru_setpts!(g2, sx, sy)
         (g1, g2)
     end
-    pts(n) = B == 1 ? Vector{Complex{T}}(undef, n) : Matrix{Complex{T}}(undef, n, B)
-    modes() = B == 1 ? Array{Complex{T}}(undef, ms) : Array{Complex{T}}(undef, ms..., B)
+    # `similar` to the points, so a device point set gives device-resident buffers to match the
+    # cuFINUFFT plan the seam returned for it.
+    pts(n) = B == 1 ? similar(sx, Complex{T}, n) : similar(sx, Complex{T}, n, B)
+    modes() = B == 1 ? similar(sx, Complex{T}, ms) : similar(sx, Complex{T}, (ms..., B))
     return NUFFTScatteringPlan(
         guru1, guru2, ms, M, B, one(T) / prod(ms), solve, maxiter, rtol, sx, sy, eps,
         pts(M), modes(), modes(), modes(), pts(M))
@@ -126,7 +141,7 @@ end
 # Synthesis: modes → points, scaled by 1/prod(ms) (ifft convention). For a Type-2 plan
 # `finufft_exec!(plan, input, output)` takes input=modes, output=points.
 function ST.Plans.inverse_transform!(out_pts::AbstractVector, plan::NUFFTScatteringPlan, Xmodes::AbstractMatrix)
-    FINUFFT.finufft_exec!(plan.guru2, Xmodes, plan.cj)
+    ST.Plans.nufft_guru_exec!(plan.guru2, Xmodes, plan.cj)
     @. out_pts = plan.cj * plan.invN
     return out_pts
 end
@@ -135,7 +150,7 @@ end
 # valid shapes for it, just as the shapes above are the only valid ones for a `B = 1` plan.
 function ST.Plans.inverse_transform!(out_pts::AbstractMatrix, plan::NUFFTScatteringPlan,
                                      Xmodes::AbstractArray{<:Any,3})
-    FINUFFT.finufft_exec!(plan.guru2, Xmodes, plan.cj)
+    ST.Plans.nufft_guru_exec!(plan.guru2, Xmodes, plan.cj)
     @. out_pts = plan.cj * plan.invN
     return out_pts
 end
@@ -146,7 +161,7 @@ function ST.Plans.forward_transform!(Xmodes::AbstractArray{<:Any,3}, plan::NUFFT
         "the CG least-squares analysis (`solve = true`) has no batched form; build the plan with " *
         "`ntrans = 1` or use `solve = false`."))
     copyto!(plan.cj, x_pts)
-    FINUFFT.finufft_exec!(plan.guru1, plan.cj, Xmodes)
+    ST.Plans.nufft_guru_exec!(plan.guru1, plan.cj, Xmodes)
     return Xmodes
 end
 
@@ -156,7 +171,7 @@ function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NUFFTScatteri
         _cg_solve!(Xmodes, plan, x_pts)
     else
         copyto!(plan.cj, x_pts)
-        FINUFFT.finufft_exec!(plan.guru1, plan.cj, Xmodes)
+        ST.Plans.nufft_guru_exec!(plan.guru1, plan.cj, Xmodes)
     end
     return Xmodes
 end
@@ -166,7 +181,7 @@ end
 function _cg_solve!(f::AbstractMatrix, plan::NUFFTScatteringPlan{T}, x_pts::AbstractVector) where {T}
     N = one(T) / plan.invN
     copyto!(plan.cj, x_pts)
-    FINUFFT.finufft_exec!(plan.guru1, plan.cj, plan.r)         # r = A†x  (modes)
+    ST.Plans.nufft_guru_exec!(plan.guru1, plan.cj, plan.r)         # r = A†x  (modes)
     plan.r .*= N                                               # r = A†(N·x) = rhs
     fill!(f, zero(Complex{T}))
     copyto!(plan.p, plan.r)
@@ -174,8 +189,8 @@ function _cg_solve!(f::AbstractMatrix, plan::NUFFTScatteringPlan{T}, x_pts::Abst
     rs0 = rsold
     rs0 == 0 && return f
     @inbounds for _ in 1:plan.maxiter
-        FINUFFT.finufft_exec!(plan.guru2, plan.p, plan.tmp_pts)    # tmp = A·p (Type-2: modes→points)
-        FINUFFT.finufft_exec!(plan.guru1, plan.tmp_pts, plan.Ap)   # Ap  = A†A·p (Type-1: points→modes)
+        ST.Plans.nufft_guru_exec!(plan.guru2, plan.p, plan.tmp_pts)    # tmp = A·p (Type-2: modes→points)
+        ST.Plans.nufft_guru_exec!(plan.guru1, plan.tmp_pts, plan.Ap)   # Ap  = A†A·p (Type-1: points→modes)
         α = rsold / real(LinearAlgebra.dot(vec(plan.p), vec(plan.Ap)))
         f .+= α .* plan.p
         plan.r .-= α .* plan.Ap

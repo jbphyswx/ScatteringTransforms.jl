@@ -15,6 +15,7 @@ SpectralBackends = "289ded02-b044-41b2-8b2d-71f2a47755d1"
 
 [weakdeps]
 AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
@@ -29,6 +30,7 @@ OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 
 [extensions]
 ScatteringTransformsCairoMakieExt = "CairoMakie"
+ScatteringTransformscuFINUFFTExt = ["CUDA", "FINUFFT"]
 ScatteringTransformsDifferentiationInterfaceExt = "DifferentiationInterface"
 ScatteringTransformsDistributedExt = "Distributed"
 ScatteringTransformsFFTWExt = "FFTW"
@@ -42,12 +44,13 @@ ScatteringTransformsOhMyThreadsExt = "OhMyThreads"
 
 [compat]
 AbstractFFTs = "1"
+CUDA = "5, 6"
 CairoMakie = "0.15"
 ComputationalBackends = "0.1"
 DifferentiationInterface = "0.7"
 Distributed = "1"
 FFTW = "1"
-FINUFFT = "3"
+FINUFFT = "3.5.2"
 FastSphericalHarmonics = "1"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1"

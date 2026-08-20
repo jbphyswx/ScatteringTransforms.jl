@@ -81,6 +81,24 @@ spectral_backend(plan::AbstractScatteringPlan) = throw(ArgumentError(
     "rebuilt from a serialisable spec — construct the transform on each worker explicitly."))
 
 """
+    nufft_guru_make(points, type, ms, iflag, ntrans, eps, T) -> guru plan
+    nufft_guru_setpts!(guru, x, y) -> guru
+    nufft_guru_exec!(guru, input, output) -> output
+
+Creation, point assignment and execution of a FINUFFT guru plan, split so that a device binding is
+one method rather than a second copy of the scattered-planar plan.
+
+Creation dispatches on the point array, since that is what decides where the transform has to run;
+the other two dispatch on the returned plan, so each backend's handle carries its own execution. The
+host methods live in the FINUFFT extension, the CUDA ones in the cuFINUFFT extension — only the NUFFT
+is vendor-specific, because the cascade around it is broadcasts and reductions over whatever array
+type the points are.
+"""
+function nufft_guru_make end
+function nufft_guru_setpts! end
+function nufft_guru_exec! end
+
+"""
     batch_width(plan) -> Int
 
 Number of co-located fields this plan transforms per execution — `1` unless it was built for a batch.
