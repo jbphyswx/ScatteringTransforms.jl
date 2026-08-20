@@ -69,3 +69,51 @@ Test.@testset "Spherical monogenic components: dependency-free direct SH backend
     ref = Complex{Float64}[bl * NUFSHT.sYlm(1, ℓ0, 0, θ[k], φ[k]) for k in 1:M]
     Test.@test maximum(abs.(URc .- ref)) / maximum(abs.(ref)) < 1e-5
 end
+
+Test.@testset "Riesz components equal the surface gradient (finite-difference ground truth)" begin
+    # The comparison above is backend-against-backend, so it cannot pin a sign: it checks the complex
+    # combination `u_θ + i·u_φ`, and a flip in both components against a flipped reference passes.
+    # That is not hypothetical — it is how a sign error in both survived here.
+    #
+    # This gates each component separately against something neither backend supplies. The Riesz field
+    # is the surface gradient of `g = (−Δ_S)^{-1/2} U⁰`: `u_θ = ∂_θ g` and `u_φ = (1/sinθ) ∂_φ g`, so
+    # central differences of the analytic harmonic are the ground truth. `m = 0` alone is not enough —
+    # `∂_φ g` vanishes there, which is exactly what hid the `u_φ` sign.
+    SC = ScatteringTransforms.SphericalCore
+    lmax, J, M = 12, 3, 400
+    gr = (sqrt(5) - 1) / 2
+    θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φ = [2π * mod(k * gr, 1) for k in 1:M]
+
+    # A real spherical harmonic in the plan's own convention, from the *undifferentiated* Legendre
+    # recurrence, so the θ-derivative under test is not used to build its own reference.
+    function realY(ℓ, m, t, f)
+        P = Matrix{Float64}(undef, lmax + 1, lmax + 1)
+        SC._assoc_legendre!(P, cos(t), lmax)
+        am = abs(m)
+        Pv = P[ℓ + 1, am + 1]
+        return m == 0 ? Pv : (m > 0 ? sqrt(2) * Pv * cos(m * f) : sqrt(2) * Pv * sin(am * f))
+    end
+
+    st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J;
+             spectral = SpectralBackends.DirectSumSpectralBackend())
+    sig = SC.dog_sigma2(lmax, J, Float64)
+    h = 1.0e-6
+    for (ℓ0, m) in ((5, 0), (5, 2), (6, -3))
+        bvals = [SC.band_multiplier(sig[j + 1], sig[j])(ℓ0) for j in 1:J]
+        j = argmax(abs.(bvals))
+        bl = bvals[j]
+        s = sqrt(ℓ0 * (ℓ0 + 1))
+        field = [realY(ℓ0, m, θ[k], φ[k]) for k in 1:M]
+        comp = ScatteringTransforms.spherical_monogenic_components(st, field, j)
+        gθ = [bl * (realY(ℓ0, m, θ[k] + h, φ[k]) - realY(ℓ0, m, θ[k] - h, φ[k])) / (2h) / s
+              for k in 1:M]
+        gφ = [bl * (realY(ℓ0, m, θ[k], φ[k] + h) - realY(ℓ0, m, θ[k], φ[k] - h)) /
+              (2h) / s / sin(θ[k]) for k in 1:M]
+        # Absolute scale, not relative: `∂_φ g` is identically zero at `m = 0`, so a relative
+        # tolerance there would divide by zero and report nonsense either way.
+        scale = maximum(abs, gθ)
+        Test.@test maximum(abs, comp.riesz[1] .- gθ) < 1e-6 * scale
+        Test.@test maximum(abs, comp.riesz[2] .- gφ) < 1e-6 * scale
+    end
+end

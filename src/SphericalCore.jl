@@ -769,10 +769,13 @@ make_structured_plan(::SB.AbstractAutoSpectralBackend, lmax, ::Type{T}; kwargs..
 # ---------------------------------------------------------------------------
 
 # ∂_θ P̄_ℓ^m from same-degree neighbours:
-#   ∂_θ P̄_ℓ^m = ½[ √((ℓ−m)(ℓ+m+1))·P̄_ℓ^{m+1} − √((ℓ+m)(ℓ−m+1))·P̄_ℓ^{m−1} ]
+#   ∂_θ P̄_ℓ^m = ½[ √((ℓ+m)(ℓ−m+1))·P̄_ℓ^{m−1} − √((ℓ−m)(ℓ+m+1))·P̄_ℓ^{m+1} ]
 # with `P̄_ℓ^{−1} = −P̄_ℓ^{1}` (the normalised form of `P_ℓ^{−m} = (−1)^m (ℓ−m)!/(ℓ+m)!·P_ℓ^m`), which
-# collapses the `m = 0` case to `+√(ℓ(ℓ+1))·P̄_ℓ^1`. The sign is opposite the form usually quoted for
-# functions without the Condon–Shortley phase, which `_assoc_legendre!` carries in its sectoral step.
+# collapses the `m = 0` case to `−√(ℓ(ℓ+1))·P̄_ℓ^1`.
+#
+# The overall sign is fixed by ground truth rather than by convention-matching: for `m = 0` the field
+# is `∝ P_ℓ(cosθ)`, so the surface gradient has no `φ` component and its `θ` component is a plain
+# `∂_θ`, which a central difference of the analytic harmonic pins to 1e-9.
 #
 # The identity is homogeneous in the normalisation, so it holds for `_assoc_legendre!`'s output as
 # written — that routine's arbitrary overall scale cancels. One Legendre recurrence per point instead
@@ -781,7 +784,7 @@ make_structured_plan(::SB.AbstractAutoSpectralBackend, lmax, ::Type{T}; kwargs..
     up = (m + 1 > ℓ) ? zero(T) : sqrt(T((ℓ - m) * (ℓ + m + 1))) * P[ℓ + 1, m + 2]
     dn = m == 0 ? -sqrt(T(ℓ * (ℓ + 1))) * (ℓ >= 1 ? P[ℓ + 1, 2] : zero(T)) :
          sqrt(T((ℓ + m) * (ℓ - m + 1))) * P[ℓ + 1, m]
-    return (up - dn) / 2
+    return (dn - up) / 2
 end
 
 function _riesz_gradient(plan::DirectSHTSphericalPlan{T}, gc::AbstractVector) where {T}
@@ -805,10 +808,10 @@ function _riesz_gradient(plan::DirectSHTSphericalPlan{T}, gc::AbstractVector) wh
                 aθ += gc[col] * dP
             elseif m > 0
                 aθ += gc[col] * s2 * dP * cos(m * φn)
-                aφ += gc[col] * s2 * P0[ℓ + 1, am + 1] * (-m * sin(m * φn)) * invs
+                aφ += gc[col] * s2 * P0[ℓ + 1, am + 1] * (m * sin(m * φn)) * invs
             else
                 aθ += gc[col] * s2 * dP * sin(am * φn)
-                aφ += gc[col] * s2 * P0[ℓ + 1, am + 1] * (am * cos(am * φn)) * invs
+                aφ -= gc[col] * s2 * P0[ℓ + 1, am + 1] * (am * cos(am * φn)) * invs
             end
         end
         uθ[n] = aθ
