@@ -56,8 +56,12 @@ const PLANNER_LOCK = ReentrantLock()
 #
 # `ft_set_num_threads` has no getter, but it forwards to OpenMP and `omp_get_max_threads` tracks it,
 # so the count is restored afterwards rather than left mutated behind the caller's back.
+#
+# That symbol is reached through `libfasttransforms`, which links OpenMP and re-exports it, rather
+# than through `libomp` by name: the bare name resolves on macOS but not on a stock Linux runner,
+# whereas the JLL gives a real path on every platform.
 function with_serial_ft(f)
-    prev = ccall((:omp_get_max_threads, "libomp"), Cint, ())
+    prev = ccall((:omp_get_max_threads, FSH.FastTransforms.libfasttransforms), Cint, ())
     FSH.FastTransforms.ft_set_num_threads(1)
     try
         return f()
