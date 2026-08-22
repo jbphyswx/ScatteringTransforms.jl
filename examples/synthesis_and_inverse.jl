@@ -60,8 +60,11 @@ println("2. phase retrieval:        modulus rel. err = ", round(mod_relerr; sigd
 # Use the in-core direct-sum forward: it is differentiable by *every* AD backend with no special
 # rules (FFTW-fast-path reverse-mode AD needs the backend's FFT rules — see the docs).
 st_ad = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.DirectSumSpectralBackend())
-# res = ST.synthesize(st_ad, sig; backend=ADTypes.AutoMooncake(), init=randn(N), iters=300, lr=0.05)
-res = ST.synthesize(st_ad, sig; backend=ADTypes.AutoEnzyme(), init=randn(N), iters=300, lr=0.05)
+# Runtime activity is required, not optional: the cascade maps a closure over the filter bank, so
+# every closure holds constant filters next to the active input and Enzyme's static activity analysis
+# cannot tell them apart. Without it, `AutoEnzyme()` raises `EnzymeRuntimeActivityError`.
+ad = ADTypes.AutoEnzyme(; mode=Enzyme.set_runtime_activity(Enzyme.Reverse))
+res = ST.synthesize(st_ad, sig; backend=ad, init=randn(N), iters=300, lr=0.05)
 cT, cS = ST.ScatteringCore.scattering(st_ad, sig), ST.ScatteringCore.scattering(st_ad, res.field)
 s1_relerr = sqrt(sum(abs2, ST.Coefficients.first_order(cS) .- ST.Coefficients.first_order(cT))) /
             sqrt(sum(abs2, ST.Coefficients.first_order(cT)))

@@ -30,6 +30,14 @@ _target_coeffs(::Any, target) = target
 # Spatial shape of the transform input (the real modulus workspace carries it).
 _field_shape(st) = size(st.buffer_mod)
 
+# The differentiated function takes the transform, the target and the loss as arguments instead of
+# capturing them, so that they can be declared `DI.Constant` below. A closure over the transform is a
+# struct holding its filter bank and plan tables, and reverse mode cannot prove such an argument
+# read-only: Enzyme rejects it with `EnzymeMutabilityException` unless the caller thought to pass
+# `AutoEnzyme(; function_annotation = Enzyme.Const)`. Declared constants make the differentiated
+# function captureless, so the backend needs no special configuration to see that only `z` is active.
+_objective(z, st, tc, loss) = loss(ScatteringTransforms.ScatteringCore.scattering(st, z), tc)
+
 function ScatteringTransforms.synthesize(st::_Gridded, target;
                                          backend,
                                          init = nothing,
@@ -40,8 +48,8 @@ function ScatteringTransforms.synthesize(st::_Gridded, target;
     T = real(eltype(st.filter_bank.averaging))
     x = init === nothing ? randn(T, _field_shape(st)) : T.(collect(init))
 
-    objective(z) = loss(ScatteringTransforms.ScatteringCore.scattering(st, z), tc)
-    prep = DI.prepare_gradient(objective, backend, x)
+    ctx = (DI.Constant(st), DI.Constant(tc), DI.Constant(loss))
+    prep = DI.prepare_gradient(_objective, backend, x, ctx...)
 
     # Adam — first-order, no extra optimizer dependency.
     losses = Vector{T}(undef, iters)
@@ -49,7 +57,7 @@ function ScatteringTransforms.synthesize(st::_Gridded, target;
     v = zero(x)
     β1, β2, ϵ, η = T(0.9), T(0.999), T(1e-8), T(lr)
     for t in 1:iters
-        val, g = DI.value_and_gradient(objective, prep, backend, x)
+        val, g = DI.value_and_gradient(_objective, prep, backend, x, ctx...)
         losses[t] = T(val)
         @. m = β1 * m + (1 - β1) * g
         @. v = β2 * v + (1 - β2) * g * g

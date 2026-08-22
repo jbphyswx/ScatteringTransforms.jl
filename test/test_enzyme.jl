@@ -14,8 +14,7 @@ using Test: Test
     using Enzyme: Enzyme   # loads DifferentiationInterface's Enzyme extension used below
 
     # Reverse mode: the objective is scalar in a length-N vector, so one reverse pass gives the
-    # whole gradient. `Const` on the closure marks the captured transform as non-differentiable —
-    # its filter bank and plan tables are constants of the problem, not parameters.
+    # whole gradient.
     #
     # No custom AD rule is needed: the direct-sum plan's non-mutating transform is plain scalar
     # arithmetic over its twiddle table. A dense-matrix formulation would need one, because Enzyme
@@ -24,9 +23,17 @@ using Test: Test
     # Runtime activity is on because `scattering` maps closures over the filter bank, so each
     # closure captures constant filters alongside the active input and static activity analysis
     # cannot separate them. This is Enzyme's documented remedy for mixed activity, not a workaround
-    # for a defect in the transform.
-    enzyme_backend() = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
-                                  function_annotation = Enzyme.Const)
+    # for a defect in the transform — and it is the whole configuration `synthesize` needs, which is
+    # the minimum this test should pin: `synthesize` declares the transform and target as
+    # `DI.Constant` arguments rather than capturing them, so no `function_annotation` is required.
+    enzyme_backend() = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+
+    # A hand-written closure over the transform additionally needs `Const`: the closure is a struct
+    # holding the filter bank and plan tables, and reverse mode cannot prove such an argument
+    # read-only. `synthesize` avoids the annotation by passing those as `DI.Constant` arguments; a
+    # caller differentiating their own closure has to say so themselves.
+    enzyme_closure_backend() = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse),
+                                          function_annotation = Enzyme.Const)
 
     Test.@testset "Autodiff through scattering(st,x): Enzyme gradient matches finite differences" begin
         Random.seed!(1)   # reproducibility (this AD-vs-FD check is seed-robust anyway)
@@ -40,7 +47,7 @@ using Test: Test
         loss(x) = sum(abs2, ScatteringTransforms.Coefficients.first_order(ScatteringTransforms.ScatteringCore.scattering(st, x)) .- t1) +
                   sum(abs2, ScatteringTransforms.Coefficients.second_order(ScatteringTransforms.ScatteringCore.scattering(st, x)) .- t2)
 
-        backend = enzyme_backend()
+        backend = enzyme_closure_backend()
         x0 = randn(N)
         prep = DI.prepare_gradient(loss, backend, x0)
         val, grad = DI.value_and_gradient(loss, prep, backend, x0)

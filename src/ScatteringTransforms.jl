@@ -748,9 +748,14 @@ Reconstruct a field whose scattering coefficients match `target` by gradient des
 (Bruna & Mallat microcanonical synthesis): starting from `init` (random by default), minimize
 `loss(scattering(st, x̂), target)` with Adam. `target` may be a precomputed coefficient container
 or a field (its coefficients are taken first). The gradient is obtained through
-DifferentiationInterface, so `backend` is any `ADTypes` backend (e.g. `AutoMooncake()`); the
-synthesized result is a *sample* with matching statistics, not the exact original (the modulus
-discards local phase). Requires `using DifferentiationInterface` and an AD backend package.
+DifferentiationInterface, so `backend` is any `ADTypes` backend; the synthesized result is a *sample*
+with matching statistics, not the exact original (the modulus discards local phase). Requires
+`using DifferentiationInterface` and an AD backend package.
+
+With Enzyme, pass `AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`. The cascade maps
+a closure over the filter bank, so each closure captures constant filters alongside the active input
+and Enzyme's static activity analysis cannot separate the two — runtime activity is its documented
+remedy for that, and a plain `AutoEnzyme()` raises `EnzymeRuntimeActivityError` instead of a gradient.
 """
 function synthesize(args...; kwargs...)
     throw(ArgumentError(

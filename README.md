@@ -21,7 +21,8 @@ Fast, generic wavelet scattering transforms in Julia.
   anisotropy `s₂₂` (`compute_shape_sparsity`).
 - **Reconstruction**: exact linear wavelet-frame inverse (`wavelet_transform`/`iwavelet`), phase
   retrieval (`reconstruct_phase`), and gradient-descent `synthesize` from coefficients
-  (DifferentiationInterface extension; any `ADTypes` backend, e.g. `AutoMooncake`).
+  (DifferentiationInterface extension; any `ADTypes` backend — with Enzyme, pass
+  `AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`).
 - **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
   monogenic amplitude + continuous orientation/phase (`monogenic_components`); on S²,
   `spherical_monogenic_scattering` (amplitude via the spin-0 Bochner identity) plus
