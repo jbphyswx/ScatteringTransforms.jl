@@ -258,6 +258,7 @@ ScatteringTransforms.SphericalCore.plan_points
 ScatteringTransforms.SphericalCore.plan_weights
 ScatteringTransforms.SphericalCore.plan_solver
 ScatteringTransforms.SphericalCore.batch_plan
+ScatteringTransforms.SphericalCore.task_local_batch_plan
 ScatteringTransforms.SphericalCore.supports_batch
 ScatteringTransforms.SphericalCore.plan_nufft
 ScatteringTransforms.SphericalCore.plan_spin

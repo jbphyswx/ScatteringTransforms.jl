@@ -78,6 +78,34 @@ Test.@testset "Concurrent plan construction" begin
         Test.@test ft_count() == before
     end
 
+    Test.@testset "one reused spherical plan applied concurrently matches the serial batch" begin
+        # One column per thread makes every chunk one wide, which is the width this plan already has,
+        # so the threaded batch asks for a plan of the width it is holding. Any wider and each task
+        # builds its own plan, where no sharing can occur — that sizing is what the earlier threaded
+        # tests use, and why they never saw this. (At one thread there is nothing to race either way.)
+        lmax, J, M = 8, 3, 800
+        B = max(2, Threads.nthreads())
+        gr = (sqrt(5) - 1) / 2
+        θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+        φ = [2π * mod(k * gr, 1) for k in 1:M]
+        st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; max_order = 2)
+        X = [cos(2 * θ[k]) + 0.4 * cos(3 * φ[k]) * sin(θ[k]) + 0.1 * b for k in 1:M, b in 1:B]
+
+        # The NUFSHT plan's own width, not `Plans.batch_width`: that falls back to 1 for any argument
+        # it has no method for, so it would report 1 here whatever the plan actually is.
+        Test.@test st.plan.plan.B == 1
+        serial = ScatteringTransforms.scattering_batch(ComputationalBackends.SerialBackend(), st, X)
+        threaded = ScatteringTransforms.scattering_batch(ComputationalBackends.ThreadedBackend(), st, X)
+        # A raced solve diverges rather than erroring, so the comparison is against the serial values,
+        # not merely against `isfinite`.
+        Test.@test all(isfinite, threaded)
+        Test.@test threaded ≈ serial rtol = 1e-8
+        # The plan handed to a task is never the shared one, whatever width is asked for.
+        for k in (1, B)
+            Test.@test ScatteringTransforms.SphericalCore.task_local_batch_plan(st.plan, k) !== st.plan
+        end
+    end
+
     Test.@testset "concurrent structured-sphere builds match serial ones" begin
         lmax, J, ntask = 12, 2, 4
         Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)

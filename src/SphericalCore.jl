@@ -133,8 +133,27 @@ no batched form. Same points, band limit, weights and solver settings — only t
 A backend that returns a plan here lets [`spherical_scattering_batch!`](@ref) issue one transform per
 cascade step for the whole stack instead of one per field. Returning `nothing` is not a defect; it
 means the per-field loop is the only path, and callers fall back to it.
+
+May return `plan` itself when it is already `B` wide, so a per-task caller wants
+[`task_local_batch_plan`](@ref).
 """
 batch_plan(::Any, ::Integer) = nothing
+
+"""
+    task_local_batch_plan(plan, B) -> plan or nothing
+
+A `B`-wide plan safe to apply while `plan` is applied in another task.
+
+A spherical plan carries the scratch its analysis solves through, and [`batch_plan`](@ref) may hand
+back `plan` itself at its own width — shared across tasks that corrupts the solve into a diverging
+residual instead of erroring. Widening to another width already builds a fresh plan, so only the
+same-width case copies.
+"""
+function task_local_batch_plan(plan, B::Integer)
+    widened = batch_plan(plan, B)
+    widened === nothing && return nothing
+    return widened === plan ? Plans.task_local_plan(plan) : widened
+end
 
 """
     supports_batch(plan) -> Bool
