@@ -54,7 +54,10 @@ function ST.Plans.abstractffts_plan(dummy::AbstractArray{Complex{T}}; region = 1
     # raised by unrelated packages simply being loaded — so without pinning it here, how many threads
     # this plan uses (and therefore how many tasks it spawns, and allocates, per execution) would
     # depend on load order. Device plans ignore this; the hook is a no-op when FFTW is absent.
-    return ST.Plans.with_fft_nthreads(fft_nthreads) do
+    #
+    # Serialised on the package-wide planner lock, which is also what makes that pin of a process
+    # global safe against a concurrent build restoring it underneath this one.
+    return Base.@lock ST.Plans.PLANNER_LOCK ST.Plans.with_fft_nthreads(fft_nthreads) do
         fwd = AbstractFFTs.plan_fft(dummy, region)
         inv = AbstractFFTs.plan_ifft(dummy, region)
         return AbstractFFTsScatteringPlan{T, typeof(fwd), typeof(inv)}(fwd, inv)

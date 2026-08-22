@@ -445,8 +445,14 @@ transform_spec(st::SubsampledScattering.MultiResolutionScattering{T, 3}) where {
 # size — batching a distributed run means rebuilding at the block's own width, not at the origin's.
 function transform_spec(st::ScatteredPlanar.ScatteredPlanarScattering)
     x, y = Plans.plan_points(st.plan)
+    # The analysis settings travel for the same reason the spherical solver tolerance does: `solve`
+    # picks between the Type-1 adjoint and a least-squares inversion, which on irregular sampling are
+    # different transforms, and a rebuild without it silently takes the constructor default.
+    a = Plans.plan_analysis(st.plan)
     return (kind = :planar, x = x, y = y, ms = st.plan.ms, J = st.filter_bank.J,
             L = st.filter_bank.L, max_order = st.max_order, weights = st.weights,
+            solve = a.solve, maxiter = a.maxiter, rtol = a.rtol, eps = a.eps,
+            nufft_nthreads = a.nufft_nthreads,
             T = real(eltype(st.filter_bank.averaging)), spectral = Plans.spectral_backend(st.plan))
 end
 
@@ -505,7 +511,8 @@ function rebuild_transform(spec)
         # explicitly rather than re-derived from their extent.
         return ScatteredPlanar.build(spec.T, spec.x, spec.y, spec.ms, spec.J; L = spec.L,
             max_order = spec.max_order, spectral = spec.spectral, weights = spec.weights,
-            period = (2π, 2π))
+            period = (2π, 2π), solve = spec.solve, maxiter = spec.maxiter, rtol = spec.rtol,
+            eps = spec.eps, nufft_nthreads = spec.nufft_nthreads)
     elseif spec.kind === :sphere
         # The element type follows from the retained points, so it is not passed separately.
         return spherical_scattering(spec.theta, spec.phi, spec.lmax, spec.J;
@@ -541,7 +548,8 @@ scattering_batch(b::CB.AbstractExecutionBackend, st, X) =
 """
     scattered_planar_scattering(x, y, ms, J; L=8, max_order=2, T=Float64,
                                 spectral=SpectralBackends.AutoSpectralBackend(), period=nothing,
-                                solve=false, weights=nothing, eps=nothing, maxiter=100, rtol=1e-8)
+                                solve=false, weights=nothing, eps=nothing, maxiter=100, rtol=1e-8,
+                                nufft_nthreads=0)
 
 Build a 2D planar scattering transform for a scalar field sampled at scattered points `(x, y)`, using
 the same oriented Morlet wavelet bank as the gridded [`ScatteringTransform2D`] but computing the
@@ -563,6 +571,11 @@ fields, approximate on gappy/irregular data; `solve=true` uses a conjugate-gradi
 inversion for the true band-limited coefficients (slower, needed for irregular sampling). `weights`
 (length `M`, summing to 1) sets the quadrature for the spatial mean; the default is the uniform sample
 mean. `eps` is the FINUFFT tolerance (ignored by the exact direct sum).
+
+`nufft_nthreads` sets the fast library's own thread count; `0` (the default) leaves it to the
+library, which is worth 2–3× at `M ≳ 2·10⁴`. Pass `1` to take the library out of the threading
+picture — the per-task plans a threaded backend builds already divide the cores between themselves,
+and a single-threaded plan is also the one that executes without allocating.
 """
 scattered_planar_scattering(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int},
                             J::Int; kwargs...) where {T} =
@@ -619,9 +632,11 @@ function spherical_monogenic_scattering(pts_theta::AbstractVector{TT}, pts_phi::
                                         maxiter::Int = 500, weights = nothing,
                                         nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {TT<:Real}
     T = float(TT)
+    # `spin = true`: the pointwise decomposition this transform exists for needs a spin-weighted plan
+    # pair on these same points, so the plan builds it once here instead of once per call per band.
     plan = SphericalCore.make_spherical_plan(spectral, pts_theta, pts_phi, lmax, T;
                                              rtol = rtol, maxiter = maxiter, weights = weights,
-                                             nufft = nufft)
+                                             nufft = nufft, spin = true)
     return SphericalCore.SphericalMonogenicScattering(lmax, J, max_order, plan,
                                                       SphericalCore.dog_sigma2(lmax, J, T))
 end

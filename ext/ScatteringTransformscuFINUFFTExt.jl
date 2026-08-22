@@ -24,8 +24,11 @@ using ScatteringTransforms: ScatteringTransforms as ST
 
 # `cufinufft_plan` is mutable and owns the device plan, so the finalizer that frees it goes there and
 # the scattered-planar wrapper stays immutable — the same arrangement as the host guru plans.
+# `nthreads` is accepted and ignored: it configures a CPU library's thread pool, and this plan runs on
+# the device, where the launch configuration is cuFINUFFT's own (`gpu_method`, block sizes).
 function ST.Plans.nufft_guru_make(::CUDA.CuArray, type::Integer, ms::NTuple{2, Int},
-                                  iflag::Integer, ntrans::Integer, eps::Real, ::Type{T}) where {T}
+                                  iflag::Integer, ntrans::Integer, eps::Real, ::Type{T};
+                                  nthreads::Integer = 0) where {T}
     g = FINUFFT.cufinufft_makeplan(type, collect(ms), iflag, ntrans, eps; dtype = T, modeord = 1)
     finalizer(FINUFFT.cufinufft_destroy!, g)
     return g

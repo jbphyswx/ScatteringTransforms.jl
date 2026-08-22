@@ -42,6 +42,42 @@ Test.@testset "Spherical monogenic components (spin-1 orientation/phase on S²)"
     α = 0.6
     fα = Float64[real(NUFSHT.sYlm(0, ℓ0, 0, θ[k], φ[k])) for k in 1:M]       # m=0 ⇒ φ-invariant
     Test.@test comp.amplitude ≈ ScatteringTransforms.spherical_monogenic_components(st, fα, j).amplitude
+
+    Test.@testset "the spin plans are built with the transform, not per call" begin
+        SC = ScatteringTransforms.SphericalCore
+        # Only the monogenic constructor asks for them, so a plain spherical transform on the same
+        # points pays nothing for a decomposition it does not perform.
+        Test.@test SC.plan_spin(st.plan) !== nothing
+        Test.@test SC.plan_spin(ScatteringTransforms.spherical_scattering(θ, φ, lmax, J).plan) ===
+                   nothing
+
+        # Gated by counting bytes against the same decomposition on a plan that carries no pair, so
+        # the constant is measured here rather than assumed: the difference between the two is what
+        # the caching removes, and it must be at least one plan build (it is two plus their Wigner-d
+        # tables). A single call allocates more than one plan build on its own — the CG solve and
+        # seven length-M outputs — so the per-call figure is only meaningful against its own
+        # uncached twin.
+        nospin = SC.nusht_spherical_plan(θ, φ, lmax, Float64; spin = false)
+        Test.@test SC.plan_spin(nospin) === nothing
+        st_nospin = SC.SphericalMonogenicScattering(lmax, J, st.max_order, nospin, st.sigma2)
+        components(s, f, jj) = ScatteringTransforms.spherical_monogenic_components(s, f, jj)
+        components(st, field, j)                                              # warm up both paths
+        components(st_nospin, field, j)
+        cached = @allocated components(st, field, j)
+        uncached = @allocated components(st_nospin, field, j)
+        NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0)                      # warm up
+        build_bytes = @allocated NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0)
+        Test.@test cached < uncached
+        Test.@test uncached - cached > build_bytes
+        # And the two agree: taking the pair off the plan changes only where it came from.
+        Test.@test components(st_nospin, field, j).amplitude ≈ components(st, field, j).amplitude
+
+        # A task's own copy carries its own pair: the spin plans hold the buffers their synthesis
+        # writes through, so sharing one across tasks would corrupt both.
+        tl = ScatteringTransforms.Plans.task_local_plan(st.plan)
+        Test.@test SC.plan_spin(tl) !== nothing
+        Test.@test SC.plan_spin(tl) !== SC.plan_spin(st.plan)
+    end
 end
 
 # Same validation for the in-core dependency-free direct SH backend (no NUFSHT for the transform — the

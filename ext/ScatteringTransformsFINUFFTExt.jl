@@ -54,6 +54,7 @@ struct NUFFTScatteringPlan{T, G, CV<:AbstractArray{Complex{T}},
     sx::RV                        # (M) points already scaled to FINUFFT's 2π-periodic domain,
     sy::RV                        #     retained so a task can build its own guru plans
     eps::T                        # the tolerance those plans were made with
+    nthreads::Int                 # and the thread count they were made with (0 = FINUFFT's default)
     cj::CV                        # (M[, B]) nonuniform exec buffer (shared by Type-1/Type-2)
     r::MM                         # (ms[, B]) CG residual / rhs
     p::MM                         # (ms[, B]) CG search direction
@@ -62,7 +63,7 @@ struct NUFFTScatteringPlan{T, G, CV<:AbstractArray{Complex{T}},
 end
 
 function _make_plan(x, y, ms::NTuple{2,Int}, ::Type{T}, period, eps, solve, maxiter, rtol,
-                    B::Int = 1) where {T}
+                    B::Int = 1, nthreads::Int = 0) where {T}
     M = length(x)
     length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
     xmin, ymin = T(minimum(x)), T(minimum(y))
@@ -71,19 +72,17 @@ function _make_plan(x, y, ms::NTuple{2,Int}, ::Type{T}, period, eps, solve, maxi
     py = period === nothing ? (T(maximum(y)) - ymin) * ms[2] / (ms[2] - 1) : T(period[2])
     sx = T(2π) .* (T.(x) .- xmin) ./ px
     sy = T(2π) .* (T.(y) .- ymin) ./ py
-    return _plan_at(ms, M, sx, sy, T(eps), T, solve, maxiter, T(rtol), B)
+    return _plan_at(ms, M, sx, sy, T(eps), T, solve, maxiter, T(rtol), B, nthreads)
 end
-
-# FINUFFT builds FFTW plans internally, and FFTW's planner may only be called from one thread at a
-# time, so plan construction is serialised. It happens once per task, never per transform.
-const PLANNER_LOCK = ReentrantLock()
 
 # Host seam. `finufft_plan` is mutable and owns the C plan, so the finalizer that frees it goes there
 # and this package's wrapper stays immutable; `finufft_destroy!` is idempotent, so an explicit destroy
 # before collection is harmless.
 function ST.Plans.nufft_guru_make(::AbstractArray, type::Integer, ms::NTuple{2, Int},
-                                  iflag::Integer, ntrans::Integer, eps::Real, ::Type{T}) where {T}
-    g = FINUFFT.finufft_makeplan(type, collect(ms), iflag, ntrans, eps; dtype = T, modeord = 1)
+                                  iflag::Integer, ntrans::Integer, eps::Real, ::Type{T};
+                                  nthreads::Integer = 0) where {T}
+    g = FINUFFT.finufft_makeplan(type, collect(ms), iflag, ntrans, eps;
+                                 dtype = T, modeord = 1, nthreads = nthreads)
     finalizer(FINUFFT.finufft_destroy!, g)
     return g
 end
@@ -93,11 +92,14 @@ ST.Plans.nufft_guru_exec!(g::FINUFFT.finufft_plan, input, output) =
     (FINUFFT.finufft_exec!(g, input, output); output)
 
 function _plan_at(ms::NTuple{2,Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, maxiter,
-                  rtol::T, B::Int = 1) where {T}
-    guru1, guru2 = Base.@lock PLANNER_LOCK begin
+                  rtol::T, B::Int = 1, nthreads::Int = 0) where {T}
+    # FINUFFT plans through the same libfftw3 as every other backend here, and that planner takes one
+    # thread at a time, so construction is serialised on the package-wide lock. It happens once per
+    # task, never per transform.
+    guru1, guru2 = Base.@lock ST.Plans.PLANNER_LOCK begin
         # Built through the seam, so device points get a cuFINUFFT plan and host points a host one.
-        g1 = ST.Plans.nufft_guru_make(sx, 1, ms, -1, B, eps, T)
-        g2 = ST.Plans.nufft_guru_make(sx, 2, ms, +1, B, eps, T)
+        g1 = ST.Plans.nufft_guru_make(sx, 1, ms, -1, B, eps, T; nthreads = nthreads)
+        g2 = ST.Plans.nufft_guru_make(sx, 2, ms, +1, B, eps, T; nthreads = nthreads)
         ST.Plans.nufft_guru_setpts!(g1, sx, sy)
         ST.Plans.nufft_guru_setpts!(g2, sx, sy)
         (g1, g2)
@@ -107,7 +109,7 @@ function _plan_at(ms::NTuple{2,Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, m
     pts(n) = B == 1 ? similar(sx, Complex{T}, n) : similar(sx, Complex{T}, n, B)
     modes() = B == 1 ? similar(sx, Complex{T}, ms) : similar(sx, Complex{T}, (ms..., B))
     return NUFFTScatteringPlan(
-        guru1, guru2, ms, M, B, one(T) / prod(ms), solve, maxiter, rtol, sx, sy, eps,
+        guru1, guru2, ms, M, B, one(T) / prod(ms), solve, maxiter, rtol, sx, sy, eps, nthreads,
         pts(M), modes(), modes(), modes(), pts(M))
 end
 
@@ -120,12 +122,23 @@ Base.show(io::IO, ::MIME"text/plain", p::NUFFTScatteringPlan) = show(io, p)
 
 ST.Plans.spectral_backend(::NUFFTScatteringPlan) = ST.Plans.FINUFFTBackend()
 ST.Plans.plan_points(p::NUFFTScatteringPlan) = (p.sx, p.sy)
+ST.Plans.plan_analysis(p::NUFFTScatteringPlan) =
+    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, eps = p.eps,
+     nufft_nthreads = p.nthreads)
 
 # A guru plan carries the working buffers each execution writes through, so tasks cannot share one —
 # doing so silently corrupts every concurrent transform. The scaled points are retained on the
 # wrapper precisely so a task can build its own.
+#
+# The rebuild divides the machine among the concurrent tasks rather than inheriting FINUFFT's default
+# of "all cores": one of these plans exists per task, so the default would put `nthreads()` tasks ×
+# `CPU_THREADS` library threads on `CPU_THREADS` cores, and each execution would additionally spawn a
+# Julia task per library thread through FFTW.jl's thread callback. An even split keeps the cores
+# filled exactly once — and collapses to a single thread, i.e. no nesting at all, when Julia already
+# has a task per core.
 ST.Plans.task_local_plan(p::NUFFTScatteringPlan{T}) where {T} =
-    _plan_at(p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol, p.B)
+    _plan_at(p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol, p.B,
+             max(1, cld(Sys.CPU_THREADS, Threads.nthreads())))
 
 ST.Plans.batch_width(p::NUFFTScatteringPlan) = p.B
 
@@ -133,9 +146,10 @@ ST.Plans.batch_width(p::NUFFTScatteringPlan) = p.B
 # `scattered_planar_scattering` cascade builds it when `spectral` selects the FINUFFT backend.
 function ST.Plans.finufft_scattered_plan(x, y, ms::NTuple{2,Int}, ::Type{T}; period = nothing,
                                       solve::Bool = false, maxiter::Int = 100, rtol::Real = 1.0e-8,
-                                      eps = nothing, ntrans::Int = 1) where {T}
+                                      eps = nothing, ntrans::Int = 1,
+                                      nufft_nthreads::Int = 0) where {T}
     ε = eps === nothing ? (T === Float32 ? 1.0e-6 : 1.0e-9) : eps
-    return _make_plan(x, y, ms, T, period, ε, solve, maxiter, rtol, ntrans)
+    return _make_plan(x, y, ms, T, period, ε, solve, maxiter, rtol, ntrans, nufft_nthreads)
 end
 
 # Synthesis: modes → points, scaled by 1/prod(ms) (ifft convention). For a Type-2 plan

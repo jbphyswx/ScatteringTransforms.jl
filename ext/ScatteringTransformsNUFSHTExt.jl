@@ -30,17 +30,18 @@ using ScatteringTransforms: ScatteringTransforms as ST
 # ---------------------------------------------------------------------------
 
 """
-    NUSHTSphericalPlan{P,V,T} <: SphericalCore.AbstractSphericalPlan
+    NUSHTSphericalPlan{P,V,T,C,NB,SP} <: SphericalCore.AbstractSphericalPlan
 
 Scattered-point spherical plan wrapping a `NUFSHT.NUSHTplan`, the sample count `M`, the band limit
-`lmax`, the scattered points `(theta, phi)` (retained so spin-weighted plans can be built on the same
-points for `spherical_monogenic_components`), and the CG-inversion tolerance/iteration cap used by
-[`sphere_coeffs`](@ref). Analysis is a band-limited least-squares solve, not `nusht_type1!`:
+`lmax`, the scattered points `(theta, phi)` (retained so a task or another process can rebuild on the
+same points), the CG-inversion tolerance/iteration cap used by [`sphere_coeffs`](@ref), and — for a
+plan built by the monogenic constructors — the spin-weighted plan pair
+`spherical_monogenic_components` synthesises with. Analysis is a band-limited least-squares solve, not `nusht_type1!`:
 on scattered points the adjoint mis-scales the coefficients degree-dependently, so the exact inversion
 is needed for correct absolute magnitudes. Accurate inversion needs the sampling to resolve the band
 limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed points.
 """
-struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, C, NB} <: ST.SphericalCore.AbstractSphericalPlan
+struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, C, NB, SP} <: ST.SphericalCore.AbstractSphericalPlan
     plan::P
     M::Int
     lmax::Int
@@ -50,17 +51,18 @@ struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, C, NB} <: ST.SphericalC
     maxiter::Int
     cbuf::C          # coefficient scratch filtered per band, so `sphere_apply!` allocates nothing
     nufft::NB        # the *resolved* NUFFT backend driving `plan`, never an `Auto` request
+    spin::SP         # (spin-0, spin-1) plan pair for `spherical_monogenic_components`, or `nothing`
 end
 
-NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, nufft) =
-    NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, zero(plan.C), nufft)
+NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, nufft, spin = nothing) =
+    NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, zero(plan.C), nufft, spin)
 
 # The NUFFT backend and batch size are shown because they dominate this plan's speed and are
 # otherwise invisible: an unresolved request falls back to direct summation when no fast NUFFT
 # extension is loaded, which is asymptotically slower and looks identical from the outside.
 Base.show(io::IO, p::NUSHTSphericalPlan) =
     print(io, "NUSHTSphericalPlan(lmax=", p.lmax, ", M=", p.M, ", ntrans=", p.plan.B,
-          ", nufft=", nameof(typeof(p.nufft)), ")")
+          ", nufft=", nameof(typeof(p.nufft)), ", spin=", p.spin !== nothing, ")")
 
 # A `NUSHTplan` is working state, not a lookup table: every transform writes through its coefficient,
 # field and phase buffers, so tasks cannot share one. The points and band limit are retained on this
@@ -74,35 +76,51 @@ Base.show(io::IO, p::NUSHTSphericalPlan) =
 # per batch call rather than cached: caching would key on `B`, which the caller varies freely.
 ST.SphericalCore.supports_batch(::NUSHTSphericalPlan) = true
 
-# Serialised on `PLANNER_LOCK` like every other plan build here: this one is called from inside
-# spawned tasks, one per batch chunk, and FFTW's planner is single-threaded.
+# Serialised on `Plans.PLANNER_LOCK` like every other plan build here: this one is called
+# from inside spawned tasks, one per batch chunk, and FFTW's planner is single-threaded.
 function ST.SphericalCore.batch_plan(p::NUSHTSphericalPlan, B::Integer)
     B == p.plan.B && return p
-    plan = Base.@lock PLANNER_LOCK with_serial_ft() do
+    plan = Base.@lock ST.Plans.PLANNER_LOCK with_serial_ft() do
         NUFSHT.make_plan(eltype(p.theta), p.theta, p.phi, p.lmax;
                          ntrans = Int(B), nufft = p.nufft, tol = p.plan.tol)
     end
-    return NUSHTSphericalPlan(plan, p.M, p.lmax, p.theta, p.phi, p.rtol, p.maxiter, p.nufft)
+    # The spin pair is rebuilt, not shared: it holds the buffers its synthesis writes through, and a
+    # widened plan exists precisely so one task can use it while another uses the original.
+    return NUSHTSphericalPlan(plan, p.M, p.lmax, p.theta, p.phi, p.rtol, p.maxiter, p.nufft,
+                              _rebuild_spin(p))
 end
 
 ST.SphericalCore.plan_nufft(p::NUSHTSphericalPlan) = p.nufft
+ST.SphericalCore.plan_spin(p::NUSHTSphericalPlan) = p.spin
 ST.SphericalCore.plan_points(p::NUSHTSphericalPlan) = (p.theta, p.phi)
 ST.SphericalCore.plan_weights(::NUSHTSphericalPlan) = nothing   # unweighted sample mean
 ST.SphericalCore.plan_solver(p::NUSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter)
 ST.Plans.spectral_backend(::NUSHTSphericalPlan) = SB.NUFSHTSpectralBackend()
 
-const PLANNER_LOCK = ReentrantLock()
-
 function ST.Plans.task_local_plan(p::NUSHTSphericalPlan)
-    plan = Base.@lock PLANNER_LOCK with_serial_ft() do
+    plan = Base.@lock ST.Plans.PLANNER_LOCK with_serial_ft() do
         # `ntrans` and the resolved backend must be carried over: rebuilding with the defaults would
         # give the task a single-field plan on whatever `Auto` happens to pick, silently changing both
         # the batch size the cascade feeds it and the transform driving it.
         NUFSHT.make_plan(eltype(p.theta), p.theta, p.phi, p.lmax;
                          ntrans = p.plan.B, nufft = p.nufft, tol = p.plan.tol)
     end
-    return NUSHTSphericalPlan(plan, p.M, p.lmax, p.theta, p.phi, p.rtol, p.maxiter, p.nufft)
+    return NUSHTSphericalPlan(plan, p.M, p.lmax, p.theta, p.phi, p.rtol, p.maxiter, p.nufft,
+                              _rebuild_spin(p))
 end
+
+# One spin plan per spin weight over the plan's own points, or `nothing` for a plan that carries none.
+# Serialised for the FFTW planner inside the NUFFT build, like every other plan build here; the spin
+# path drives no FastTransforms code, so it needs no OpenMP pin.
+_spin_plans(::Type{FE}, theta, phi, lmax::Int) where {FE} =
+    Base.@lock ST.Plans.PLANNER_LOCK begin
+        (NUFSHT.make_spin_plan(FE, theta, phi, lmax, 0),
+         NUFSHT.make_spin_plan(FE, theta, phi, lmax, 1))
+    end
+
+_rebuild_spin(p::NUSHTSphericalPlan) =
+    p.spin === nothing ? nothing :
+    _spin_plans(Complex{eltype(p.theta)}, p.theta, p.phi, p.lmax)
 
 # Generic per-degree spectral multiplier h(ℓ): NUFSHT's apply_transfer! dispatches on
 # `kernel_transfer(filter, ℓ)`, so any object with this method is a valid transfer.
@@ -157,39 +175,34 @@ ST.SphericalCore.sphere_mean(plan::NUSHTSphericalPlan, field::AbstractMatrix) =
 # `spherical_scattering` / `spherical_monogenic_scattering` build this when `spectral` selects NUFSHT.
 # ---------------------------------------------------------------------------
 
-# FastTransforms, which NUFSHT builds on, is not re-entrant from a task sharing the caller's OS
-# thread: running it multithreaded from such a task silently changes what an already-built plan
-# returns, permanently and with no error.
-#
 # `ft_set_num_threads` has no getter, but it forwards to OpenMP and `omp_get_max_threads` tracks it,
-# so the count is restored afterwards rather than left mutated behind the caller's back.
-#
-# That symbol is reached through `libfasttransforms`, which links OpenMP and re-exports it, rather
-# than through `libomp` by name: the bare name resolves on macOS but not on a stock Linux runner,
-# whereas the JLL gives a real path on every platform.
-function with_serial_ft(f)
-    prev = ccall((:omp_get_max_threads, NUFSHT.FastTransforms.libfasttransforms), Cint, ())
-    NUFSHT.FastTransforms.ft_set_num_threads(1)
-    try
-        return f()
-    finally
-        NUFSHT.FastTransforms.ft_set_num_threads(prev)
-    end
-end
+# so the count can be restored rather than left mutated behind the caller's back. That symbol is
+# reached through `libfasttransforms`, which links OpenMP and re-exports it, rather than through
+# `libomp` by name: the bare name resolves on macOS but not on a stock Linux runner, whereas the JLL
+# gives a real path on every platform.
+_ft_nthreads() = ccall((:omp_get_max_threads, NUFSHT.FastTransforms.libfasttransforms), Cint, ())
+_ft_nthreads!(n) = NUFSHT.FastTransforms.ft_set_num_threads(n)
+
+# The pin itself is reference counted in core, shared with the structured backend, because the thread
+# count it guards is one process global for both — see `SphericalCore.with_serial_ft`.
+with_serial_ft(f) = ST.SphericalCore.with_serial_ft(f, _ft_nthreads, _ft_nthreads!)
 
 """
-    nusht_spherical_plan(θ, φ, lmax, T; rtol, maxiter, ntrans = 1)
+    nusht_spherical_plan(θ, φ, lmax, T; rtol, maxiter, ntrans = 1, spin = false)
 
 `ntrans` is NUFSHT's batch size: a plan transforms `ntrans` fields sampled at the same points per
 call. The cascade issues many small transforms per field, and each call pays FastTransforms' parallel
 region setup, so batching amortises that the way the gridded path amortises an FFT plan. `ntrans = 1`
 is a single-field plan.
+
+`spin = true` also builds the spin-0/spin-1 plan pair `spherical_monogenic_components` synthesises
+with (see `SphericalCore.plan_spin`). Only the monogenic constructors ask for it.
 """
 function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_phi::AbstractVector,
                                                lmax::Int, ::Type{T};
                                                rtol::Real = ST.SphericalCore.default_rtol(SB.NUFSHTSpectralBackend()),
                                                maxiter::Int = 500,
-                                               ntrans::Int = 1,
+                                               ntrans::Int = 1, spin::Bool = false,
                                                nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {T<:Real}
     # Broadcast rather than `collect`: both copy (the plan must own its points, so a spec rebuilt
     # from them is independent), but `collect` materialises to a host `Array` and would strand a
@@ -200,8 +213,17 @@ function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_ph
     # `make_plan` works, but then nothing downstream — not the plan, not `show`, not a benchmark —
     # can say whether the fast NUFFT or the O(M·K) direct-sum fallback is actually running.
     nb = NUFSHT._resolve_nufft(nufft)
-    plan = with_serial_ft(() -> NUFSHT.make_plan(T, θ, φ, lmax; ntrans = ntrans, nufft = nb))
-    return NUSHTSphericalPlan(plan, length(θ), lmax, θ, φ, T(rtol), maxiter, nb)
+    # The whole build is serialised, not just the sphere plans: `make_plan` also builds the NUFFT,
+    # which plans through the same libfftw3, so two builds racing fault inside the FFTW planner —
+    # observed as a segfault in `fftw_mkapiplan` under `ft_plan_sph_synthesis` when independent point
+    # sets were planned from concurrent tasks.
+    plan = Base.@lock ST.Plans.PLANNER_LOCK with_serial_ft() do
+        NUFSHT.make_plan(T, θ, φ, lmax; ntrans = ntrans, nufft = nb)
+    end
+    # NUFSHT's positional argument is the *field* element type, not the precision: a real one selects
+    # its folded real layout, and the spin field is complex.
+    sp = spin ? _spin_plans(Complex{T}, θ, φ, lmax) : nothing
+    return NUSHTSphericalPlan(plan, length(θ), lmax, θ, φ, T(rtol), maxiter, nb, sp)
 end
 
 # ---------------------------------------------------------------------------
@@ -221,12 +243,14 @@ function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogen
     p = st.plan
     lmax = st.lmax
     T = eltype(p.theta)
+    # The spin-weighted plans come off the transform: `spherical_monogenic_scattering` built them with
+    # it, and they are the expensive half of this decomposition — two NUFFTs and the Wigner-d tables
+    # against the two syntheses below. A plan built without them (a plain `spherical_scattering`, or one
+    # rebuilt from a spec by an older caller) builds them here instead of refusing.
+    p0, p1 = ST.SphericalCore.plan_spin(p) === nothing ?
+             _spin_plans(Complex{T}, p.theta, p.phi, lmax) : ST.SphericalCore.plan_spin(p)
     # Complex spin-0 coefficients of the field in NUFSHT's dense spin layout (exact CG inversion,
     # so the band-pass and Riesz fields below share one consistent set of coefficients).
-    # NUFSHT's positional argument is the *field* element type, not the precision: a real one selects
-    # its folded real layout. The spin field here is complex, so it must be `Complex{T}`.
-    p0 = NUFSHT.make_spin_plan(Complex{T}, p.theta, p.phi, lmax, 0)
-    p1 = NUFSHT.make_spin_plan(Complex{T}, p.theta, p.phi, lmax, 1)
     a = zeros(Complex{T}, lmax + 1, 2lmax + 1)
     NUFSHT.nusht_solve_spin!(a, Complex{T}.(field), p0)
 

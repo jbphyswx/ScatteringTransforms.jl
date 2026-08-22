@@ -81,7 +81,7 @@ spectral_backend(plan::AbstractScatteringPlan) = throw(ArgumentError(
     "rebuilt from a serialisable spec — construct the transform on each worker explicitly."))
 
 """
-    nufft_guru_make(points, type, ms, iflag, ntrans, eps, T) -> guru plan
+    nufft_guru_make(points, type, ms, iflag, ntrans, eps, T; nthreads = 0) -> guru plan
     nufft_guru_setpts!(guru, x, y) -> guru
     nufft_guru_exec!(guru, input, output) -> output
 
@@ -93,6 +93,12 @@ the other two dispatch on the returned plan, so each backend's handle carries it
 host methods live in the FINUFFT extension, the CUDA ones in the cuFINUFFT extension — only the NUFFT
 is vendor-specific, because the cascade around it is broadcasts and reductions over whatever array
 type the points are.
+
+`nthreads` is the library's own thread count, baked into the plan, with `0` meaning "the library's
+default" (all cores). Measured on the scattered-planar shapes: the library's threading is worth
+2.2–3.3× at `M ≳ 2·10⁴` and breaks even at `M ~ 500`, so the default keeps it. It is pinned to `1`
+only where ST is itself running one plan per task — see [`task_local_plan`](@ref). A device binding
+has no CPU threads to set and ignores it.
 """
 function nufft_guru_make end
 function nufft_guru_setpts! end
@@ -115,8 +121,33 @@ batch_width(::Any) = 1
 A plan equivalent to `plan` that is safe to use concurrently with it. Stateless plans (FFTW,
 `AbstractFFTs`) return themselves; plans carrying mutable scratch return a copy that shares their
 read-only tables and owns fresh scratch. Called once per task by the parallel backends.
+
+Two obligations follow from *where* this is called. A method that **builds** rather than shares must
+do so under [`PLANNER_LOCK`](@ref), because it runs inside a spawned task by construction. And it
+must pin the underlying library to a single thread: the caller has already claimed the cores by
+running one of these per task, so a library threading inside that would oversubscribe by a factor of
+the thread count. Never two levels of threading.
 """
 task_local_plan(plan::AbstractScatteringPlan) = plan
+
+"""
+    PLANNER_LOCK
+
+Serialises plan construction across every backend in the package.
+
+FFTW documents `fftw_execute` as its only thread-safe entry point, so two plan builds running at once
+fault inside the planner. One lock covers them all rather than one per backend, because the planner
+is shared far more widely than any single backend: FFTW.jl, FINUFFT, NonuniformFFTs and
+FastTransforms all plan through the same libfftw3, so a lock private to one of them excludes nothing.
+Concurrent construction is routine — [`task_local_plan`](@ref) and `SphericalCore.batch_plan` build
+inside spawned tasks — and a build racing a build of a *different* library was observed as a segfault
+in `fftw_mkapiplan`.
+
+Only construction takes this lock; transforms are never serialised, so a plan per task still executes
+in parallel. FastTransforms additionally needs its OpenMP thread count pinned across construction
+*and* execution — see `SphericalCore.with_serial_ft`.
+"""
+const PLANNER_LOCK = ReentrantLock()
 
 """
     with_fft_nthreads(f, n) -> f()
@@ -127,6 +158,9 @@ FFTW's thread count is process-global and is raised as a side effect of loading 
 so a plan built without pinning it inherits whatever was last set — and a plan built for more threads
 than it needs spawns (and allocates) a task per thread on *every* execution. Plan builders wrap
 construction in this so a plan's threading is a property of the plan, not of load order.
+
+Because the count is one global, callers hold [`PLANNER_LOCK`](@ref) across this: two builds pinning
+it concurrently would each restore the other's value.
 
 The default is a no-op: only the FFTW extension has a global count to set. It takes `args...` so the
 extension's fixed-arity method is strictly more specific and *adds* a method rather than overwriting
@@ -202,8 +236,21 @@ make_plan(::SB.AbstractAutoSpectralBackend, ::Type{T}, dims; nbatch::Int = 1, kw
     DirectSumPlan(T, dims; nbatch = nbatch)
 
 """
-    finufft_scattered_plan(x, y, ms, T; period, solve, maxiter, rtol, eps)
-    nonuniformffts_scattered_plan(x, y, ms, T; period, solve, maxiter, rtol, eps)
+    plan_analysis(plan) -> (; solve, maxiter, rtol, eps, nufft_nthreads)
+
+How a scattered-planar plan turns samples into modes, in the form its constructor takes.
+
+Carried rather than re-derived, because none of it follows from the points: a plan rebuilt on another
+process without `solve` analyses with the plain Type-1 adjoint where the original ran a
+conjugate-gradient least-squares inversion, and on irregular sampling those are different transforms,
+not one slightly less accurate than the other. `eps` is `nothing` for the exact direct sum, which has
+no tolerance to honour.
+"""
+function plan_analysis end
+
+"""
+    finufft_scattered_plan(x, y, ms, T; period, solve, maxiter, rtol, eps, nufft_nthreads)
+    nonuniformffts_scattered_plan(x, y, ms, T; period, solve, maxiter, rtol, eps, nufft_nthreads)
 
 Fast-path scattered-planar plan constructors. The real methods live in the FINUFFT and
 NonuniformFFTs extensions; the definitions here are throwing stubs, so naming one of those backends
@@ -217,17 +264,22 @@ nonuniformffts_scattered_plan(args...; kwargs...) = throw(ArgumentError(
     "NonuniformFFTsBackend requires the NonuniformFFTs extension. Run `using NonuniformFFTs`."))
 
 """
-    make_scattered_plan(spectral, x, y, ms, T; period, solve, maxiter, rtol, eps) -> AbstractScatteringPlan
+    make_scattered_plan(spectral, x, y, ms, T; period, solve, maxiter, rtol, eps,
+                        nufft_nthreads) -> AbstractScatteringPlan
 
 Build the scattered/nonuniform planar plan selected by `spectral` over points `(x, y)` and a uniform
 mode grid of size `ms`. `SpectralBackends.DirectSumSpectralBackend` is the dependency-free exact
 NUDFT; [`FINUFFTBackend`](@ref) and [`NonuniformFFTsBackend`](@ref) select a specific fast library;
 `SpectralBackends.NUFFTSpectralBackend` takes whichever fast library is loaded, and
 `SpectralBackends.AutoSpectralBackend` falls back to the exact direct sum when neither is.
+
+`nufft_nthreads` sets the fast library's own thread count (`0`, the default, leaves it to the
+library). The direct sum accepts it and ignores it, as it does `eps`, so a caller can pass one set of
+options without first knowing which backend it will get.
 """
 make_scattered_plan(::SB.AbstractDirectSumSpectralBackend, x, y, ms, ::Type{T}; period = nothing,
                     solve::Bool = false, maxiter::Int = 100, rtol::Real = 1.0e-8,
-                    eps = nothing, ntrans::Int = 1) where {T} =
+                    eps = nothing, ntrans::Int = 1, nufft_nthreads::Int = 0) where {T} =
     DirectNUFFTPlan(x, y, ms, T; period, solve, maxiter, rtol, ntrans)
 
 make_scattered_plan(::FINUFFTBackend, x, y, ms, ::Type{T}; kwargs...) where {T} =
@@ -510,10 +562,13 @@ end
 
 # `ntrans` is accepted so a caller can request a batch width without first asking which backend it
 # will get, and ignored because direct summation transforms one field per call. The plan reports
-# `batch_width == 1`, so nothing downstream feeds it a stack it cannot take.
+# `batch_width == 1`, so nothing downstream feeds it a stack it cannot take. `eps` and
+# `nufft_nthreads` are accepted and ignored for the same reason: they configure a fast library that
+# this plan does not use.
 function DirectNUFFTPlan(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, ::Type{T};
                          period = nothing, solve::Bool = false, maxiter::Int = 100,
-                         rtol::Real = 1.0e-8, eps = nothing, ntrans::Int = 1) where {T}
+                         rtol::Real = 1.0e-8, eps = nothing, ntrans::Int = 1,
+                         nufft_nthreads::Int = 0) where {T}
     M = length(x)
     length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
     xmin, ymin = T(minimum(x)), T(minimum(y))
@@ -554,6 +609,11 @@ domain. This is what lets a transform be rebuilt on another process, where the p
 travel. Rebuilding from these requires `period = (2π, 2π)`, since they are already scaled.
 """
 plan_points(p::DirectNUFFTPlan) = (p.sx, p.sy)
+
+# Direct summation is exact and single-threaded by construction, so it reports no tolerance and no
+# thread count — both are `nothing`/`0`, the values its constructor ignores.
+plan_analysis(p::DirectNUFFTPlan) =
+    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, eps = nothing, nufft_nthreads = 0)
 
 # Type-1 (points → modes): X = Ex · (c ⊙ Ey), all preallocated.
 function _nudft_type1!(X::AbstractMatrix, plan::DirectNUFFTPlan, c::AbstractVector)

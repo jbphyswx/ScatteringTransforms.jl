@@ -114,18 +114,19 @@ Test.@testset "Allocation discipline" begin
         # per path would allocate an array header on every call, so the views are built once with the
         # transform; this asserts they stay there.
         #
-        # Asserted as proportional to `B` rather than as zero. FFTW.jl allocates per execution once
-        # its multithreading is active (JuliaMath/FFTW.jl#240), and merely loading
-        # FastSphericalHarmonics activates it, so no FFT-executing path can reach zero here — measured
-        # at 139104 B for `B = 4` and exactly twice that for `B = 8`. A view rebuilt per wavelet would
-        # add a *constant* instead, which breaks proportionality at any thread count (and this is
-        # exactly zero when FFTW threading was never enabled, where 2*0 == 0 still holds).
+        # `nufft_nthreads = 1` is what makes zero reachable, and it is a property of the library, not
+        # of this cascade: FINUFFT executes its internal FFT through the same libfftw3 FFTW.jl has
+        # installed a Julia-task thread callback into, so a multi-threaded FINUFFT plan spawns a task
+        # per thread on every transform (measured: 276 tasks, 139104 B for `B = 4`). Single-threaded it
+        # takes libfftw3's serial path and the cascade's own allocation — which is what is under test —
+        # is exactly zero.
         SP = ScatteringTransforms.ScatteredPlanar
         M, ms = 500, (16, 16)
         px, py = rand(M), rand(M)
         function batched_alloc(B)
             stb = SP.build(Float64, px, py, ms, 3; L = 4, max_order = 2,
-                           spectral = ScatteringTransforms.Plans.FINUFFTBackend(), ntrans = B)
+                           spectral = ScatteringTransforms.Plans.FINUFFTBackend(), ntrans = B,
+                           nufft_nthreads = 1)
             # Asserted, not assumed: a plan that quietly came back single-field would make the
             # measurement below time the per-field cascade and agree for the wrong reason.
             Test.@test ScatteringTransforms.Plans.batch_width(stb.plan) == B
@@ -135,7 +136,8 @@ Test.@testset "Allocation discipline" begin
             S2 = zeros(Float64, nwp, nwp, B)
             return _alloc(SP.scattered_planar_scattering_batch!, S0, S1, S2, stb, randn(M, B))
         end
-        Test.@test 2 * batched_alloc(4) == batched_alloc(8)
+        Test.@test batched_alloc(4) == 0
+        Test.@test batched_alloc(8) == 0
     end
 
     Test.@testset "st(x) allocates only its coefficient container (size-independent)" begin

@@ -67,7 +67,7 @@ function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, In
                spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
                period = nothing, solve::Bool = false, weights = nothing,
                eps = nothing, maxiter::Int = 100, rtol::Real = 1.0e-8,
-               ntrans::Int = 1) where {T}
+               ntrans::Int = 1, nufft_nthreads::Int = 0) where {T}
     M = length(x)
     cpu_fb = FilterBanks.build_filter_bank2d(T, ms, J; L = L)
     # The transform lives wherever its points do. Every array is `similar` to `x`, so host points
@@ -78,7 +78,8 @@ function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, In
     tree = PathGraph.build_tree([m.j_eff for m in fb.meta], max_order)
     plan = Plans.make_scattered_plan(spectral, x, y, ms, T;
                                      period = period, solve = solve, maxiter = maxiter,
-                                     rtol = rtol, eps = eps, ntrans = ntrans)
+                                     rtol = rtol, eps = eps, ntrans = ntrans,
+                                     nufft_nthreads = nufft_nthreads)
     # The buffers must match what the plan will actually execute, which is its own width — a backend
     # that cannot batch reports 1 regardless of what was asked for.
     B = Plans.batch_width(plan)
