@@ -46,34 +46,27 @@ end
 # the cache on our plan builds them once instead.
 #
 # Their construction goes through FFTW's planner, which is documented as callable from only one
-# thread at a time (only `fftw_execute` is thread safe), so every cache is populated under this
-# lock — including the per-task copies below, which are built inside spawned tasks.
-const PLANNER_LOCK = ReentrantLock()
+# thread at a time (only `fftw_execute` is thread safe), so every cache is populated under
+# `Plans.PLANNER_LOCK` — including the per-task copies below, which are built inside spawned
+# tasks. That lock is shared with the scattered-point backend because the planner they contend for is
+# one process global.
 
-# FastTransforms is not re-entrant from a task sharing the caller's OS thread: running it
-# multithreaded from such a task silently changes what an already-built plan returns, permanently and
-# with no error.
-#
 # `ft_set_num_threads` has no getter, but it forwards to OpenMP and `omp_get_max_threads` tracks it,
-# so the count is restored afterwards rather than left mutated behind the caller's back.
-#
-# That symbol is reached through `libfasttransforms`, which links OpenMP and re-exports it, rather
-# than through `libomp` by name: the bare name resolves on macOS but not on a stock Linux runner,
-# whereas the JLL gives a real path on every platform.
-function with_serial_ft(f)
-    prev = ccall((:omp_get_max_threads, FSH.FastTransforms.libfasttransforms), Cint, ())
-    FSH.FastTransforms.ft_set_num_threads(1)
-    try
-        return f()
-    finally
-        FSH.FastTransforms.ft_set_num_threads(prev)
-    end
-end
+# so the count can be restored rather than left mutated behind the caller's back. That symbol is
+# reached through `libfasttransforms`, which links OpenMP and re-exports it, rather than through
+# `libomp` by name: the bare name resolves on macOS but not on a stock Linux runner, whereas the JLL
+# gives a real path on every platform.
+_ft_nthreads() = ccall((:omp_get_max_threads, FSH.FastTransforms.libfasttransforms), Cint, ())
+_ft_nthreads!(n) = FSH.FastTransforms.ft_set_num_threads(n)
+
+# The pin itself is reference counted in core, shared with the scattered-point backend, because the
+# thread count it guards is one process global for both — see `SphericalCore.with_serial_ft`.
+with_serial_ft(f) = ST.SphericalCore.with_serial_ft(f, _ft_nthreads, _ft_nthreads!)
 
 function _warmed_cache(nθ::Int, nφ::Int)
     cache = FSH.SphPlanCache{Float64}()
     scratch = zeros(Float64, nθ, nφ)
-    Base.@lock PLANNER_LOCK begin
+    Base.@lock ST.Plans.PLANNER_LOCK begin
         with_serial_ft() do
             FSH.sph_transform!(scratch; cache = cache)
             FSH.sph_evaluate!(scratch; cache = cache)

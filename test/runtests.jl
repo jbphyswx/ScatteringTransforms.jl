@@ -1005,6 +1005,10 @@ include("test_scattered_planar.jl")
 # Pointwise spherical monogenic orientation/phase (spin-1 synthesis).
 include("test_spherical_monogenic_components.jl")
 
+# Plan construction from concurrent tasks — the guards over the process-global FFTW planner and
+# FastTransforms thread count both backends share.
+include("test_concurrency.jl")
+
 # Allocation discipline: hot paths zero-alloc; allocating paths minimal + data-size-independent.
 include("test_allocs.jl")
 

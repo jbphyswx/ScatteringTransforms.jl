@@ -111,6 +111,64 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
                                                                                  Xb[:, 1:3])
     end
 
+    Test.@testset "threaded batches with overlapping tasks match the serial batch" begin
+        # The assertion above runs `B == ntrans`, which is a single chunk and therefore a single task —
+        # it cannot see a race. These sizes give one task per column (per-field path) and eight
+        # overlapping chunks (batched path), which is where a plan shared between tasks shows up: the
+        # FINUFFT guru plan writes through its own buffers, so two tasks executing one would return
+        # NaN rather than a slightly different answer.
+        Random.seed!(13)
+        M2, B2, W2 = 1500, 32, 4
+        xs, ys = rand(M2), rand(M2)
+        Xb = randn(M2, B2)
+        st1 = ScatteringTransforms.scattered_planar_scattering(xs, ys, (32, 32), 3;
+            L = 4, max_order = 2, spectral = ScatteringTransforms.Plans.FINUFFTBackend())
+        serial = ScatteringTransforms.scattering_batch(ComputationalBackends.SerialBackend(), st1, Xb)
+        Test.@test !any(isnan, serial)
+
+        perfield = ScatteringTransforms.scattering_batch(
+            ComputationalBackends.ThreadedBackend(), st1, Xb)
+        Test.@test !any(isnan, perfield)
+        Test.@test perfield ≈ serial rtol=1e-12
+
+        stb = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (32, 32), 3;
+            L = 4, max_order = 2, spectral = ScatteringTransforms.Plans.FINUFFTBackend(),
+            ntrans = W2)
+        Test.@test ScatteringTransforms.Plans.batch_width(stb.plan) == W2
+        chunked = ScatteringTransforms.scattering_batch(
+            ComputationalBackends.ThreadedBackend(), stb, Xb)
+        Test.@test !any(isnan, chunked)
+        Test.@test chunked ≈ serial rtol=1e-12
+    end
+
+    Test.@testset "a transform rebuilt from its spec analyses the same way" begin
+        # A distributed worker cannot receive a plan, so it receives a spec and rebuilds. Everything
+        # that decides what the analysis *is* has to survive that trip: `solve` selects a
+        # least-squares inversion over the Type-1 adjoint, which on irregular points is a different
+        # transform, and the tolerance and CG settings decide how exactly it is solved.
+        Random.seed!(11)
+        M2 = 800
+        xs, ys = 2π .* rand(M2), 2π .* rand(M2)
+        fs = [1.0 + 0.7cos(xs[k]) + 0.5sin(2ys[k]) for k in 1:M2]
+        for spectral in (SpectralBackends.DirectSumSpectralBackend(),
+                         ScatteringTransforms.Plans.FINUFFTBackend(),
+                         ScatteringTransforms.Plans.NonuniformFFTsBackend())
+            st = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
+                L = 4, max_order = 2, period = (2π, 2π), spectral = spectral,
+                solve = true, maxiter = 37, rtol = 1.0e-7, eps = 1.0e-8)
+            rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
+            a0 = ScatteringTransforms.Plans.plan_analysis(st.plan)
+            a1 = ScatteringTransforms.Plans.plan_analysis(rb.plan)
+            Test.@test a1.solve == a0.solve == true
+            Test.@test a1.maxiter == 37
+            Test.@test a1.rtol == a0.rtol
+            Test.@test a1.eps == a0.eps
+            # And the same settings must give the same coefficients, not merely the same fields.
+            Test.@test ScatteringTransforms.Coefficients.flatten2d(rb(fs)) ≈
+                       ScatteringTransforms.Coefficients.flatten2d(st(fs))
+        end
+    end
+
     Test.@testset "NonuniformFFTs backend agrees with FINUFFT and direct summation" begin
         # Three independent transforms of the same field on the same points: exact direct
         # summation, FINUFFT, and NonuniformFFTs. They lay their modes out on the same fftfreq

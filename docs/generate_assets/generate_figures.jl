@@ -8,13 +8,14 @@ Run from repo root: `julia --project=docs/generate_assets docs/generate_assets/g
 """
 
 using ScatteringTransforms: ScatteringTransforms as ST
+using SpectralBackends: SpectralBackends as SB
 using CairoMakie: CairoMakie as MK
 using Statistics: Statistics
 using FFTW: FFTW
 using Random: Random
 using DifferentiationInterface: DifferentiationInterface as DI
-using ADTypes: AutoMooncake
-import Mooncake
+using ADTypes: AutoEnzyme
+using Enzyme: Enzyme
 using NUFSHT: NUFSHT          # enables spherical (monogenic) scattering
 using FINUFFT: FINUFFT        # enables scattered / nonuniform planar scattering
 using FastSphericalHarmonics: FastSphericalHarmonics   # enables structured spherical scattering
@@ -163,8 +164,8 @@ let J = 6
     td = Float64[]; tf = Float64[]
     for N in Ns
         x = spectral_signal(N, -5/3)
-        sd = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.DirectSumBackend())
-        sf = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.FFTBackend())
+        sd = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.DirectSumSpectralBackend())
+        sf = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.FFTSpectralBackend())
         sd(x); sf(x)  # warmup
         push!(td, Base.minimum(Base.@elapsed(sd(x)) for _ in 1:3) * 1e3)
         push!(tf, Base.minimum(Base.@elapsed(sf(x)) for _ in 1:3) * 1e3)
@@ -230,7 +231,7 @@ end
 Base.println("Figure 8: reconstruction & synthesis...")
 let N = 384, J = 6
     sig = spectral_signal(N, -5/3)
-    st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.FFTBackend())
+    st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.FFTSpectralBackend())
 
     # (1) exact linear wavelet-frame inverse — recovers the field to machine precision.
     xr = ST.Inverse.iwavelet(st, ST.Inverse.wavelet_transform(st, sig))
@@ -241,8 +242,8 @@ let N = 384, J = 6
     #     in-core direct-sum forward (portable across AD backends; FFTW reverse-mode AD needs the
     #     backend's FFT rules).
     Random.seed!(7)
-    st_ad = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=ST.Plans.DirectSumBackend())
-    res = ST.synthesize(st_ad, sig; backend=AutoMooncake(), init=Base.randn(N), iters=300, lr=0.05)
+    st_ad = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.DirectSumSpectralBackend())
+    res = ST.synthesize(st_ad, sig; backend=AutoEnzyme(; mode=Enzyme.set_runtime_activity(Enzyme.Reverse)), init=Base.randn(N), iters=300, lr=0.05)
     syn = res.field
 
     cT = ST.ScatteringCore.scattering(st_ad, sig); cS = ST.ScatteringCore.scattering(st_ad, syn)
@@ -279,7 +280,7 @@ let M = 128
     cx = cy = (M + 1) / 2
     rr = [Base.sqrt((i - cx)^2 + (j - cy)^2) for i in 1:M, j in 1:M]
     field = Base.cos.(2π .* rr ./ (M / 16))
-    st = ST.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1, spectral=ST.Plans.FFTBackend())
+    st = ST.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1, spectral=SB.FFTSpectralBackend())
     best = Base.argmax([Base.sum(abs2, ST.Monogenic.monogenic_components(st, field, j).bandpass) for j in 1:5])
     comp = ST.Monogenic.monogenic_components(st, field, best)
     amp = comp.amplitude
@@ -307,7 +308,7 @@ let M = 128
 end
 
 # ── 10. 2D reconstruction: exact linear inverse + scattering-coefficient synthesis ─
-Base.println("Figure 10: 2D reconstruction & synthesis (Mooncake; this one is slow)...")
+Base.println("Figure 10: 2D reconstruction & synthesis (reverse-mode AD; this one is slow)...")
 let M = 40, J = 3, L = 6
     # A clear, *stationary* texture (oriented stripes + mild noise): global scattering coefficients
     # are translation-invariant texture statistics, so synthesis reproduces the texture (same
@@ -317,13 +318,13 @@ let M = 40, J = 3, L = 6
              0.15 .* Base.randn(M, M)
     target ./= Statistics.std(target)
     # (1) exact linear inverse — machine precision, via the FFTW fast path.
-    stf = ST.Scattering2D.ScatteringTransform2D((M, M), J; L=L, max_order=2, spectral=ST.Plans.FFTBackend())
+    stf = ST.Scattering2D.ScatteringTransform2D((M, M), J; L=L, max_order=2, spectral=SB.FFTSpectralBackend())
     xr = ST.Inverse.iwavelet(stf, ST.Inverse.wavelet_transform(stf, target))
     inv_err = Base.maximum(Base.abs.(xr .- target)) / Base.maximum(Base.abs.(target))
     # (2) coefficient synthesis from noise (direct-sum forward, portable under reverse-mode AD).
     Random.seed!(11)
-    st_ad = ST.Scattering2D.ScatteringTransform2D((M, M), J; L=L, max_order=2, spectral=ST.Plans.DirectSumBackend())
-    res = ST.synthesize(st_ad, target; backend=AutoMooncake(), init=Base.randn(M, M),
+    st_ad = ST.Scattering2D.ScatteringTransform2D((M, M), J; L=L, max_order=2, spectral=SB.DirectSumSpectralBackend())
+    res = ST.synthesize(st_ad, target; backend=AutoEnzyme(; mode=Enzyme.set_runtime_activity(Enzyme.Reverse)), init=Base.randn(M, M),
                         iters=160, lr=0.06)
     syn = res.field
 
@@ -399,7 +400,7 @@ let Mmode = 24, Mdisp = 160, J = 3, L = 6, Npts = 6000
     g(x, y) = 1.0 + 0.8Base.cos(x) + 0.6Base.sin(2y) - 0.5Base.cos(x) * Base.sin(y) + 0.4Base.cos(3x + y)
     fdisp = [g(2π * i / Mdisp, 2π * j / Mdisp) for i in 0:Mdisp-1, j in 0:Mdisp-1]   # smooth, for display
     fgrid = [g(2π * i / Mmode, 2π * j / Mmode) for i in 0:Mmode-1, j in 0:Mmode-1]   # mode-grid reference
-    stg = ST.Scattering2D.ScatteringTransform2D((Mmode, Mmode), J; L=L, max_order=2, spectral=ST.Plans.FFTBackend())
+    stg = ST.Scattering2D.ScatteringTransform2D((Mmode, Mmode), J; L=L, max_order=2, spectral=SB.FFTSpectralBackend())
     cg = stg(fgrid)
     Random.seed!(5)
     px = 2π .* Base.rand(Npts); py = 2π .* Base.rand(Npts)

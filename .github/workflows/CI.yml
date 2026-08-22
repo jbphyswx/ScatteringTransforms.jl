@@ -37,8 +37,9 @@ jobs:
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
-        # More than one thread, or the threaded backend's tests all run on the serial path and the
-        # allocation gates never see a task-spawn floor.
+        # More than one thread, or every threaded-backend test silently runs on the serial path — and
+        # so does the FFT library threading whose per-execution task spawns the allocation gates
+        # exist to keep out of the cascades.
         env:
           JULIA_NUM_THREADS: '2'
       - uses: julia-actions/julia-processcoverage@v1

@@ -86,13 +86,20 @@ DifferentiationInterface) to draw a new sample with matching multiscale statisti
 
 ```julia
 using DifferentiationInterface: DifferentiationInterface
-using Mooncake: Mooncake
-using ADTypes: AutoMooncake
+using Enzyme: Enzyme
+using ADTypes: AutoEnzyme
 # exact linear inverse (machine precision)
 x̂ = ST.Inverse.iwavelet(st, ST.Inverse.wavelet_transform(st, signal))
-# coefficient synthesis from noise (a matching sample, not the original field)
-res = ST.synthesize(st, signal; backend = AutoMooncake(), iters = 400)
+# coefficient synthesis from noise (a matching sample, not the original field). Runtime activity is
+# required: the cascade maps a closure over the filter bank, so every closure holds constant filters
+# next to the active input and Enzyme cannot separate the two statically.
+res = ST.synthesize(st, signal; iters = 400,
+                    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
 ```
+
+Any `ADTypes` backend works — the differentiable forward is the non-mutating `scattering(st, x)`. Use
+the in-core direct-sum spectral backend for reverse mode: it is plain scalar arithmetic and needs no
+FFT rules.
 
 ![Reconstruction & synthesis (1D)](assets/reconstruction_synthesis.png)
 ![Reconstruction & synthesis (2D)](assets/reconstruction_2d.png)

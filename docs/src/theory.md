@@ -91,7 +91,8 @@ local phase of each wavelet coefficient. Three reconstruction levels are availab
    the scattering coefficients themselves: from noise, minimize `‖S(\hat x) − S(x)‖²`
    (Bruna & Mallat microcanonical models). This yields a new *sample* with matching multiscale
    statistics — not the original field — and is differentiated through the mutation-free
-   `scattering(st, x)` by any `ADTypes` backend (e.g. `AutoMooncake()`).
+   `scattering(st, x)` by any `ADTypes` backend (with Enzyme:
+   `AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`).
 
 ## Monogenic (Riesz) scattering
 

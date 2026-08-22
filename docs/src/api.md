@@ -176,8 +176,10 @@ ScatteringTransforms.Plans.spectral_backend
 ScatteringTransforms.Plans.task_local_plan
 ScatteringTransforms.Plans.batch_width
 ScatteringTransforms.Plans.plan_points
+ScatteringTransforms.Plans.plan_analysis
 ScatteringTransforms.Plans.nufft_guru_make
 ScatteringTransforms.Plans.with_fft_nthreads
+ScatteringTransforms.Plans.PLANNER_LOCK
 ScatteringTransforms.ScatteringCore.wavelet_convolve
 ScatteringTransforms.ScatteringCore.wavelet_convolve!
 ScatteringTransforms.ScatteringCore.apply_modulus
@@ -258,8 +260,10 @@ ScatteringTransforms.SphericalCore.plan_solver
 ScatteringTransforms.SphericalCore.batch_plan
 ScatteringTransforms.SphericalCore.supports_batch
 ScatteringTransforms.SphericalCore.plan_nufft
+ScatteringTransforms.SphericalCore.plan_spin
 ScatteringTransforms.SphericalCore.AnalysisNotConverged
 ScatteringTransforms.SphericalCore.default_rtol
+ScatteringTransforms.SphericalCore.with_serial_ft
 ScatteringTransforms.SphericalCore.make_spherical_plan
 ScatteringTransforms.SphericalCore.make_structured_plan
 ScatteringTransforms.SphericalCore.nusht_spherical_plan
