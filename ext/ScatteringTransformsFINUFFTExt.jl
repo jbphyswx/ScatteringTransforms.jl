@@ -88,6 +88,7 @@ function ST.Plans.nufft_guru_make(::AbstractArray, type::Integer, ms::NTuple{2, 
 end
 
 ST.Plans.nufft_guru_setpts!(g::FINUFFT.finufft_plan, x, y) = (FINUFFT.finufft_setpts!(g, x, y); g)
+ST.Plans.nufft_guru_destroy!(g::FINUFFT.finufft_plan) = (FINUFFT.finufft_destroy!(g); nothing)
 ST.Plans.nufft_guru_exec!(g::FINUFFT.finufft_plan, input, output) =
     (FINUFFT.finufft_exec!(g, input, output); output)
 
@@ -141,6 +142,9 @@ ST.Plans.task_local_plan(p::NUFFTScatteringPlan{T}) where {T} =
              max(1, cld(Sys.CPU_THREADS, Threads.nthreads())))
 
 ST.Plans.batch_width(p::NUFFTScatteringPlan) = p.B
+
+ST.Plans.close_plan!(p::NUFFTScatteringPlan) =
+    (ST.Plans.nufft_guru_destroy!(p.guru1); ST.Plans.nufft_guru_destroy!(p.guru2); nothing)
 
 # Fast-path plan constructor filled into the core `ST.Plans.finufft_scattered_plan` declaration; the core
 # `scattered_planar_scattering` cascade builds it when `spectral` selects the FINUFFT backend.

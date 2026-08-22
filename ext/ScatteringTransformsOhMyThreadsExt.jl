@@ -283,17 +283,25 @@ function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
         OMT.@tasks for cols in chunks
             k = length(cols)
             Xc = view(X, :, cols)
-            stb = ST.SphericalCore.SphericalScattering(st.lmax, st.J, st.max_order,
-                                                       ST.SphericalCore.task_local_batch_plan(st.plan, k),
-                                                       st.sigma2)
-            ws = ST.SphericalCore.SphericalWorkspace(stb, Xc)
-            S1 = zeros(T, st.J, k)
-            S2 = st.max_order >= 2 ? zeros(T, st.J, st.J, k) : Array{T, 3}(undef, 0, 0, 0)
-            r = ST.SphericalCore.spherical_scattering_batch!(S1, S2, stb, ws, Xc)
-            empty2 = Matrix{T}(undef, 0, 0)
-            for (i, b) in enumerate(cols)
-                S2b = isempty(r.S2) ? empty2 : view(r.S2, :, :, i)
-                ST._flatten_spherical!(view(out, :, b), r.S0[i], view(r.S1, :, i), S2b, st.J)
+            plan = ST.SphericalCore.task_local_batch_plan(st.plan, k)
+            # Freed on the way out, never by the finalizer: a FINUFFT plan's destructor takes a lock,
+            # which aborts the process if it runs from a GC finalizer, and one plan per task per call
+            # is enough churn to hit that inside another task's transform. `finally`, because a solve
+            # that refuses to converge is an exception a caller can catch and carry on from.
+            try
+                stb = ST.SphericalCore.SphericalScattering(st.lmax, st.J, st.max_order, plan,
+                                                           st.sigma2)
+                ws = ST.SphericalCore.SphericalWorkspace(stb, Xc)
+                S1 = zeros(T, st.J, k)
+                S2 = st.max_order >= 2 ? zeros(T, st.J, st.J, k) : Array{T, 3}(undef, 0, 0, 0)
+                r = ST.SphericalCore.spherical_scattering_batch!(S1, S2, stb, ws, Xc)
+                empty2 = Matrix{T}(undef, 0, 0)
+                for (i, b) in enumerate(cols)
+                    S2b = isempty(r.S2) ? empty2 : view(r.S2, :, :, i)
+                    ST._flatten_spherical!(view(out, :, b), r.S0[i], view(r.S1, :, i), S2b, st.J)
+                end
+            finally
+                plan === st.plan || ST.Plans.close_plan!(plan)
             end
         end
     end

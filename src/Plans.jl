@@ -103,6 +103,21 @@ has no CPU threads to set and ignores it.
 function nufft_guru_make end
 function nufft_guru_setpts! end
 function nufft_guru_exec! end
+function nufft_guru_destroy! end
+
+"""
+    close_plan!(plan) -> nothing
+
+Release the foreign-library resources `plan` owns, now rather than at collection. No-op by default,
+and safe to call more than once.
+
+Whoever *builds* a plan per task must call this when the task is done. These destructors take a lock
+— FINUFFT installs one to serialise its FFTW planner calls — and a lock cannot be taken from a GC
+finalizer, so leaving them to be collected aborts the process the moment one fires inside another
+task's transform. Closing eagerly leaves the finalizer nothing to do, since it checks whether the C
+plan is already gone.
+"""
+close_plan!(::Any) = nothing
 
 """
     batch_width(plan) -> Int

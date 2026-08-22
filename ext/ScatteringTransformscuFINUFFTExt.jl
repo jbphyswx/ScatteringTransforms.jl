@@ -36,6 +36,7 @@ end
 
 ST.Plans.nufft_guru_setpts!(g::FINUFFT.cufinufft_plan, x, y) =
     (FINUFFT.cufinufft_setpts!(g, x, y); g)
+ST.Plans.nufft_guru_destroy!(g::FINUFFT.cufinufft_plan) = (FINUFFT.cufinufft_destroy!(g); nothing)
 ST.Plans.nufft_guru_exec!(g::FINUFFT.cufinufft_plan, input, output) =
     (FINUFFT.cufinufft_exec!(g, input, output); output)
 

@@ -91,6 +91,14 @@ function ST.SphericalCore.batch_plan(p::NUSHTSphericalPlan, B::Integer)
 end
 
 ST.SphericalCore.plan_nufft(p::NUSHTSphericalPlan) = p.nufft
+
+# `NUFSHT.close!` frees the FINUFFT plans a NUSHT plan owns and is idempotent, so the finalizer that
+# would otherwise free them from a GC context finds nothing left to do.
+function ST.Plans.close_plan!(p::NUSHTSphericalPlan)
+    NUFSHT.close!(p.plan)
+    p.spin === nothing || (NUFSHT.close!(p.spin[1]); NUFSHT.close!(p.spin[2]))
+    return nothing
+end
 ST.SphericalCore.plan_spin(p::NUSHTSphericalPlan) = p.spin
 ST.SphericalCore.plan_points(p::NUSHTSphericalPlan) = (p.theta, p.phi)
 ST.SphericalCore.plan_weights(::NUSHTSphericalPlan) = nothing   # unweighted sample mean
