@@ -141,6 +141,29 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         Test.@test chunked ≈ serial rtol=1e-12
     end
 
+    Test.@testset "an explicit nufft_nthreads survives into the per-task plans" begin
+        # A threaded backend applies task-local copies, so a thread count honoured only at construction
+        # is a keyword that does nothing where it matters most. Unset, a per-task copy takes one thread
+        # rather than a share of `Sys.CPU_THREADS`: those are logical cores, so on a hyperthreaded
+        # machine already running one Julia task per physical core the arithmetic hands out a second
+        # library thread per task.
+        M2 = 500
+        xs, ys = rand(M2), rand(M2)
+        build(n) = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
+            L = 4, max_order = 2, spectral = ScatteringTransforms.Plans.FINUFFTBackend(),
+            nufft_nthreads = n)
+        for n in (1, 3)
+            st = build(n)
+            Test.@test st.plan.nthreads == n
+            Test.@test ScatteringTransforms.Plans.task_local_plan(st.plan).nthreads == n
+        end
+        st0 = build(0)
+        Test.@test st0.plan.nthreads == 0                                   # the library's own choice
+        Test.@test ScatteringTransforms.Plans.task_local_plan(st0.plan).nthreads == 1
+        Test.@test ScatteringTransforms.Plans.per_task_nthreads(0) == 1
+        Test.@test ScatteringTransforms.Plans.per_task_nthreads(5) == 5
+    end
+
     Test.@testset "a transform rebuilt from its spec analyses the same way" begin
         # A distributed worker cannot receive a plan, so it receives a spec and rebuilds. Everything
         # that decides what the analysis *is* has to survive that trip: `solve` selects a
