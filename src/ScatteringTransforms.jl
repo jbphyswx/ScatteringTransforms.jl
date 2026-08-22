@@ -572,10 +572,12 @@ inversion for the true band-limited coefficients (slower, needed for irregular s
 (length `M`, summing to 1) sets the quadrature for the spatial mean; the default is the uniform sample
 mean. `eps` is the FINUFFT tolerance (ignored by the exact direct sum).
 
-`nufft_nthreads` sets the fast library's own thread count; `0` (the default) leaves it to the
-library, which is worth 2–3× at `M ≳ 2·10⁴`. Pass `1` to take the library out of the threading
-picture — the per-task plans a threaded backend builds already divide the cores between themselves,
-and a single-threaded plan is also the one that executes without allocating.
+`nufft_nthreads` sets the fast library's own thread count, and is honoured wherever the plan goes,
+including the per-task copies a threaded backend builds. `0` (the default) leaves it to the library,
+which is worth 2–3× at `M ≳ 2·10⁴` on a serial backend; a per-task copy defaults to one instead, since
+the tasks already have the cores. Pass `1` to keep the library single-threaded everywhere — that is
+also the plan that executes without allocating, because a multi-threaded FFTW plan runs its parallel
+loop on Julia tasks.
 """
 scattered_planar_scattering(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int},
                             J::Int; kwargs...) where {T} =

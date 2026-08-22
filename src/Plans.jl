@@ -96,9 +96,9 @@ type the points are.
 
 `nthreads` is the library's own thread count, baked into the plan, with `0` meaning "the library's
 default" (all cores). Measured on the scattered-planar shapes: the library's threading is worth
-2.2–3.3× at `M ≳ 2·10⁴` and breaks even at `M ~ 500`, so the default keeps it. It is pinned to `1`
-only where ST is itself running one plan per task — see [`task_local_plan`](@ref). A device binding
-has no CPU threads to set and ignores it.
+2.2–3.3× at `M ≳ 2·10⁴` and breaks even at `M ~ 500`, so the default keeps it. A plan built per task
+defaults to one instead — see [`per_task_nthreads`](@ref). A device binding has no CPU threads to set
+and ignores it.
 """
 function nufft_guru_make end
 function nufft_guru_setpts! end
@@ -120,6 +120,21 @@ plan is already gone.
 close_plan!(::Any) = nothing
 
 """
+    per_task_nthreads(requested) -> Int
+
+Thread count for a library plan built inside a task: `requested` if the caller asked for one, else 1.
+
+An explicit request is honoured here and not just at construction, or `nufft_nthreads` would be a
+keyword that silently does nothing under a threaded backend. The default is one because
+[`task_local_plan`](@ref) builds a plan per task, so the tasks have already claimed the cores.
+
+Deriving the default from `Sys.CPU_THREADS` instead gets this wrong twice: those are logical cores, so
+on a hyperthreaded machine running one Julia task per *physical* core — already a full machine — the
+arithmetic hands every task a second library thread.
+"""
+per_task_nthreads(requested::Integer) = requested > 0 ? Int(requested) : 1
+
+"""
     batch_width(plan) -> Int
 
 Number of co-located fields this plan transforms per execution — `1` unless it was built for a batch.
@@ -137,11 +152,10 @@ A plan equivalent to `plan` that is safe to use concurrently with it. Stateless 
 `AbstractFFTs`) return themselves; plans carrying mutable scratch return a copy that shares their
 read-only tables and owns fresh scratch. Called once per task by the parallel backends.
 
-Two obligations follow from *where* this is called. A method that **builds** rather than shares must
-do so under [`PLANNER_LOCK`](@ref), because it runs inside a spawned task by construction. And it
-must pin the underlying library to a single thread: the caller has already claimed the cores by
-running one of these per task, so a library threading inside that would oversubscribe by a factor of
-the thread count. Never two levels of threading.
+Three obligations follow from *where* this is called. A method that **builds** rather than shares must
+do so under [`PLANNER_LOCK`](@ref), because it runs inside a spawned task by construction; it must
+take its thread count from [`per_task_nthreads`](@ref), since the caller has already claimed the cores;
+and whoever built it must [`close_plan!`](@ref) it when the task ends.
 """
 task_local_plan(plan::AbstractScatteringPlan) = plan
 

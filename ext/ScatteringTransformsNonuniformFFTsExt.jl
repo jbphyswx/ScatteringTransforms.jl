@@ -60,12 +60,12 @@ end
 # `PlanNUFFT` holds the scratch every execution writes through, so tasks cannot share one. The
 # points are retained above precisely so a task can build its own.
 #
-# The rebuild divides the cores among the concurrent tasks, for the reason given on the FINUFFT
-# sibling: one plan exists per task, so leaving each one the whole machine oversubscribes by the
-# thread count and makes every execution spawn a Julia task per FFT thread.
+# The rebuild carries the plan's own thread count, defaulting to one, for the reason given on the
+# FINUFFT sibling: one plan exists per task, so leaving each one the whole machine oversubscribes and
+# makes every execution spawn a Julia task per FFT thread.
 function ST.Plans.task_local_plan(p::NonuniformFFTsScatteringPlan{T}) where {T}
     return _plan_at(p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol,
-                    max(1, cld(Sys.CPU_THREADS, Threads.nthreads())))
+                    ST.Plans.per_task_nthreads(p.nthreads))
 end
 
 # Where the plan lives follows the points, so there is nothing to pass: `get_backend` reads the

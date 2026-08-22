@@ -131,15 +131,13 @@ ST.Plans.plan_analysis(p::NUFFTScatteringPlan) =
 # doing so silently corrupts every concurrent transform. The scaled points are retained on the
 # wrapper precisely so a task can build its own.
 #
-# The rebuild divides the machine among the concurrent tasks rather than inheriting FINUFFT's default
-# of "all cores": one of these plans exists per task, so the default would put `nthreads()` tasks ×
-# `CPU_THREADS` library threads on `CPU_THREADS` cores, and each execution would additionally spawn a
-# Julia task per library thread through FFTW.jl's thread callback. An even split keeps the cores
-# filled exactly once — and collapses to a single thread, i.e. no nesting at all, when Julia already
-# has a task per core.
+# The rebuild carries the plan's own thread count, defaulting to one rather than to FINUFFT's "all
+# cores": one plan exists per task here, so the tasks have the cores, and a library threading beneath
+# them both oversubscribes and spawns a Julia task per library thread through FFTW.jl's callback on
+# every execution.
 ST.Plans.task_local_plan(p::NUFFTScatteringPlan{T}) where {T} =
     _plan_at(p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol, p.B,
-             max(1, cld(Sys.CPU_THREADS, Threads.nthreads())))
+             ST.Plans.per_task_nthreads(p.nthreads))
 
 ST.Plans.batch_width(p::NUFFTScatteringPlan) = p.B
 
