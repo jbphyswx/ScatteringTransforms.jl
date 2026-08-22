@@ -270,9 +270,9 @@ _column_chunks(n::Int, k::Int) =
     (k = max(1, min(k, n)); [(div((c - 1) * n, k) + 1):(div(c * n, k)) for c in 1:k])
 
 # Threads and batched transforms are independent multipliers here, so both are used: one task per
-# column chunk, and inside each task one transform per cascade step covering that whole chunk. A
-# chunk gets its own widened plan, which is what makes it task-local — the batched cascade writes
-# through the plan's own buffers, so tasks cannot share one.
+# column chunk, and inside each task one transform per cascade step covering that whole chunk. The
+# cascade solves through its plan's scratch, so every chunk takes a task-local plan — including a
+# chunk that happens to match the shared plan's own width, which is every chunk once threads ≥ B.
 function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
                               st::ST.SphericalCore.SphericalScattering{T},
                               X::AbstractArray) where {T}
@@ -284,7 +284,7 @@ function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
             k = length(cols)
             Xc = view(X, :, cols)
             stb = ST.SphericalCore.SphericalScattering(st.lmax, st.J, st.max_order,
-                                                       ST.SphericalCore.batch_plan(st.plan, k),
+                                                       ST.SphericalCore.task_local_batch_plan(st.plan, k),
                                                        st.sigma2)
             ws = ST.SphericalCore.SphericalWorkspace(stb, Xc)
             S1 = zeros(T, st.J, k)
