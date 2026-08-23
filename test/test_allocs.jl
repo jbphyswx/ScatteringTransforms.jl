@@ -143,6 +143,40 @@ Test.@testset "Allocation discipline" begin
         Test.@test a4 <= 32
     end
 
+    Test.@testset "the scattered least-squares solve allocates nothing per call" begin
+        # `solve = true` replaces one adjoint application with an iterative solve, so anything it
+        # allocates is paid once per iteration — up to `maxiter` times per field, and again for every
+        # wavelet path in the cascade. Its whole workspace lives on the plan for that reason, and this
+        # is what keeps it there: a buffer that slipped back into the solver would be invisible in the
+        # coefficients and cost `2 · maxiter` allocations per transform.
+        #
+        # NonuniformFFTs is deliberately not gated here. Its own `exec_type1!`/`exec_type2!` allocate
+        # 880 B per execution — a `Threads.@threads` region in its deconvolution step, which builds
+        # task scaffolding on every call even at one thread — so a solve over it allocates the
+        # library's per-transform cost times the iteration count, which this package cannot reach.
+        Msc, mssc = 500, (16, 16)
+        Random.seed!(31)
+        pxs, pys = 2π .* rand(Msc), 2π .* rand(Msc)
+        bs = randn(Msc)
+        Xs = zeros(ComplexF64, mssc)
+        for spec in (SpectralBackends.DirectSumSpectralBackend(), P.FINUFFTBackend())
+            plan = P.make_scattered_plan(spec, pxs, pys, mssc, Float64; period = (2π, 2π),
+                                         solve = true, maxiter = 20, nufft_nthreads = 1)
+            # Asserted so a plan that came back with `solve = false` cannot pass this by measuring a
+            # single adjoint application instead of the solve.
+            Test.@test P.plan_analysis(plan).solve
+            Test.@test _alloc(P.forward_transform!, Xs, plan, bs) == 0
+        end
+        # Batched: the per-column recurrence runs host-side over `B` states, reducing into mirrors
+        # that are preallocated on the plan. Widening the batch must not allocate either.
+        Bsc = 4
+        pb = P.make_scattered_plan(P.FINUFFTBackend(), pxs, pys, mssc, Float64; period = (2π, 2π),
+                                   solve = true, maxiter = 20, ntrans = Bsc, nufft_nthreads = 1)
+        Test.@test P.batch_width(pb) == Bsc
+        Test.@test _alloc(P.forward_transform!, zeros(ComplexF64, mssc..., Bsc), pb,
+                          randn(Msc, Bsc)) == 0
+    end
+
     Test.@testset "st(x) allocates only its coefficient container (size-independent)" begin
         # The non-mutating callable is documented to allocate coefficient storage once; that cost
         # depends on the number of wavelets, not the signal length.

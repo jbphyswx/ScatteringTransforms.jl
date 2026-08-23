@@ -79,4 +79,27 @@ Test.@testset "ScatteringTransforms CUDA GPU (Tier-2)" begin
         got = Array(ST.Coefficients.flatten2d(dev(CUDA.CuArray(f))))
         Test.@test got ≈ ST.Coefficients.flatten2d(host(f)) rtol = 1e-5
     end
+
+    Test.@testset "the scattered least-squares solve runs on device points (cuFINUFFT)" begin
+        # `solve = true` inverts the transform by LSMR instead of applying its adjoint. Every vector
+        # operation in it is a `copyto!`, `fill!`, `norm` or fused broadcast so that it can run on a
+        # device array, and this is the only test that puts it on a real device.
+        #
+        # The field is band limited and the budget is above `prod(ms) = 1024`, the step count at which
+        # the Krylov process terminates exactly. Both matter: an unconverged iterate is not
+        # reproducible enough to compare, because a threaded NUFFT accumulates its spreading in
+        # nondeterministic order and an unconverged solve amplifies that by roughly `cond(A)²`.
+        M, ms, J, L = 2000, (32, 32), 3, 4
+        x = rand(Float64, M) .* 2π
+        y = rand(Float64, M) .* 2π
+        f = [1.0 + 0.7cos(x[k]) + 0.5sin(2y[k]) - 0.3cos(x[k]) * sin(y[k]) for k in 1:M]
+        args = (; L = L, max_order = 2, period = (2π, 2π), solve = true, maxiter = 1200,
+                spectral = ST.Plans.FINUFFTBackend())
+        host = ST.scattered_planar_scattering(x, y, ms, J; args...)
+        dev = ST.scattered_planar_scattering(CUDA.CuArray(x), CUDA.CuArray(y), ms, J; args...)
+        Test.@test dev.plan.guru1 isa FINUFFT.cufinufft_plan
+        Test.@test dev.plan.solve
+        got = Array(ST.Coefficients.flatten2d(dev(CUDA.CuArray(f))))
+        Test.@test got ≈ ST.Coefficients.flatten2d(host(f)) rtol = 1e-6
+    end
 end

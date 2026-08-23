@@ -5,7 +5,7 @@ module ScatteringTransformsFINUFFTExt
 
 Supplies the **fast** spectral plan for the scattered-planar cascade (`ScatteredPlanar`): a reusable
 FINUFFT guru plan over fixed scattered points `(x, y)` and a uniform Fourier mode grid `ms`. Analysis
-is a Type-1 NUFFT (points → modes) or a conjugate-gradient least-squares solve; synthesis is a Type-2
+is a Type-1 NUFFT (points → modes) or an LSMR least-squares solve; synthesis is a Type-2
 NUFFT (modes → points) scaled by `1/prod(ms)`. It implements the same `ST.Plans.AbstractScatteringPlan`
 interface as the in-core `ST.Plans.DirectNUFFTPlan`, so the cascade is identical — this only replaces the
 `O(M·prod(ms))` direct summation with FINUFFT's `O((M + prod(ms))·log)` transform.
@@ -17,17 +17,16 @@ this extension loaded).
 
 The Type-1 adjoint (`solve=false`) equals the true DFT on a uniform grid and is
 accurate for adequately-sampled band-limited fields, but on gappy/irregular sampling it is only the
-adjoint, not the inverse. `solve=true` runs a conjugate-gradient least-squares inversion for the true
-band-limited coefficients — slower, but the principled choice for irregular data. The caller picks per
-their sampling.
+adjoint, not the inverse. `solve=true` runs an LSMR least-squares inversion for the true band-limited
+coefficients — slower, but the principled choice for irregular data. The caller picks per their
+sampling.
 """
 
 using FINUFFT: FINUFFT
-using LinearAlgebra: LinearAlgebra
 using ScatteringTransforms: ScatteringTransforms as ST
 
 # ---------------------------------------------------------------------------
-# NUFFT spectral plan: analysis (points → modes, Type-1 or CG-solve) + synthesis (modes → points).
+# NUFFT spectral plan: analysis (points → modes, Type-1 or least-squares) + synthesis (modes → points).
 # Implements the `ST.Plans.AbstractScatteringPlan` interface so the cascade reuses `wavelet_convolve!`.
 # ---------------------------------------------------------------------------
 
@@ -39,7 +38,7 @@ using ScatteringTransforms: ScatteringTransforms as ST
 # A plan is therefore either single-field or batched, never both.
 struct NUFFTScatteringPlan{T, G, CV<:AbstractArray{Complex{T}},
                            MM<:AbstractArray{Complex{T}},
-                           RV<:AbstractVector{T}} <: ST.Plans.AbstractScatteringPlan
+                           RV<:AbstractVector{T}, BW} <: ST.Plans.AbstractScatteringPlan
     # A type parameter rather than `finufft_plan{T}`, so the same wrapper holds a host guru plan or a
     # cuFINUFFT one. Concrete either way — it is fixed per instantiation.
     guru1::G                      # Type-1 (points → modes), iflag −1, FFT mode order
@@ -51,19 +50,22 @@ struct NUFFTScatteringPlan{T, G, CV<:AbstractArray{Complex{T}},
     solve::Bool
     maxiter::Int
     rtol::T
+    damp::T                       # Tikhonov λ; 0 unless the mode grid is over-specified
     sx::RV                        # (M) points already scaled to FINUFFT's 2π-periodic domain,
     sy::RV                        #     retained so a task can build its own guru plans
     eps::T                        # the tolerance those plans were made with
     nthreads::Int                 # and the thread count they were made with (0 = FINUFFT's default)
     cj::CV                        # (M[, B]) nonuniform exec buffer (shared by Type-1/Type-2)
-    r::MM                         # (ms[, B]) CG residual / rhs
-    p::MM                         # (ms[, B]) CG search direction
-    Ap::MM                        # (ms[, B]) CG A†A·p
-    tmp_pts::CV                   # (M[, B]) CG scratch
+    ls_v::MM                      # (ms[, B]) solver scratch: the four LSMR mode vectors, with `cj`
+    ls_w::MM                      #      and `ls_t` its two point vectors. The transforms overwrite
+    ls_h::MM                      #      rather than accumulate, so `A·v` and `A†·u` each need a
+    ls_hbar::MM                   #      destination of their own.
+    ls_t::CV                      # (M[, B])
+    ls_batch::BW                  # per-column solver bookkeeping, or `nothing` for a single field
 end
 
 function _make_plan(x, y, ms::NTuple{2,Int}, ::Type{T}, period, eps, solve, maxiter, rtol,
-                    B::Int = 1, nthreads::Int = 0) where {T}
+                    B::Int = 1, nthreads::Int = 0, damp::Real = 0) where {T}
     M = length(x)
     length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
     xmin, ymin = T(minimum(x)), T(minimum(y))
@@ -72,7 +74,7 @@ function _make_plan(x, y, ms::NTuple{2,Int}, ::Type{T}, period, eps, solve, maxi
     py = period === nothing ? (T(maximum(y)) - ymin) * ms[2] / (ms[2] - 1) : T(period[2])
     sx = T(2π) .* (T.(x) .- xmin) ./ px
     sy = T(2π) .* (T.(y) .- ymin) ./ py
-    return _plan_at(ms, M, sx, sy, T(eps), T, solve, maxiter, T(rtol), B, nthreads)
+    return _plan_at(ms, M, sx, sy, T(eps), T, solve, maxiter, T(rtol), B, nthreads, T(damp))
 end
 
 # Host seam. `finufft_plan` is mutable and owns the C plan, so the finalizer that frees it goes there
@@ -93,7 +95,7 @@ ST.Plans.nufft_guru_exec!(g::FINUFFT.finufft_plan, input, output) =
     (FINUFFT.finufft_exec!(g, input, output); output)
 
 function _plan_at(ms::NTuple{2,Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, maxiter,
-                  rtol::T, B::Int = 1, nthreads::Int = 0) where {T}
+                  rtol::T, B::Int = 1, nthreads::Int = 0, damp::T = zero(T)) where {T}
     # FINUFFT plans through the same libfftw3 as every other backend here, and that planner takes one
     # thread at a time, so construction is serialised on the package-wide lock. It happens once per
     # task, never per transform.
@@ -109,9 +111,24 @@ function _plan_at(ms::NTuple{2,Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, m
     # cuFINUFFT plan the seam returned for it.
     pts(n) = B == 1 ? similar(sx, Complex{T}, n) : similar(sx, Complex{T}, n, B)
     modes() = B == 1 ? similar(sx, Complex{T}, ms) : similar(sx, Complex{T}, (ms..., B))
+    # Only a batched solve needs the per-column machinery; a single field runs the scalar recurrence.
+    # The two norms are each held as both ranks over one allocation, since the point stack is rank 2
+    # and the mode stack rank 3.
+    batch = if solve && B > 1
+        nrm_p = similar(sx, T, 1, B)
+        nrm_m = similar(sx, T, 1, 1, B)
+        coef() = similar(sx, T, 1, 1, B)
+        host() = Vector{T}(undef, B)
+        ST.Plans.BatchedLSMRWork(nrm_p, reshape(nrm_p, 1, 1, B), nrm_m, reshape(nrm_m, 1, B),
+                                 coef(), coef(), coef(),
+                                 host(), host(), host(), host(), host(),
+                                 [ST.Plans.lsmr_init(zero(T), zero(T)) for _ in 1:B])
+    else
+        nothing
+    end
     return NUFFTScatteringPlan(
-        guru1, guru2, ms, M, B, one(T) / prod(ms), solve, maxiter, rtol, sx, sy, eps, nthreads,
-        pts(M), modes(), modes(), modes(), pts(M))
+        guru1, guru2, ms, M, B, one(T) / prod(ms), solve, maxiter, rtol, damp, sx, sy, eps, nthreads,
+        pts(M), modes(), modes(), modes(), modes(), pts(M), batch)
 end
 
 # The guru plans hold C pointers and reference-keeping arrays; the default `show` would walk all of
@@ -124,7 +141,7 @@ Base.show(io::IO, ::MIME"text/plain", p::NUFFTScatteringPlan) = show(io, p)
 ST.Plans.spectral_backend(::NUFFTScatteringPlan) = ST.Plans.FINUFFTBackend()
 ST.Plans.plan_points(p::NUFFTScatteringPlan) = (p.sx, p.sy)
 ST.Plans.plan_analysis(p::NUFFTScatteringPlan) =
-    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, eps = p.eps,
+    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp, eps = p.eps,
      nufft_nthreads = p.nthreads)
 
 # A guru plan carries the working buffers each execution writes through, so tasks cannot share one —
@@ -137,7 +154,7 @@ ST.Plans.plan_analysis(p::NUFFTScatteringPlan) =
 # every execution.
 ST.Plans.task_local_plan(p::NUFFTScatteringPlan{T}) where {T} =
     _plan_at(p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol, p.B,
-             ST.Plans.per_task_nthreads(p.nthreads))
+             ST.Plans.per_task_nthreads(p.nthreads), p.damp)
 
 ST.Plans.batch_width(p::NUFFTScatteringPlan) = p.B
 
@@ -147,11 +164,13 @@ ST.Plans.close_plan!(p::NUFFTScatteringPlan) =
 # Fast-path plan constructor filled into the core `ST.Plans.finufft_scattered_plan` declaration; the core
 # `scattered_planar_scattering` cascade builds it when `spectral` selects the FINUFFT backend.
 function ST.Plans.finufft_scattered_plan(x, y, ms::NTuple{2,Int}, ::Type{T}; period = nothing,
-                                      solve::Bool = false, maxiter::Int = 100, rtol::Real = 1.0e-8,
-                                      eps = nothing, ntrans::Int = 1,
+                                      solve::Bool = false, maxiter::Int = 100, eps = nothing,
+                                      rtol::Real = ST.Plans.default_solver_rtol(T, ST.Plans.FINUFFTBackend(), eps),
+                                      damp::Real = 0, ntrans::Int = 1,
                                       nufft_nthreads::Int = 0) where {T}
-    ε = eps === nothing ? (T === Float32 ? 1.0e-6 : 1.0e-9) : eps
-    return _make_plan(x, y, ms, T, period, ε, solve, maxiter, rtol, ntrans, nufft_nthreads)
+    ε = eps === nothing ? ST.Plans.default_nufft_eps(T) : eps
+    ST.Plans.warn_underdetermined(length(x), ms, solve, damp)
+    return _make_plan(x, y, ms, T, period, ε, solve, maxiter, rtol, ntrans, nufft_nthreads, damp)
 end
 
 # Synthesis: modes → points, scaled by 1/prod(ms) (ifft convention). For a Type-2 plan
@@ -173,18 +192,8 @@ end
 
 function ST.Plans.forward_transform!(Xmodes::AbstractArray{<:Any,3}, plan::NUFFTScatteringPlan,
                                      x_pts::AbstractMatrix)
-    plan.solve && throw(ArgumentError(
-        "the CG least-squares analysis (`solve = true`) has no batched form; build the plan with " *
-        "`ntrans = 1` or use `solve = false`."))
-    copyto!(plan.cj, x_pts)
-    ST.Plans.nufft_guru_exec!(plan.guru1, plan.cj, Xmodes)
-    return Xmodes
-end
-
-# Analysis: points → modes. Type-1 adjoint (fft-equivalent on a uniform grid) unless `solve`.
-function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NUFFTScatteringPlan, x_pts::AbstractVector)
     if plan.solve
-        _cg_solve!(Xmodes, plan, x_pts)
+        _lsmr_solve_batched!(Xmodes, plan, x_pts)
     else
         copyto!(plan.cj, x_pts)
         ST.Plans.nufft_guru_exec!(plan.guru1, plan.cj, Xmodes)
@@ -192,29 +201,46 @@ function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NUFFTScatteri
     return Xmodes
 end
 
-# CG least-squares inversion: find modes `f` with Type2(f) ≈ prod(ms)·x (so synthesis, = Type2/N,
-# recovers x). Solves the normal equations (A†A) f = A† (N·x) with A = Type-2, A† = Type-1.
-function _cg_solve!(f::AbstractMatrix, plan::NUFFTScatteringPlan{T}, x_pts::AbstractVector) where {T}
-    N = one(T) / plan.invN
-    copyto!(plan.cj, x_pts)
-    ST.Plans.nufft_guru_exec!(plan.guru1, plan.cj, plan.r)         # r = A†x  (modes)
-    plan.r .*= N                                               # r = A†(N·x) = rhs
-    fill!(f, zero(Complex{T}))
-    copyto!(plan.p, plan.r)
-    rsold = real(LinearAlgebra.dot(vec(plan.r), vec(plan.r)))
-    rs0 = rsold
-    rs0 == 0 && return f
-    @inbounds for _ in 1:plan.maxiter
-        ST.Plans.nufft_guru_exec!(plan.guru2, plan.p, plan.tmp_pts)    # tmp = A·p (Type-2: modes→points)
-        ST.Plans.nufft_guru_exec!(plan.guru1, plan.tmp_pts, plan.Ap)   # Ap  = A†A·p (Type-1: points→modes)
-        α = rsold / real(LinearAlgebra.dot(vec(plan.p), vec(plan.Ap)))
-        f .+= α .* plan.p
-        plan.r .-= α .* plan.Ap
-        rsnew = real(LinearAlgebra.dot(vec(plan.r), vec(plan.r)))
-        sqrt(rsnew) <= plan.rtol * sqrt(rs0) && break
-        plan.p .= plan.r .+ (rsnew / rsold) .* plan.p
-        rsold = rsnew
+# The whole stack shares one guru plan whose width is fixed, so it advances together and every scalar
+# in the recurrence becomes one per column — see `Plans.lsmr_solve_batched!`.
+function _lsmr_solve_batched!(f::AbstractArray{<:Any,3}, plan::NUFFTScatteringPlan{T},
+                              x_pts::AbstractMatrix) where {T}
+    info = ST.Plans.lsmr_solve_batched!(f,
+        (dst, src) -> ST.Plans.nufft_guru_exec!(plan.guru2, src, dst),   # A : modes → points
+        (dst, src) -> ST.Plans.nufft_guru_exec!(plan.guru1, src, dst),   # A†: points → modes
+        x_pts, plan.cj, plan.ls_t, plan.ls_v, plan.ls_w, plan.ls_h, plan.ls_hbar, plan.ls_batch;
+        damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
+        conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
+    ST.Plans._check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
+    f .*= one(T) / plan.invN
+    return f
+end
+
+# Analysis: points → modes. Type-1 adjoint (fft-equivalent on a uniform grid) unless `solve`.
+function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NUFFTScatteringPlan, x_pts::AbstractVector)
+    if plan.solve
+        _lsmr_solve!(Xmodes, plan, x_pts)
+    else
+        copyto!(plan.cj, x_pts)
+        ST.Plans.nufft_guru_exec!(plan.guru1, plan.cj, Xmodes)
     end
+    return Xmodes
+end
+
+# Least-squares inversion: find modes `f` with Type2(f) ≈ prod(ms)·x, so synthesis (Type-2 scaled by
+# `invN`) recovers `x`. `A f̃ = x` is solved and the answer scaled by `N` at the end rather than
+# handing the solver an `N`-inflated right-hand side — at `ms = 200²` that factor is 4·10⁴, enough to
+# put `Float32` squared quantities near `floatmax`, and it leaves the reported residual a misfit in
+# the field's own units.
+function _lsmr_solve!(f::AbstractMatrix, plan::NUFFTScatteringPlan{T}, x_pts::AbstractVector) where {T}
+    info = ST.Plans.lsmr_solve!(f,
+        (dst, src) -> ST.Plans.nufft_guru_exec!(plan.guru2, src, dst),   # A : modes → points
+        (dst, src) -> ST.Plans.nufft_guru_exec!(plan.guru1, src, dst),   # A†: points → modes
+        x_pts, plan.cj, plan.ls_t, plan.ls_v, plan.ls_w, plan.ls_h, plan.ls_hbar;
+        damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
+        conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
+    ST.Plans._check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
+    f .*= one(T) / plan.invN
     return f
 end
 

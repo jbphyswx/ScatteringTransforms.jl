@@ -176,31 +176,6 @@ instead of silently re-resolving to whatever that process happens to have loaded
 """
 plan_nufft(::Any) = SB.AutoSpectralBackend()
 
-"""
-    AnalysisNotConverged <: Exception
-
-Thrown when an iterative spherical analysis stops at `maxiter` still above its tolerance.
-
-Such a solve does not return an imprecise answer, it returns a meaningless one — conjugate gradients
-on the normal equations can grow without bound, so the coefficients may exceed the field by many
-orders of magnitude. Returning them silently would propagate that into every coefficient downstream,
-so the analysis refuses instead.
-"""
-struct AnalysisNotConverged <: Exception
-    residual::Float64
-    rtol::Float64
-    iters::Int
-    maxiter::Int
-    ntrans::Int
-end
-
-function Base.showerror(io::IO, e::AnalysisNotConverged)
-    print(io, "AnalysisNotConverged: spherical analysis reached relative residual ", e.residual,
-          " after ", e.iters, " of ", e.maxiter, " iterations, against rtol = ", e.rtol,
-          " (ntrans = ", e.ntrans, "). ")
-    return print(io, "The sampling may not resolve the band limit — accurate analysis needs roughly ",
-                 "M ≳ (lmax+1)² well-distributed points — or `maxiter` may be too small.")
-end
 
 # ---------------------------------------------------------------------------
 # FastTransforms' OpenMP thread count.
@@ -630,16 +605,56 @@ function _cg_gram!(a::AbstractVector, plan::DirectSHTSphericalPlan{T}) where {T}
     rsold = real(LinearAlgebra.dot(plan.r, plan.r))
     rs0 = rsold
     rs0 == 0 && return a
-    @inbounds for _ in 1:plan.maxiter
+    iters = 0
+    rel = one(T)
+    @inbounds for k in 1:plan.maxiter
+        iters = k
         LinearAlgebra.mul!(plan.Gp, plan.G, plan.p)
-        α = rsold / real(LinearAlgebra.dot(plan.p, plan.Gp))
+        curvature = real(LinearAlgebra.dot(plan.p, plan.Gp))
+        # The Gram matrix is positive definite only while the sampling determines every mode. Where it
+        # does not, the curvature reaches zero at the roundoff floor and `α` becomes `Inf`, which the
+        # iterate then absorbs — so the step is not taken and the last good iterate stands.
+        (isfinite(curvature) && curvature > 0) || break
+        α = rsold / curvature
         a .+= α .* plan.p
         plan.r .-= α .* plan.Gp
         rsnew = real(LinearAlgebra.dot(plan.r, plan.r))
-        sqrt(rsnew) <= plan.rtol * sqrt(rs0) && break
+        if !isfinite(rsnew)
+            rel = T(Inf)
+            break
+        end
+        rel = sqrt(rsnew) / sqrt(rs0)
+        if rel <= plan.rtol
+            # `plan.r` is updated by recurrence, so it drifts away from `rhs - G·a` as it shrinks —
+            # exactly far enough, on an ill-conditioned Gram matrix, to report a convergence that did
+            # not happen. Convergence is therefore never declared on it: the residual is recomputed
+            # once, and if the true one disagrees the iteration resumes from it with a fresh
+            # direction, since the accumulated one is conjugate to the stale residual, not this one.
+            # The extra product costs one iteration and is paid only when the recurrence claims to be
+            # finished.
+            LinearAlgebra.mul!(plan.Gp, plan.G, a)
+            plan.r .= plan.rhs .- plan.Gp
+            rsnew = real(LinearAlgebra.dot(plan.r, plan.r))
+            if !isfinite(rsnew)
+                rel = T(Inf)
+                break
+            end
+            rel = sqrt(rsnew) / sqrt(rs0)
+            rel <= plan.rtol && break
+            copyto!(plan.p, plan.r)
+            rsold = rsnew
+            continue
+        end
         plan.p .= plan.r .+ (rsnew / rsold) .* plan.p
         rsold = rsnew
     end
+    # Reports like the NUFSHT-backed analysis rather than returning a meaningless answer silently: on
+    # the normal equations of an under-determined point set, conjugate gradients grow without bound,
+    # and coefficients that exceed the field by orders of magnitude then propagate into every band.
+    (isfinite(rel) && rel <= plan.rtol) || throw(Plans.AnalysisNotConverged(
+        Float64(rel), Float64(plan.rtol), iters, plan.maxiter,
+        "In-core spherical analysis over $(plan.M) points at lmax = $(plan.lmax). Accurate " *
+        "inversion needs roughly M ≳ (lmax+1)² well-distributed points, or `maxiter` may be short."))
     return a
 end
 

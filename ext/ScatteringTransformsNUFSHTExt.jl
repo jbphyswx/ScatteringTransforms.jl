@@ -154,9 +154,10 @@ function ST.SphericalCore.sphere_coeffs!(C, plan::NUSHTSphericalPlan, field::Abs
     # A solve that stops at `maxiter` has not merely fallen short of `rtol` — the iterate can have
     # diverged, so `C` is unrelated to the field. The residual is the only thing that distinguishes
     # the two, and it is discarded unless it is checked here.
-    rel <= plan.rtol || throw(ST.SphericalCore.AnalysisNotConverged(Float64(rel),
-                                                                    Float64(plan.rtol), iters,
-                                                                    plan.maxiter, plan.plan.B))
+    rel <= plan.rtol || throw(ST.Plans.AnalysisNotConverged(
+        Float64(rel), Float64(plan.rtol), iters, plan.maxiter,
+        "ntrans = $(plan.plan.B). The sampling may not resolve the band limit — accurate analysis " *
+        "needs roughly M ≳ (lmax+1)² well-distributed points — or `maxiter` may be too small."))
     return C
 end
 

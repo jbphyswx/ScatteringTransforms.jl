@@ -110,5 +110,29 @@ Test.@testset "GPU vendor-neutral path (GPUBackend(KA.CPU()))" begin
         X = randn(M, 4)
         Test.@test Array(ScatteringTransforms.scattering_batch(dev, X)) ≈
                    Array(ScatteringTransforms.scattering_batch(host, X))
+
+        # `solve = true` on device points. The least-squares solve is written entirely in `copyto!`,
+        # `fill!`, `norm` and fused broadcasts precisely so it can run on a device array, and the
+        # batched form reduces through `mapreducedim!` into preallocated slices for the same reason —
+        # neither is exercised anywhere else on a device array type.
+        #
+        # Two conditions make this comparison well posed, and without them it is not. The field is
+        # band limited, so it lies in the span of the mode grid and the solve has an exact answer to
+        # converge to; white noise at `M > prod(ms)` leaves an irreducible residual instead. And the
+        # budget is above `prod(ms) = 256`, the step count at which the Krylov process terminates
+        # exactly, so the solve finishes rather than stopping on `maxiter`. An unconverged iterate is
+        # not reproducible to compare against: a threaded NUFFT accumulates its spreading in
+        # nondeterministic order, and an unconverged solve amplifies that by roughly `cond(A)²` —
+        # measured here as 2e-6 at `maxiter = 100` against 4e-10 once it converges.
+        fb = [1 + 0.7cos(2π * px[k]) + 0.5sin(4π * py[k]) for k in 1:M]
+        host_s = SP.build(Float64, px, py, ms, J; L = L, spectral = spec, solve = true,
+                          maxiter = 400)
+        dev_s = SP.build(Float64, px, py, ms, J, gpu; L = L, spectral = spec, solve = true,
+                         maxiter = 400)
+        Test.@test Array(ScatteringTransforms.Coefficients.flatten2d(dev_s(fb))) ≈
+                   Array(ScatteringTransforms.Coefficients.flatten2d(host_s(fb))) rtol = 1e-8
+        Xb = hcat([[1 + 0.7cos(2π * px[k]) + 0.5c * sin(4π * py[k]) for k in 1:M] for c in 1:4]...)
+        Test.@test Array(ScatteringTransforms.scattering_batch(dev_s, Xb)) ≈
+                   Array(ScatteringTransforms.scattering_batch(host_s, Xb)) rtol = 1e-8
     end
 end
