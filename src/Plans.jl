@@ -135,6 +135,461 @@ arithmetic hands every task a second library thread.
 per_task_nthreads(requested::Integer) = requested > 0 ? Int(requested) : 1
 
 """
+    AnalysisNotConverged <: Exception
+
+Thrown when an iterative analysis cannot produce a usable answer.
+
+Not thrown merely for stopping early: LSMR decreases both `‖r‖` and `‖A†r‖` monotonically, so an
+iterate truncated at `maxiter` is the best one seen and is returned. This is for the cases where the
+answer means nothing — a non-finite residual, or a conditioning estimate past what the precision can
+represent — because those propagate into every coefficient downstream, and a silent `NaN` is worse
+than a stop.
+"""
+struct AnalysisNotConverged <: Exception
+    residual::Float64
+    rtol::Float64
+    iters::Int
+    maxiter::Int
+    detail::String
+end
+
+function Base.showerror(io::IO, e::AnalysisNotConverged)
+    print(io, "AnalysisNotConverged: reached relative residual ", e.residual, " after ", e.iters,
+          " of ", e.maxiter, " iterations, against rtol = ", e.rtol, ". ")
+    return print(io, e.detail)
+end
+
+# `istop` 3 and 6 are the conditioning limits — `cond(A)` past `conlim`, and past what the precision
+# can represent. A non-finite residual means the recurrence itself broke down. Everything else,
+# `istop = 7` (ran out of iterations) included, is a usable iterate.
+function _check_solve(info, M::Integer, ms::Tuple, rtol::Real, maxiter::Integer)
+    (isfinite(info.normr) && info.istop != 3 && info.istop != 6) && return nothing
+    n = prod(ms)
+    advice = n > M ?
+        "The mode grid asks for more coefficients than there are samples ($n modes, $M points), so " *
+        "$(n - M) mode directions are constrained by no sample: reduce `ms`, supply more points, or " *
+        "raise `damp` to regularise them." :
+        "The sampling may not determine the mode grid ($n modes, $M points) — check the point set " *
+        "for gaps, reduce `ms`, or raise `damp`."
+    throw(AnalysisNotConverged(Float64(info.normr), Float64(rtol), info.iters, maxiter,
+                              "cond(A) ≈ $(Float32(info.condA)), istop = $(info.istop). " * advice))
+end
+
+# ---------------------------------------------------------------------------
+# Least-squares solver (LSMR, Fong & Saunders 2011)
+#
+# Finds modes `x` minimising `‖A x − b‖² + λ²‖x‖²` for the nonuniform transform pair `A` (modes →
+# points, Type-2) and `A†` (points → modes, Type-1), given only closures that apply them.
+#
+# LSMR rather than conjugate gradients on `A†A`: `A` is a nonuniform DFT, never Hermitian positive
+# definite at any size, so CG is only available on the normal equations — which costs the same two
+# transforms per iteration while squaring the condition number. On a rank-deficient point set (fewer
+# samples than modes, or a gap) that CG is semiconvergent: it reaches its best answer in a couple of
+# iterations and then diverges, unguarded, into `Inf − Inf`. LSMR decreases both `‖r‖` and `‖A†r‖`
+# monotonically, so stopping anywhere — including at `maxiter` — returns the best iterate seen, and its
+# stopping quantities come out of the recurrence scalars for free.
+# ---------------------------------------------------------------------------
+
+#     _sym_ortho(a, b) -> (c, s, r)
+#
+# Givens rotation zeroing `b` into `a`: `c*a + s*b == r`, `-s*a + c*b == 0`, with `r ≥ 0`.
+#
+# `hypot` rather than `sqrt(a^2 + b^2)`, which overflows for `a, b` above `sqrt(floatmax(T))` —
+# reachable in `Float32` on the norms this is fed.
+@inline function _sym_ortho(a::T, b::T) where {T<:Real}
+    r = hypot(a, b)
+    r == 0 && return (one(T), zero(T), r)
+    return (a / r, b / r, r)
+end
+
+"""
+    LSMRState{T}
+
+The scalar state of an LSMR iteration: the bidiagonalisation and rotation quantities, the running
+estimates of `‖r‖`, `‖A†r‖`, `‖A‖` and `cond(A)`, and the stopping code.
+
+`normA` accumulates `Σ(α² + β²)`, so it estimates the **Frobenius** norm of the bidiagonalisation
+built so far — bounded above by `‖A‖_F` and generally above `‖A‖₂`. That is what the optimality test
+`‖A†r‖ ≤ atol·normA·‖r‖` is scaled by, which makes it slightly conservative rather than wrong.
+
+Immutable and advanced by [`lsmr_step`](@ref), which touches no arrays — so the batched solver can hold
+one of these per column and drive them from the host while the vector work stays on the device.
+"""
+struct LSMRState{T<:Real}
+    alphabar::T
+    rho::T
+    rhobar::T
+    cbar::T
+    sbar::T
+    zeta::T
+    zetabar::T
+    betadd::T           # ‖r‖ estimation (Fong & Saunders §3.3)
+    betad::T
+    rhodold::T
+    tautildeold::T
+    thetatilde::T
+    d::T
+    normA2::T           # ‖A‖ and cond(A) estimation
+    maxrbar::T
+    minrbar::T
+    normb::T
+    normr::T
+    normar::T
+    normA::T
+    condA::T
+    istop::Int
+    iters::Int
+end
+
+"""
+    lsmr_init(alpha, beta, ::Type{T}) -> LSMRState{T}
+
+Initial state from the first bidiagonalisation pair, `beta = ‖b‖` and `alpha = ‖A†b/beta‖`.
+"""
+function lsmr_init(alpha::T, beta::T) where {T<:Real}
+    return LSMRState{T}(alpha, one(T), one(T), one(T), zero(T), zero(T), alpha * beta,
+                        beta, zero(T), one(T), zero(T), zero(T), zero(T),
+                        alpha * alpha, zero(T), typemax(T),
+                        beta, beta, alpha * beta, sqrt(alpha * alpha), one(T), 0, 0)
+end
+
+"""
+    lsmr_step(state, alpha, beta, damp, atol, btol, ctol) -> (state, chbar, cx, ch)
+
+Advance the scalar recurrence one iteration and return the three coefficients the vector updates need:
+
+    hbar .= h .+ chbar .* hbar
+    x    .= x .+ cx    .* hbar
+    h    .= v .+ ch    .* h
+
+`alpha`/`beta` are this iteration's bidiagonalisation norms. `damp` is the Tikhonov `λ`, which enters
+only through one extra rotation, so `λ = 0` costs a rotation of a zero and nothing else.
+"""
+function lsmr_step(st::LSMRState{T}, alpha::T, beta::T, damp::T,
+                   atol::T, btol::T, ctol::T) where {T<:Real}
+    # Damping folds in as a rotation of (alphabar, λ) — the augmented system [A; λI] without forming it.
+    chat, shat, alphahat = _sym_ortho(st.alphabar, damp)
+
+    rhoold = st.rho
+    c, s, rho = _sym_ortho(alphahat, beta)
+    thetanew = s * alpha
+    alphabar = c * alpha
+
+    rhobarold = st.rhobar
+    zetaold = st.zeta
+    thetabar = st.sbar * rho
+    rhotemp = st.cbar * rho
+    cbar, sbar, rhobar = _sym_ortho(st.cbar * rho, thetanew)
+    zeta = cbar * st.zetabar
+    zetabar = -sbar * st.zetabar
+
+    chbar = -(thetabar * rho / (rhoold * rhobarold))
+    cx = zeta / (rho * rhobar)
+    ch = -(thetanew / rho)
+
+    # ‖r‖ without recomputing it: the residual of the bidiagonal subproblem, which stays tied to the
+    # true residual instead of drifting from it the way a recursively updated `r` does.
+    betaacute = chat * st.betadd
+    betacheck = -shat * st.betadd
+    betahat = c * betaacute
+    betadd = -s * betaacute
+
+    thetatildeold = st.thetatilde
+    ctildeold, stildeold, rhotildeold = _sym_ortho(st.rhodold, thetabar)
+    thetatilde = stildeold * rhobar
+    rhodold = ctildeold * rhobar
+    betad = -stildeold * st.betad + ctildeold * betahat
+
+    tautildeold = (zetaold - thetatildeold * st.tautildeold) / rhotildeold
+    taud = (zeta - thetatilde * tautildeold) / rhodold
+    d = st.d + betacheck * betacheck
+    normr = sqrt(d + (betad - taud)^2 + betadd^2)
+
+    normA2 = st.normA2 + beta * beta
+    normA = sqrt(normA2)
+    normA2 += alpha * alpha
+
+    maxrbar = max(st.maxrbar, rhobarold)
+    # `rhobarold` is meaningless on the first pass (it is the initial 1), so cond(A) ignores it.
+    minrbar = st.iters == 0 ? st.minrbar : min(st.minrbar, rhobarold)
+    condA = max(maxrbar, rhotemp) / min(minrbar, rhotemp)
+
+    normar = abs(zetabar)
+
+    # `1 + t <= 1` are the "as small as this precision can express" forms, free to test.
+    test1 = st.normb == 0 ? zero(T) : normr / st.normb
+    test2 = (normA * normr) == 0 ? T(Inf) : normar / (normA * normr)
+    test3 = inv(condA)
+    istop = 0
+    (1 + test3 <= 1) && (istop = 6)
+    (1 + test2 <= 1) && (istop = 5)
+    (test3 <= ctol) && (istop = 3)
+    (test2 <= atol) && (istop = 2)
+    (test1 <= btol) && (istop = 1)
+
+    return (LSMRState{T}(alphabar, rho, rhobar, cbar, sbar, zeta, zetabar,
+                         betadd, betad, rhodold, tautildeold, thetatilde, d,
+                         normA2, maxrbar, minrbar,
+                         st.normb, normr, normar, normA, condA, istop, st.iters + 1),
+            chbar, cx, ch)
+end
+
+"""
+    lsmr_solve!(x, applyA!, applyAt!, b, u, t, v, w, h, hbar;
+                damp, atol, btol, conlim, maxiter) -> (; istop, iters, normr, normar, normA, condA)
+
+Minimise `‖A x − b‖² + damp²‖x‖²` in place, where `applyA!(dst_pts, src_modes)` applies `A` and
+`applyAt!(dst_modes, src_pts)` applies `A†`.
+
+`b` is read only. `u`/`t` are point-space scratch and `v`/`w`/`h`/`hbar` mode-space scratch; the two
+destinations `t` and `w` exist because the transforms overwrite rather than accumulate. Every array
+operation is `copyto!`, `fill!`, `norm` or a fused broadcast, so the buffers may live on a device.
+
+`istop` says why it stopped: 1 the residual met `btol`, 2 the least-squares optimality met `atol`,
+3 the condition estimate hit `conlim`, 5/6 those quantities reached the precision floor, 7 `maxiter`.
+Stopping at 7 is not a failure — both `‖r‖` and `‖A†r‖` decrease monotonically, so the iterate is the
+best one seen.
+"""
+function lsmr_solve!(x, applyA!::FA, applyAt!::FT, b, u, t, v, w, h, hbar;
+                     damp::Real = 0, atol::Real, btol::Real, conlim::Real,
+                     maxiter::Integer) where {FA, FT}
+    T = real(eltype(x))
+    λ = T(damp)
+    at = T(atol)
+    bt = T(btol)
+    ct = conlim > 0 ? T(inv(conlim)) : zero(T)
+
+    fill!(x, zero(eltype(x)))
+    copyto!(u, b)
+    beta = T(LinearAlgebra.norm(u))
+    beta > 0 && (u .*= inv(beta))
+    applyAt!(v, u)
+    alpha = T(LinearAlgebra.norm(v))
+    alpha > 0 && (v .*= inv(alpha))
+
+    # A zero right-hand side, or a right-hand side entirely in the null space of `A†`, leaves `x = 0`
+    # as the exact answer — there is no direction to descend.
+    (beta == 0 || alpha == 0) &&
+        return (istop = 0, iters = 0, normr = beta, normar = zero(T), normA = alpha, condA = one(T))
+
+    copyto!(h, v)
+    fill!(hbar, zero(eltype(hbar)))
+    state = lsmr_init(alpha, beta)
+    iters = 0
+
+    for k in 1:maxiter
+        iters = k
+        applyA!(t, v)
+        @. u = t - alpha * u
+        beta = T(LinearAlgebra.norm(u))
+        if beta > 0
+            u .*= inv(beta)
+            applyAt!(w, u)
+            @. v = w - beta * v
+            alpha = T(LinearAlgebra.norm(v))
+            alpha > 0 && (v .*= inv(alpha))
+        end
+
+        state, chbar, cx, ch = lsmr_step(state, alpha, beta, λ, at, bt, ct)
+
+        @. hbar = h + chbar * hbar
+        @. x = x + cx * hbar
+        @. h = v + ch * h
+
+        state.istop == 0 || break
+    end
+    istop = state.istop == 0 ? 7 : state.istop
+    return (istop = istop, iters = iters, normr = state.normr, normar = state.normar,
+            normA = state.normA, condA = state.condA)
+end
+
+"""
+    BatchedLSMRWork{A2,A3,HV,SV}
+
+Per-column bookkeeping for [`lsmr_solve_batched!`](@ref): the two reduction targets, the three
+coefficient arrays the vector updates broadcast against, host mirrors of each of those five, and one
+[`LSMRState`](@ref) per column.
+
+The device arrays are `(1, B)` over points and `(1, 1, B)` over modes so they broadcast against the
+stacks with no reshape in the loop, and they are preallocated because `sum(abs2, x; dims = …)`
+allocates on every call. Each norm is held twice — as both ranks, over the same memory — because the
+point stack is rank 2 and the mode stack rank 3, and a `(1, 1, B)` array broadcast against `(M, B)`
+would expand to `(M, B, B)` rather than scaling columns. Each *quantity* nonetheless gets its own
+buffer: the recurrence needs this iteration's `alpha` while the previous one is still live.
+"""
+struct BatchedLSMRWork{A2, A3, HV, SV}
+    nrm_p::A2      # (1, B)        per-column ‖u‖, i.e. `beta`
+    nrm_p3::A3     # the same memory as (1, 1, B), to broadcast `beta` against the mode stack
+    nrm_m::A3      # (1, 1, B)     per-column ‖v‖, i.e. `alpha`
+    nrm_m2::A2     # the same memory as (1, B), to broadcast `alpha` against the point stack
+    c_hbar::A3
+    c_x::A3
+    c_h::A3
+    beta::HV       # host mirrors of the norms …
+    alpha::HV
+    chbar::HV      # … and of the coefficients on their way back to the device
+    cx::HV
+    ch::HV
+    states::SV
+end
+
+# Per-column `‖·‖`, fused and allocation-free: `mapreducedim!` over the leading axes, then a
+# broadcast `sqrt` in place — the idiom `Batched.slice_modulus_mean!` already uses.
+function _col_norm!(dst, a)
+    fill!(dst, zero(eltype(dst)))
+    Base.mapreducedim!(abs2, +, dst, a)
+    @. dst = sqrt(dst)
+    return dst
+end
+
+# `x ./= nrm` per column, leaving a zero-norm column alone rather than dividing by zero: such a column
+# must stay finite, because the transform it shares with the others would otherwise be handed an `Inf`.
+_col_scale!(x, nrm) = (@. x = x * ifelse(nrm > 0, inv(nrm), zero(eltype(nrm))); x)
+
+"""
+    lsmr_solve_batched!(x, applyA!, applyAt!, b, u, t, v, w, h, hbar, work;
+                        damp, atol, btol, conlim, maxiter) -> (; istop, iters, normr, normar, …)
+
+[`lsmr_solve!`](@ref) over a stack of `B` right-hand sides sharing one operator.
+
+A batched NUFFT plan's width is fixed when it is built, so no column can be transformed on its own and
+the stack must advance together — which turns every scalar in the recurrence into one per column. They
+advance on the host through the same [`lsmr_step`](@ref) the single-column path uses, and return to the
+device as three coefficient arrays.
+
+A column that has stopped is *frozen*: its coefficients go to zero, so it contributes nothing further.
+It is not compacted out of the stack, because the transform width cannot shrink — removing it would
+save no work while costing the bookkeeping that makes a permuted, partially-retired stack correct.
+
+`istop`/`normr`/`normar` describe the worst column, so a caller that checks them sees the whole stack.
+"""
+function lsmr_solve_batched!(x, applyA!::FA, applyAt!::FT, b, u, t, v, w, h, hbar,
+                             work::BatchedLSMRWork; damp::Real = 0, atol::Real, btol::Real,
+                             conlim::Real, maxiter::Integer) where {FA, FT}
+    T = real(eltype(x))
+    λ = T(damp); at = T(atol); bt = T(btol)
+    ct = conlim > 0 ? T(inv(conlim)) : zero(T)
+    B = length(work.states)
+
+    fill!(x, zero(eltype(x)))
+    copyto!(u, b)
+    _col_norm!(work.nrm_p, u)
+    _col_scale!(u, work.nrm_p)
+    copyto!(work.beta, work.nrm_p)
+    applyAt!(v, u)
+    _col_norm!(work.nrm_m, v)
+    _col_scale!(v, work.nrm_m)
+    copyto!(work.alpha, work.nrm_m)
+
+    @inbounds for c in 1:B
+        work.states[c] = lsmr_init(work.alpha[c], work.beta[c])
+    end
+    copyto!(h, v)
+    fill!(hbar, zero(eltype(hbar)))
+    iters = 0
+
+    for k in 1:maxiter
+        iters = k
+        # `nrm_m` still holds the previous iteration's `alpha` here, which is what the `u` update
+        # needs; `nrm_p` then becomes this iteration's `beta` before the `v` update reads it.
+        applyA!(t, v)
+        @. u = t - work.nrm_m2 * u
+        _col_norm!(work.nrm_p, u)
+        _col_scale!(u, work.nrm_p)
+        copyto!(work.beta, work.nrm_p)
+        applyAt!(w, u)
+        @. v = w - work.nrm_p3 * v
+        _col_norm!(work.nrm_m, v)
+        _col_scale!(v, work.nrm_m)
+        copyto!(work.alpha, work.nrm_m)
+
+        done = true
+        @inbounds for c in 1:B
+            if work.states[c].istop != 0
+                work.chbar[c] = zero(T); work.cx[c] = zero(T); work.ch[c] = zero(T)
+                continue
+            end
+            st, chbar, cx, ch = lsmr_step(work.states[c], work.alpha[c], work.beta[c], λ, at, bt, ct)
+            work.states[c] = st
+            work.chbar[c] = chbar
+            work.cx[c] = cx
+            work.ch[c] = ch
+            done &= st.istop != 0
+        end
+        copyto!(work.c_hbar, work.chbar)
+        copyto!(work.c_x, work.cx)
+        copyto!(work.c_h, work.ch)
+
+        @. hbar = h + work.c_hbar * hbar
+        @. x = x + work.c_x * hbar
+        @. h = v + work.c_h * h
+
+        done && break
+    end
+
+    worst = argmax(c -> work.states[c].normar, 1:B)
+    st = work.states[worst]
+    return (istop = st.istop == 0 ? 7 : st.istop, iters = iters, normr = st.normr,
+            normar = st.normar, normA = st.normA, condA = st.condA)
+end
+
+"""
+    default_nufft_eps(::Type{T}) -> Float64
+
+The NUFFT tolerance a fast backend uses when the caller names none: `1e-6` for `Float32`, `1e-9`
+otherwise. One definition, because both fast backends must ask their library for the same accuracy.
+"""
+default_nufft_eps(::Type{T}) where {T} = real(float(T)) === Float32 ? 1.0e-6 : 1.0e-9
+
+"""
+    default_solver_rtol(::Type{T}, spectral, eps) -> T
+
+Stopping tolerance for the scattered least-squares solve, chosen from the accuracy of the transform
+the solve is built on rather than from a fixed constant.
+
+Dispatched on the spectral backend, exactly as `SphericalCore.default_rtol` is: the in-core direct
+summation evaluates an exact conjugate pair, so the arithmetic is the only limit and `sqrt(Base.eps(T))`
+is the conventional least-squares target. A fast NUFFT's Type-1 and Type-2 are adjoints of each other
+only to about `eps`, so the operator the solver sees is Hermitian only to that accuracy and a target
+below it asks for something the transform cannot express — which is how a `Float32` plan came to be
+asked for `1e-8`, two orders under its own `1e-6`.
+
+`Base.eps` is spelled out because `eps` is a keyword-argument name in every plan constructor here.
+"""
+default_solver_rtol(::Type{T}, ::SB.AbstractDirectSumSpectralBackend, eps) where {T} =
+    T(sqrt(Base.eps(real(float(T)))))
+default_solver_rtol(::Type{T}, ::SB.AbstractSpectralBackend, eps) where {T} =
+    T(max(10 * Float64(eps === nothing ? default_nufft_eps(T) : eps),
+          sqrt(Base.eps(real(float(T))))))
+
+"""
+    warn_underdetermined(M, ms, solve, damp) -> nothing
+
+Warn, once per session, that a solve has more modes than samples and no damping to resolve them.
+
+With `prod(ms) > M` at least `prod(ms) - M` mode directions are constrained by no sample, so the
+least-squares problem has no unique solution and the answer depends on the regularisation. LSMR
+returns the minimum-norm iterate and its early termination is itself a regulariser, which is why
+this warns rather than throws — but the caller is the only one who can say whether that is the
+answer they wanted, or whether they should coarsen `ms`, add samples, or set `damp` for explicit
+Tikhonov. Both numbers are named because the ratio is what decides how ill-posed the solve is.
+
+No `λ` is chosen for the caller. Sweeping `λ` against a dense Tikhonov reference on this operator
+shows why: on quasi-uniform points `A` is a scaled isometry and every `λ` across six decades returns
+the same coefficients to `1e-14`, while on clustered points a `λ` small enough to be safe changes
+neither the residual nor `‖x‖` in the first five digits. A default that cannot be observed to do
+anything is worse than none, since it would still be a number the caller has to reason about.
+"""
+function warn_underdetermined(M::Integer, ms::Tuple, solve::Bool, damp::Real)
+    n = prod(ms)
+    (!solve || n <= M || damp > 0) && return nothing
+    @warn "Scattered solve is underdetermined: $n modes from $M samples leaves at least $(n - M) " *
+          "mode directions unconstrained. LSMR returns the minimum-norm solution; pass `damp` for " *
+          "Tikhonov regularisation, or reduce `ms`." maxlog = 1
+    return nothing
+end
+
+"""
     batch_width(plan) -> Int
 
 Number of co-located fields this plan transforms per execution — `1` unless it was built for a batch.
@@ -265,13 +720,13 @@ make_plan(::SB.AbstractAutoSpectralBackend, ::Type{T}, dims; nbatch::Int = 1, kw
     DirectSumPlan(T, dims; nbatch = nbatch)
 
 """
-    plan_analysis(plan) -> (; solve, maxiter, rtol, eps, nufft_nthreads)
+    plan_analysis(plan) -> (; solve, maxiter, rtol, damp, eps, nufft_nthreads)
 
 How a scattered-planar plan turns samples into modes, in the form its constructor takes.
 
 Carried rather than re-derived, because none of it follows from the points: a plan rebuilt on another
-process without `solve` analyses with the plain Type-1 adjoint where the original ran a
-conjugate-gradient least-squares inversion, and on irregular sampling those are different transforms,
+process without `solve` analyses with the plain Type-1 adjoint where the original ran a least-squares
+inversion, and on irregular sampling those are different transforms,
 not one slightly less accurate than the other. `eps` is `nothing` for the exact direct sum, which has
 no tolerance to honour.
 """
@@ -306,10 +761,11 @@ NUDFT; [`FINUFFTBackend`](@ref) and [`NonuniformFFTsBackend`](@ref) select a spe
 library). The direct sum accepts it and ignores it, as it does `eps`, so a caller can pass one set of
 options without first knowing which backend it will get.
 """
-make_scattered_plan(::SB.AbstractDirectSumSpectralBackend, x, y, ms, ::Type{T}; period = nothing,
-                    solve::Bool = false, maxiter::Int = 100, rtol::Real = 1.0e-8,
+make_scattered_plan(spectral::SB.AbstractDirectSumSpectralBackend, x, y, ms, ::Type{T};
+                    period = nothing, solve::Bool = false, maxiter::Int = 100,
+                    rtol::Real = default_solver_rtol(T, spectral, eps), damp::Real = 0,
                     eps = nothing, ntrans::Int = 1, nufft_nthreads::Int = 0) where {T} =
-    DirectNUFFTPlan(x, y, ms, T; period, solve, maxiter, rtol, ntrans)
+    DirectNUFFTPlan(x, y, ms, T; period, solve, maxiter, rtol, damp, ntrans)
 
 make_scattered_plan(::FINUFFTBackend, x, y, ms, ::Type{T}; kwargs...) where {T} =
     finufft_scattered_plan(x, y, ms, T; kwargs...)
@@ -548,7 +1004,7 @@ end
 # The `O(M·prod(ms))` reference that lets `scattered_planar_scattering` run with no external NUFFT
 # library — the nonuniform counterpart of `DirectSumPlan`. Same numeric contract as the fast
 # `NUFFTScatteringPlan`s: `forward_transform!` is the Type-1 adjoint (points → uniform mode grid),
-# or a conjugate-gradient least-squares inversion when `solve`; `inverse_transform!` is the Type-2
+# or an LSMR least-squares inversion when `solve`; `inverse_transform!` is the Type-2
 # synthesis (modes → points) scaled by `1/prod(ms)`. The mode grid uses FFT ordering, so on a
 # uniform `0:m-1` grid these reduce exactly to `fft`/`ifft` and the lattice matches the wavelet
 # bank's `fftfreq` layout.
@@ -574,6 +1030,7 @@ struct DirectNUFFTPlan{T, EM <: AbstractMatrix{Complex{T}},
     solve::Bool
     maxiter::Int
     rtol::T
+    damp::T                 # Tikhonov λ; 0 unless the mode grid is over-specified
     sx::RV                  # (M) points on the 2π-periodic domain, retained so the plan can be
     sy::RV                  #     rebuilt elsewhere — see `plan_points`
     Ex::EM                  # (ms[1], M)  e^{-i f₁[k]·sx_n}
@@ -583,10 +1040,11 @@ struct DirectNUFFTPlan{T, EM <: AbstractMatrix{Complex{T}},
     cj::CV                  # (M) values buffer (shared by Type-1/Type-2)
     Sbuf::EM                # (M, ms[2]) Type-1 scratch
     T1::EM                  # (ms[1], M) Type-2 scratch
-    r::EM                   # (ms) CG residual / rhs
-    p::EM                   # (ms) CG search direction
-    Ap::EM                  # (ms) CG A†A·p
-    tmp_pts::CV             # (M) CG scratch (points)
+    ls_v::EM                # (ms) solver scratch: the four LSMR mode vectors. `cj`/`ls_t` are its
+    ls_w::EM                #      two point vectors — the transforms overwrite rather than
+    ls_h::EM                #      accumulate, so `A·v` and `A†·u` each need a destination.
+    ls_hbar::EM
+    ls_t::CV                # (M)
 end
 
 # `ntrans` is accepted so a caller can request a batch width without first asking which backend it
@@ -596,10 +1054,12 @@ end
 # this plan does not use.
 function DirectNUFFTPlan(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, ::Type{T};
                          period = nothing, solve::Bool = false, maxiter::Int = 100,
-                         rtol::Real = 1.0e-8, eps = nothing, ntrans::Int = 1,
+                         rtol::Real = default_solver_rtol(T, SB.DirectSumSpectralBackend(), nothing),
+                         damp::Real = 0, eps = nothing, ntrans::Int = 1,
                          nufft_nthreads::Int = 0) where {T}
     M = length(x)
     length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
+    warn_underdetermined(M, ms, solve, damp)
     xmin, ymin = T(minimum(x)), T(minimum(y))
     # Default period so a uniform 0:m-1 grid (span m-1) maps to the exact DFT nodes 2π·(0:m-1)/m.
     px = period === nothing ? (T(maximum(x)) - xmin) * ms[1] / (ms[1] - 1) : T(period[1])
@@ -610,12 +1070,12 @@ function DirectNUFFTPlan(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int
     Ex = Complex{T}[cis(-f1[k] * sx[n]) for k in 1:ms[1], n in 1:M]
     Ey = Complex{T}[cis(-f2[k] * sy[n]) for n in 1:M, k in 1:ms[2]]
     return DirectNUFFTPlan{T, Matrix{Complex{T}}, Vector{Complex{T}}, Vector{T}}(
-        ms, M, one(T) / prod(ms), solve, maxiter, T(rtol), sx, sy,
+        ms, M, one(T) / prod(ms), solve, maxiter, T(rtol), T(damp), sx, sy,
         Ex, Ey, conj.(Ex), Matrix(conj.(transpose(Ey))),
         Vector{Complex{T}}(undef, M),
         Matrix{Complex{T}}(undef, M, ms[2]), Matrix{Complex{T}}(undef, ms[1], M),
         Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms), Matrix{Complex{T}}(undef, ms),
-        Vector{Complex{T}}(undef, M))
+        Matrix{Complex{T}}(undef, ms), Vector{Complex{T}}(undef, M))
 end
 
 Base.show(io::IO, p::DirectNUFFTPlan{T}) where {T} =
@@ -625,9 +1085,10 @@ spectral_backend(::DirectNUFFTPlan) = SB.DirectSumSpectralBackend()
 
 function task_local_plan(p::DirectNUFFTPlan{T, EM, CV, RV}) where {T, EM, CV, RV}
     return DirectNUFFTPlan{T, EM, CV, RV}(
-        p.ms, p.M, p.invN, p.solve, p.maxiter, p.rtol, p.sx, p.sy, p.Ex, p.Ey, p.Exc, p.Eyc,
-        similar(p.cj), similar(p.Sbuf), similar(p.T1), similar(p.r), similar(p.p), similar(p.Ap),
-        similar(p.tmp_pts))
+        p.ms, p.M, p.invN, p.solve, p.maxiter, p.rtol, p.damp, p.sx, p.sy,
+        p.Ex, p.Ey, p.Exc, p.Eyc,
+        similar(p.cj), similar(p.Sbuf), similar(p.T1),
+        similar(p.ls_v), similar(p.ls_w), similar(p.ls_h), similar(p.ls_hbar), similar(p.ls_t))
 end
 
 """
@@ -642,7 +1103,8 @@ plan_points(p::DirectNUFFTPlan) = (p.sx, p.sy)
 # Direct summation is exact and single-threaded by construction, so it reports no tolerance and no
 # thread count — both are `nothing`/`0`, the values its constructor ignores.
 plan_analysis(p::DirectNUFFTPlan) =
-    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, eps = nothing, nufft_nthreads = 0)
+    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp, eps = nothing,
+     nufft_nthreads = 0)
 
 # Type-1 (points → modes): X = Ex · (c ⊙ Ey), all preallocated.
 function _nudft_type1!(X::AbstractMatrix, plan::DirectNUFFTPlan, c::AbstractVector)
@@ -671,7 +1133,7 @@ inverse_transform!(out_pts::AbstractVector, plan::DirectNUFFTPlan, Xmodes::Abstr
 
 function forward_transform!(Xmodes::AbstractMatrix, plan::DirectNUFFTPlan, x_pts::AbstractVector)
     if plan.solve
-        _cg_solve_nudft!(Xmodes, plan, x_pts)
+        _lsmr_solve_nudft!(Xmodes, plan, x_pts)
     else
         copyto!(plan.cj, x_pts)
         _nudft_type1!(Xmodes, plan, plan.cj)
@@ -679,29 +1141,27 @@ function forward_transform!(Xmodes::AbstractMatrix, plan::DirectNUFFTPlan, x_pts
     return Xmodes
 end
 
-# CG least-squares inversion of the normal equations (A†A)f = A†(N·x), A = Type-2, A† = Type-1 — so
-# synthesis (Type-2/N) of the recovered modes reproduces the sampled values. Mirrors the FINUFFT path.
-function _cg_solve_nudft!(f::AbstractMatrix, plan::DirectNUFFTPlan{T}, x_pts::AbstractVector) where {T}
-    N = one(T) / plan.invN
-    copyto!(plan.cj, x_pts)
-    _nudft_type1!(plan.r, plan, plan.cj)                       # r = A†x  (modes)
-    plan.r .*= N                                               # r = A†(N·x) = rhs
-    fill!(f, zero(Complex{T}))
-    copyto!(plan.p, plan.r)
-    rsold = real(LinearAlgebra.dot(vec(plan.r), vec(plan.r)))
-    rs0 = rsold
-    rs0 == 0 && return f
-    @inbounds for _ in 1:plan.maxiter
-        _nudft_type2!(plan.tmp_pts, plan, plan.p)              # tmp = A·p    (points)
-        _nudft_type1!(plan.Ap, plan, plan.tmp_pts)             # Ap  = A†A·p  (modes)
-        α = rsold / real(LinearAlgebra.dot(vec(plan.p), vec(plan.Ap)))
-        f .+= α .* plan.p
-        plan.r .-= α .* plan.Ap
-        rsnew = real(LinearAlgebra.dot(vec(plan.r), vec(plan.r)))
-        sqrt(rsnew) <= plan.rtol * sqrt(rs0) && break
-        plan.p .= plan.r .+ (rsnew / rsold) .* plan.p
-        rsold = rsnew
-    end
+# Least-squares inversion: find modes `f` with `A f ≈ N·x`, `A` = Type-2, `A† ` = Type-1, so that
+# synthesis (Type-2 scaled by `invN`) reproduces the samples.
+#
+# `A f̃ = x` is solved and the answer scaled by `N` afterwards, rather than feeding the solver an
+# `N`-inflated right-hand side: at `ms = 200²` that factor is 4·10⁴, which in `Float32` puts the
+# squared quantities within reach of `floatmax` — and it makes the reported residual a misfit in the
+# field's own units.
+function _lsmr_solve_nudft!(f::AbstractMatrix, plan::DirectNUFFTPlan{T},
+                            x_pts::AbstractVector) where {T}
+    info = lsmr_solve!(f,
+                       (dst, src) -> _nudft_type2!(dst, plan, src),
+                       (dst, src) -> _nudft_type1!(dst, plan, src),
+                       x_pts, plan.cj, plan.ls_t,
+                       plan.ls_v, plan.ls_w, plan.ls_h, plan.ls_hbar;
+                       # A relative perturbation `eps` in the data becomes a relative error up to
+                       # `cond(A)·eps` in the solution, so at `cond(A) = 1/eps` the smallest singular
+                       # direction carries nothing this precision can represent. That is the limit.
+                       damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
+                       conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
+    _check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
+    f .*= one(T) / plan.invN
     return f
 end
 

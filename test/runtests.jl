@@ -999,6 +999,9 @@ end
 # Structured-grid spherical scattering (fast SHT) — completes the grid-support matrix.
 include("test_spherical_sht.jl")
 
+# The least-squares solver against LAPACK on dense operators, before any transform is involved.
+include("test_lsmr.jl")
+
 # Scattered / nonuniform planar scattering (NUFFT) — completes the Cartesian side of the matrix.
 include("test_scattered_planar.jl")
 

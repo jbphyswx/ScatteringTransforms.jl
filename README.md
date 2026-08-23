@@ -148,9 +148,10 @@ not quantized orientation bins.
 ### Nonuniform / scattered planar grids
 Off-lattice / gappy planar data (scattered `(x, y)` points) is scattered onto a uniform Fourier mode
 grid by a nonuniform DFT (`scattered_planar_scattering`), where the ordinary Morlet wavelet bank lives;
-on a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` gives the exact
-band-limited (CG least-squares) inversion for irregular sampling. The default is an in-core exact direct
-NUDFT (no dependencies); `using FINUFFT` enables the faster NUFFT path.
+on a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` recovers the
+band-limited coefficients for irregular sampling by LSMR least squares — minimum-norm where the
+samples do not determine the modes, with `damp` for explicit Tikhonov regularisation. The default is
+an in-core exact direct NUDFT (no dependencies); `using FINUFFT` enables the faster NUFFT path.
 
 ![Scattered planar scattering](docs/src/assets/scattered_planar.png)
 

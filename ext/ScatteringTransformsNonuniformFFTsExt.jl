@@ -4,7 +4,7 @@ module ScatteringTransformsNonuniformFFTsExt
     ScatteringTransformsNonuniformFFTsExt — NonuniformFFTs.jl fast path for scattered planar scattering
 
 The second fast spectral plan for the scattered-planar cascade (`ScatteredPlanar`), alongside
-FINUFFT. Analysis is a Type-1 NUFFT (points → modes) or a conjugate-gradient least-squares solve;
+FINUFFT. Analysis is a Type-1 NUFFT (points → modes) or an LSMR least-squares solve;
 synthesis is a Type-2 NUFFT (modes → points) scaled by `1/prod(ms)`. It implements the same
 `ST.Plans.AbstractScatteringPlan` interface as the in-core `ST.Plans.DirectNUFFTPlan`, so the
 cascade is identical — only the transform underneath changes.
@@ -23,16 +23,23 @@ and the tests would not catch it because the extension only loads with its trigg
 """
 
 using NonuniformFFTs: NonuniformFFTs
-using LinearAlgebra: LinearAlgebra
 using ScatteringTransforms: ScatteringTransforms as ST
 
 """
     NonuniformFFTsScatteringPlan{T,P,CV,MM,RV}
 
 Scattered-planar spectral plan backed by a `NonuniformFFTs.PlanNUFFT` over fixed points `(x, y)`
-and a uniform mode grid `ms`. `solve` selects the conjugate-gradient least-squares inversion over
-the plain Type-1 adjoint; `r`/`p`/`Ap`/`tmp_pts` are that solver's workspace, so a solve allocates
-nothing per call.
+and a uniform mode grid `ms`. `solve` selects the least-squares inversion over the plain Type-1
+adjoint; the `ls_*` fields are that solver's workspace, so the solve adds nothing per call beyond the
+transforms it issues.
+
+Those transforms do allocate, which makes this the one backend where a solve allocates in steady
+state: 880 B per execution and 152 880 B for a 100-iteration solve at `M = 500`, `ms = (16, 16)`.
+An allocation profile attributes it to a `Threads.@threads` region in NonuniformFFTs' deconvolution
+step, which builds its task scaffolding — a `Task`, a task list, a lock and a condition — on every
+call, including at one thread where it parallelises nothing. The FINUFFT plan measures exactly zero
+on the same case because its execution enters no Julia threaded region; its library threads are
+pooled rather than created per call.
 """
 struct NonuniformFFTsScatteringPlan{T, P, CV <: AbstractVector{Complex{T}},
                                     MM <: AbstractMatrix{Complex{T}},
@@ -44,6 +51,7 @@ struct NonuniformFFTsScatteringPlan{T, P, CV <: AbstractVector{Complex{T}},
     solve::Bool
     maxiter::Int
     rtol::T
+    damp::T                 # Tikhonov λ; 0 unless the mode grid is over-specified
     sx::RV                  # (M) points already scaled to the 2π-periodic domain, retained so a
     sy::RV                  #     task can build its own plan
     eps::T                  # requested relative tolerance, under the constructor's own keyword name.
@@ -51,10 +59,11 @@ struct NonuniformFFTsScatteringPlan{T, P, CV <: AbstractVector{Complex{T}},
                             #     `_half_support` rather than inverting a step function.
     nthreads::Int           # the FFT thread count (0 = whatever the process planner is set to)
     cj::CV                  # (M) nonuniform exec buffer
-    r::MM                   # (ms) CG residual / rhs
-    p::MM                   # (ms) CG search direction
-    Ap::MM                  # (ms) CG A†A·p
-    tmp_pts::CV             # (M) CG scratch
+    ls_v::MM                # (ms) solver scratch: the four LSMR mode vectors, with `cj` and `ls_t`
+    ls_w::MM                #      its two point vectors. The transforms overwrite rather than
+    ls_h::MM                #      accumulate, so `A·v` and `A†·u` each need their own destination.
+    ls_hbar::MM
+    ls_t::CV                # (M)
 end
 
 # `PlanNUFFT` holds the scratch every execution writes through, so tasks cannot share one. The
@@ -65,7 +74,7 @@ end
 # makes every execution spawn a Julia task per FFT thread.
 function ST.Plans.task_local_plan(p::NonuniformFFTsScatteringPlan{T}) where {T}
     return _plan_at(p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol,
-                    ST.Plans.per_task_nthreads(p.nthreads))
+                    ST.Plans.per_task_nthreads(p.nthreads), p.damp)
 end
 
 # Where the plan lives follows the points, so there is nothing to pass: `get_backend` reads the
@@ -73,7 +82,7 @@ end
 # plan, device points a device-resident one, through the same code — and a task's rebuilt plan lands
 # on the same device, because it rebuilds from these same points.
 function _plan_at(ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, maxiter,
-                  rtol::T, nthreads::Int = 0) where {T}
+                  rtol::T, nthreads::Int = 0, damp::T = zero(T)) where {T}
     halfsupport = _half_support(eps)
     # Serialised on the package-wide planner lock: a host plan's smooth-grid FFT is planned through
     # the same libfftw3 every other backend here plans through, and this builder runs inside spawned
@@ -92,8 +101,8 @@ function _plan_at(ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, 
     pts() = similar(sx, Complex{T}, M)
     modes() = similar(sx, Complex{T}, ms)
     return NonuniformFFTsScatteringPlan(
-        plan, ms, M, one(T) / prod(ms), solve, maxiter, rtol, sx, sy, eps, nthreads,
-        pts(), modes(), modes(), modes(), pts())
+        plan, ms, M, one(T) / prod(ms), solve, maxiter, rtol, damp, sx, sy, eps, nthreads,
+        pts(), modes(), modes(), modes(), modes(), pts())
 end
 
 # The plan holds device/threading state and scratch, so it prints as one line rather than dumping
@@ -106,7 +115,7 @@ Base.show(io::IO, ::MIME"text/plain", p::NonuniformFFTsScatteringPlan) = show(io
 ST.Plans.spectral_backend(::NonuniformFFTsScatteringPlan) = ST.Plans.NonuniformFFTsBackend()
 ST.Plans.plan_points(p::NonuniformFFTsScatteringPlan) = (p.sx, p.sy)
 ST.Plans.plan_analysis(p::NonuniformFFTsScatteringPlan) =
-    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, eps = p.eps,
+    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp, eps = p.eps,
      nufft_nthreads = p.nthreads)
 
 # NonuniformFFTs expresses accuracy as the convolution kernel's half-support, not as a tolerance
@@ -117,8 +126,9 @@ _half_support(tol::Real) = tol >= 1.0e-4 ? 2 : tol >= 1.0e-7 ? 4 : tol >= 1.0e-1
 
 function ST.Plans.nonuniformffts_scattered_plan(x, y, ms::NTuple{2, Int}, ::Type{T};
                                                 period = nothing, solve::Bool = false,
-                                                maxiter::Int = 100, rtol::Real = 1.0e-8,
-                                                eps = nothing, ntrans::Int = 1,
+                                                maxiter::Int = 100, eps = nothing,
+                                                rtol::Real = ST.Plans.default_solver_rtol(T, ST.Plans.NonuniformFFTsBackend(), eps),
+                                                damp::Real = 0, ntrans::Int = 1,
                                                 nufft_nthreads::Int = 0) where {T}
     # Accepted so the caller need not know which backend it will get, and deliberately not acted on:
     # this plan reports `batch_width == 1`, so the cascade keeps its per-field loop. NonuniformFFTs
@@ -127,6 +137,7 @@ function ST.Plans.nonuniformffts_scattered_plan(x, y, ms::NTuple{2, Int}, ::Type
     # cost throughput at the batch sizes that matter.
     M = length(x)
     length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
+    ST.Plans.warn_underdetermined(M, ms, solve, damp)
     xmin, ymin = T(minimum(x)), T(minimum(y))
     # Same default period as the in-core plan: a uniform 0:m-1 grid maps to the exact DFT nodes.
     px = period === nothing ? (T(maximum(x)) - xmin) * ms[1] / (ms[1] - 1) : T(period[1])
@@ -134,8 +145,8 @@ function ST.Plans.nonuniformffts_scattered_plan(x, y, ms::NTuple{2, Int}, ::Type
     sx = T(2π) .* (T.(x) .- xmin) ./ px
     sy = T(2π) .* (T.(y) .- ymin) ./ py
 
-    tol = eps === nothing ? (T === Float32 ? 1.0e-6 : 1.0e-9) : eps
-    return _plan_at(ms, M, sx, sy, T(tol), T, solve, maxiter, T(rtol), nufft_nthreads)
+    tol = eps === nothing ? ST.Plans.default_nufft_eps(T) : eps
+    return _plan_at(ms, M, sx, sy, T(tol), T, solve, maxiter, T(rtol), nufft_nthreads, T(damp))
 end
 
 # Synthesis: modes → points (Type-2), scaled by 1/prod(ms) so it is the ifft-convention inverse.
@@ -150,7 +161,7 @@ end
 function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NonuniformFFTsScatteringPlan,
                                      x_pts::AbstractVector)
     if plan.solve
-        _cg_solve!(Xmodes, plan, x_pts)
+        _lsmr_solve!(Xmodes, plan, x_pts)
     else
         copyto!(plan.cj, x_pts)
         NonuniformFFTs.exec_type1!(Xmodes, plan.plan, plan.cj)
@@ -158,31 +169,19 @@ function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NonuniformFFT
     return Xmodes
 end
 
-# CG least-squares inversion of the normal equations (A†A)f = A†(N·x), A = Type-2, A† = Type-1 — so
-# synthesis (Type-2/N) of the recovered modes reproduces the sampled values. Mirrors the in-core and
-# FINUFFT paths exactly, including the stopping rule, so the three agree to solver tolerance.
-function _cg_solve!(f::AbstractMatrix, plan::NonuniformFFTsScatteringPlan{T},
-                    x_pts::AbstractVector) where {T}
-    N = one(T) / plan.invN
-    copyto!(plan.cj, x_pts)
-    NonuniformFFTs.exec_type1!(plan.r, plan.plan, plan.cj)                 # r = A†x  (modes)
-    plan.r .*= N                                               # r = A†(N·x) = rhs
-    fill!(f, zero(Complex{T}))
-    copyto!(plan.p, plan.r)
-    rsold = real(LinearAlgebra.dot(vec(plan.r), vec(plan.r)))
-    rs0 = rsold
-    rs0 == 0 && return f
-    @inbounds for _ in 1:plan.maxiter
-        NonuniformFFTs.exec_type2!(plan.tmp_pts, plan.plan, plan.p)        # tmp = A·p    (points)
-        NonuniformFFTs.exec_type1!(plan.Ap, plan.plan, plan.tmp_pts)       # Ap  = A†A·p  (modes)
-        α = rsold / real(LinearAlgebra.dot(vec(plan.p), vec(plan.Ap)))
-        f .+= α .* plan.p
-        plan.r .-= α .* plan.Ap
-        rsnew = real(LinearAlgebra.dot(vec(plan.r), vec(plan.r)))
-        sqrt(rsnew) <= plan.rtol * sqrt(rs0) && break
-        plan.p .= plan.r .+ (rsnew / rsold) .* plan.p
-        rsold = rsnew
-    end
+# Least-squares inversion, sharing the core solver with the in-core and FINUFFT paths so the three
+# agree to solver tolerance. `A f̃ = x` is solved and scaled by `N` afterwards rather than inflating
+# the right-hand side by `prod(ms)` — see the FINUFFT sibling.
+function _lsmr_solve!(f::AbstractMatrix, plan::NonuniformFFTsScatteringPlan{T},
+                      x_pts::AbstractVector) where {T}
+    info = ST.Plans.lsmr_solve!(f,
+        (dst, src) -> NonuniformFFTs.exec_type2!(dst, plan.plan, src),   # A : modes → points
+        (dst, src) -> NonuniformFFTs.exec_type1!(dst, plan.plan, src),   # A†: points → modes
+        x_pts, plan.cj, plan.ls_t, plan.ls_v, plan.ls_w, plan.ls_h, plan.ls_hbar;
+        damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
+        conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
+    ST.Plans._check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
+    f .*= one(T) / plan.invN
     return f
 end
 

@@ -19,6 +19,13 @@ it was measured on:
 
  3. **Allocation** — zero, in steady state, on every `!` path.
 
+ 4. **Solve overhead** — for the scattered least-squares path, the cost of one solver iteration
+    against the type-2 plus type-1 it contains, and the whole solve against `iters` of those. Scale
+    free for the same reason: it asks whether the solve costs more than the transforms it must do
+    anyway, which is answerable on any machine. Swept over all three shape regimes, because `M` and
+    `prod(ms)` are independent and the regime decides both the iteration count and whether the
+    problem is determined at all.
+
 Run:  julia --project=benchmark -t<threads> benchmark/suite.jl [quick|full]
 """
 
@@ -144,7 +151,195 @@ function multires(label, exact, mk, x, ovs)
 end
 
 # ---------------------------------------------------------------------------
-# 4. Allocation: every `!` path, zero in steady state
+# 4. Scattered least-squares solve — the three shape regimes
+# ---------------------------------------------------------------------------
+
+# `solve = true` replaces one adjoint application with an iterative solve, so its cost is two separate
+# numbers and they fail differently. How many iterations the geometry needs is a property of the
+# points. What one iteration costs *over* the two transforms inside it is a property of the solver:
+# LSMR carries `2M + 9·prod(ms)` flops of vector work per iteration on top of a type-2 and a type-1,
+# and that fraction is largest on small grids, where the transform has the least work to hide it
+# behind. Both are measured rather than counted, because the vector work is bandwidth bound where the
+# FFT is cache blocked, and because `M` and `ms` are independent: the caller may hand over more modes
+# than samples, and the regime decides everything.
+#
+# Reported per regime: `M`, `prod(ms)`, iterations to tolerance, the cost of one type-2 plus one
+# type-1, the measured cost of one solver iteration, and their ratio — the number that says whether
+# the solve costs anything beyond the transforms it must do anyway.
+
+# Iterations, driven through the plan's public transforms. `inverse_transform!` is `A` scaled by the
+# synthesis `1/prod(ms)`, so the adjoint must carry the same scalar — a mismatched pair is not a
+# scaled problem, it is a different one, and LSMR then runs to `maxiter` on an operator whose exact
+# solution it should reach in a single step. With both scaled the factor cancels from every stopping
+# test (`normA` falls by it exactly as `normx` rises, `normar` and `normr` together), so the count is
+# the solve path's own.
+function solve_probe(::Type{T}, base, b, ms, M, tol, maxiter) where {T}
+    x = zeros(Complex{T}, ms)
+    s = T(base.invN)
+    info = ST.Plans.lsmr_solve!(x,
+                                (dst, src) -> ST.Plans.inverse_transform!(dst, base, src),
+                                (dst, src) -> (ST.Plans.forward_transform!(dst, base, src);
+                                               dst .*= s),
+                                Complex{T}.(b), zeros(Complex{T}, M), zeros(Complex{T}, M),
+                                zeros(Complex{T}, ms), zeros(Complex{T}, ms), zeros(Complex{T}, ms),
+                                zeros(Complex{T}, ms);
+                                atol = tol, btol = tol, conlim = inv(eps(T)), maxiter = maxiter)
+    return (info.iters, info.istop)
+end
+
+function solve_case(::Type{T}, label, xs, ys, ms, period, spec) where {T}
+    M = length(xs)
+    mk(solve, maxiter, rtol) = ST.Plans.make_scattered_plan(spec, xs, ys, ms, T; period = period,
+                                                            solve = solve, maxiter = maxiter,
+                                                            rtol = rtol, nufft_nthreads = 1)
+    base = mk(false, 100, ST.Plans.default_solver_rtol(T, spec, nothing))
+    b = T[sin(3xs[k]) * cos(2ys[k]) + T(0.5) for k in 1:M]
+    X = zeros(Complex{T}, ms)
+    pts = zeros(Complex{T}, M)
+
+    # One application of `A` and one of `A†` — exactly what one LSMR iteration contains.
+    ST.Plans.forward_transform!(X, base, b)
+    t_pair = bench_kernel(() -> (ST.Plans.inverse_transform!(pts, base, X);
+                                 ST.Plans.forward_transform!(X, base, b)))
+
+    rtol = ST.Plans.default_solver_rtol(T, spec, nothing)
+    iters, istop = solve_probe(T, base, b, ms, M, rtol, 100)
+
+    # A solve the package refuses is a result, not a crash: at `conlim = 1/eps(T)` an operator whose
+    # smallest singular direction carries nothing this precision can represent is rejected rather than
+    # answered, and in `Float32` on a gappy set that is reachable. Reported, and the sweep goes on.
+    solved = mk(true, 100, rtol)
+    t_solve = try
+        bench(() -> ST.Plans.forward_transform!(X, solved, b))
+    catch err
+        err isa ST.Plans.AnalysisNotConverged || rethrow()
+        NaN
+    end
+
+    # Per-iteration cost, differenced across two forced budgets so that plan setup, the closing
+    # `prod(ms)` rescale and the timer all cancel. Only meaningful while both budgets are actually
+    # spent: `atol`/`btol` can be driven to zero but LSMR's machine-precision tests cannot, so on a
+    # well-conditioned operator both runs stop at the same converged iterate and their difference is
+    # noise rather than `k2 - k1` iterations. That case is reported as converged instead of quoting a
+    # per-iteration cost the measurement cannot see.
+    k1, k2 = 8, 24
+    forced_iters, _ = solve_probe(T, base, b, ms, M, zero(T), k2)
+    t_iter = if forced_iters == k2
+        p1, p2 = mk(true, k1, zero(T)), mk(true, k2, zero(T))
+        # More repetitions than elsewhere because differencing two nearby times amplifies their
+        # scatter: at three reps this disagreed with `solve/(iters·pair)` by 25%, which is the
+        # measurement's noise and not a property of the solver.
+        d = try
+            t1 = bench(() -> ST.Plans.forward_transform!(X, p1, b), 9)
+            t2 = bench(() -> ST.Plans.forward_transform!(X, p2, b), 9)
+            (t2 - t1) / (k2 - k1)
+        catch err
+            err isa ST.Plans.AnalysisNotConverged || rethrow()
+            NaN
+        end
+        ST.Plans.close_plan!(p1); ST.Plans.close_plan!(p2)
+        d
+    else
+        NaN
+    end
+    ST.Plans.close_plan!(base); ST.Plans.close_plan!(solved)
+
+    Printf.@printf("%-24s M=%-8d n=%-7d iters %3d (istop %d)  pair %7.3f ms  solve %8.3f ms  %6s  iter %s\n",
+                   label, M, prod(ms), iters, istop, t_pair * 1e3,
+                   isnan(t_solve) ? NaN : t_solve * 1e3,
+                   isnan(t_solve) ? "refused" :
+                       Printf.@sprintf("%.2fx", t_solve / (max(iters, 1) * t_pair)),
+                   isnan(t_iter) ? "converged" :
+                       Printf.@sprintf("%7.3f ms  %.3fx", t_iter * 1e3, t_iter / t_pair))
+    return nothing
+end
+
+function scattered_solve()
+    ga = π * (3 - sqrt(5.0))
+    # Sizes span the range where the overhead fraction is predicted to move: the vector work is `O(n)`
+    # against a transform's `O(n log n)`, so the smallest grid is the hard case, not the afterthought.
+    grids = TIER == "full" ? ((8, 8), (16, 16), (32, 32), (200, 200), (256, 256)) :
+                             ((8, 8), (32, 32), (200, 200))
+    spec = ST.Plans.FINUFFTBackend()
+    for T in (TIER == "full" ? (Float64, Float32) : (Float64,))
+        println("\n", T, ":")
+        for ms in grids
+            n = prod(ms)
+            # Well sampled: the regime where the solver's extra vector work is pure overhead, and the
+            # one that decides whether `solve = true` costs existing callers anything.
+            M = 4n
+            xs = [2π * mod(ga * k, 1.0) for k in 1:M]
+            ys = [2π * (k - 0.5) / M for k in 1:M]
+            solve_case(T, "well sampled $(ms[1])^2", xs, ys, ms, (2π, 2π), spec)
+
+            # The exact DFT nodes: `A†A = n·I`, so any least-squares method is done in one iteration.
+            # A count above 1 here means a scaling or convention has drifted, not that the solve is slow.
+            gx = T[2π * (i - 1) / ms[1] for i in 1:ms[1], j in 1:ms[2]]
+            gy = T[2π * (j - 1) / ms[2] for i in 1:ms[1], j in 1:ms[2]]
+            solve_case(T, "  exact nodes $(ms[1])^2", vec(gx), vec(gy), ms, (2π, 2π), spec)
+
+            # Fewer samples than modes, with a void — the geometry that made the old solver diverge.
+            # Iterations here are the honest cost of the fix.
+            Mg = n ÷ 2
+            xg = [2π * mod(ga * k, 1.0) for k in 1:Mg]
+            yg = [π * mod(sqrt(2.0) * k, 1.0) for k in 1:Mg]   # samples confined to half the domain
+            solve_case(T, "  gappy $(ms[1])^2", xg, yg, ms, (2π, 2π), spec)
+        end
+    end
+
+    # `M` at fixed `ms`: the point count enters the transform linearly and the solver's vector work
+    # linearly too, so the ratio above should hold as `M` grows. This is where that is checked.
+    println("\nM sweep at 32^2, well sampled:")
+    for M in (TIER == "full" ? (100, 1_000, 10_000, 100_000, 1_000_000) : (100, 10_000, 1_000_000))
+        xs = [2π * mod(ga * k, 1.0) for k in 1:M]
+        ys = [2π * (k - 0.5) / M for k in 1:M]
+        solve_case(Float64, "M=$M", xs, ys, (32, 32), (2π, 2π), spec)
+    end
+
+    # Threading and `ntrans` on the solve path, which is where a per-task plan or a per-column
+    # recurrence would show up: the batched solve runs `B` LSMR recurrences through one execution per
+    # transform, so its iteration count is the worst column's, not the average.
+    println("\nSolve under a full cascade — threading and batching:")
+    M, B = 4000, 8
+    xs = [2π * mod(ga * k, 1.0) for k in 1:M]
+    ys = [2π * (k - 0.5) / M for k in 1:M]
+    Xb = randn(M, B)
+    # Named explicitly and only when loaded: naming a backend whose extension is absent raises, and a
+    # missing library is a gap to report, not a reason to abandon the sweep.
+    _ext(:ScatteringTransformsFINUFFTExt) ?
+        solve_cascade(ST.Plans.FINUFFTBackend(), xs, ys, Xb, B) :
+        println("FINUFFT: not loaded")
+    _ext(:ScatteringTransformsNonuniformFFTsExt) ?
+        solve_cascade(ST.Plans.NonuniformFFTsBackend(), xs, ys, Xb, B) :
+        println("NonuniformFFTs: not loaded")
+    return nothing
+end
+
+function solve_cascade(spectral, xs, ys, Xb, B)
+    sp = ST.scattered_planar_scattering(xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
+                                        solve = true, spectral = spectral)
+    adj = ST.scattered_planar_scattering(xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
+                                         solve = false, spectral = spectral)
+    ta = bench(() -> ST.scattering_batch(sp, Xb))
+    tadj = bench(() -> ST.scattering_batch(adj, Xb))
+    tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sp, Xb))
+    Printf.@printf("%-26s adjoint %8.1f ms  solve %8.1f ms  %.1fx  threaded %8.1f ms  %.2fx\n",
+                   string(nameof(typeof(spectral))), tadj * 1e3, ta * 1e3, ta / tadj,
+                   tt * 1e3, ta / tt)
+    spb = ST.ScatteredPlanar.build(Float64, xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
+                                   solve = true, spectral = spectral, ntrans = B)
+    if ST.Plans.batch_width(spb.plan) == B
+        tb = bench(() -> ST.scattering_batch(spb, Xb))
+        Printf.@printf("%-26s batched %8.1f ms  %.2fx over the per-field solve\n",
+                       "  ntrans=$B", tb * 1e3, ta / tb)
+    else
+        println("  ntrans=$B: unavailable — this backend transforms one field per call")
+    end
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
+# 5. Allocation: every `!` path, zero in steady state
 # ---------------------------------------------------------------------------
 
 _alloc3(f::F, a, b, c) where {F} = (f(a, b, c); @allocated f(a, b, c))
@@ -295,6 +490,9 @@ function main()
         println("scattered sphere: skipped — NUFSHT not loaded (its in-core O(M·K) reference would " *
                 "be reported as the transform's speed)")
     end
+
+    header("Scattered least-squares solve — cost per iteration against the transforms in it")
+    scattered_solve()
 
     allocations()
     println("\nA 'x floor' near 1 means the cascade costs its own arithmetic and memory traffic and")

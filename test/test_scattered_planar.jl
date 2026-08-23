@@ -39,6 +39,32 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         Test.@test cd ≈ ScatteringTransforms.Coefficients.flatten2d(fin(vec(f))) rtol=1e-6
     end
 
+    Test.@testset "gappy, over-specified mode grid: the solve stays finite" begin
+        # Fewer samples than modes, with a void: a coastal-band footprint over a 24×24 grid keeps 300
+        # of 576 modes sampled, so at least 276 mode directions are constrained by no sample at all.
+        # The least-squares problem is then rank-deficient, and an unguarded solve does not merely lose
+        # accuracy — it diverges and writes NaN into the coefficients with nothing raised, which is how
+        # a whole downstream product came out NaN before this was traced.
+        ms_g = (24, 24)
+        allx, ally = Float64[], Float64[]
+        for i in 1:ms_g[1], j in 1:ms_g[2]
+            j <= round(Int, 11 + 5 * sin(pi * i / ms_g[1])) && (push!(allx, i); push!(ally, j))
+        end
+        Random.seed!(0)
+        keep = Random.randperm(length(allx))[1:300]
+        for T in (Float32, Float64)
+            xg, yg = T.(allx[keep]), T.(ally[keep])
+            fg = T[abs(sin(3xg[k])) + 0.1 for k in eachindex(xg)]
+            # Construction says so: this is the geometry the underdetermined warning exists for.
+            st_g = Test.@test_logs (:warn, r"underdetermined") match_mode=:any (
+                ScatteringTransforms.scattered_planar_scattering(T, xg, yg, ms_g, 3;
+                    L = 4, max_order = 2, period = (T(ms_g[1]), T(ms_g[2])), solve = true))
+            c = st_g(fg)
+            Test.@test all(isfinite, ScatteringTransforms.Coefficients.first_order(c))
+            Test.@test all(isfinite, ScatteringTransforms.Coefficients.second_order(c))
+        end
+    end
+
     Test.@testset "S0 is the (weighted) sample mean" begin
         sca = ScatteringTransforms.scattered_planar_scattering(n1, n2, (Ny, Nx), J; L=L, max_order=1, period=(Ny, Nx))
         Test.@test ScatteringTransforms.Coefficients.zeroth_order(sca(vec(f))) ≈ sum(f) / length(f)
@@ -164,6 +190,70 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         Test.@test ScatteringTransforms.Plans.per_task_nthreads(5) == 5
     end
 
+    Test.@testset "the three solve paths agree on irregular points" begin
+        # The existing cross-backend comparison runs `solve = false`, so a convention divergence in one
+        # backend's least-squares path was invisible. Same points, same field, all three solvers.
+        Random.seed!(17)
+        M2 = 1200
+        xs, ys = 2π .* rand(M2), 2π .* rand(M2)
+        fs = [1.0 + 0.7cos(xs[k]) + 0.5sin(2ys[k]) - 0.3cos(xs[k]) * sin(ys[k]) for k in 1:M2]
+        coeffs(spec) = ScatteringTransforms.Coefficients.flatten2d(
+            ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
+                L = 4, max_order = 2, period = (2π, 2π), solve = true, spectral = spec)(fs))
+        direct = coeffs(SpectralBackends.DirectSumSpectralBackend())
+        finufft = coeffs(ScatteringTransforms.Plans.FINUFFTBackend())
+        nuffts = coeffs(ScatteringTransforms.Plans.NonuniformFFTsBackend())
+        Test.@test all(isfinite, direct)
+        Test.@test finufft ≈ direct rtol = 1e-5
+        Test.@test nuffts ≈ direct rtol = 1e-5
+        Test.@test nuffts ≈ finufft rtol = 1e-5
+    end
+
+    Test.@testset "the solve leaves its input untouched" begin
+        # The cascade hands `forward_transform!` a buffer it overwrites immediately afterwards
+        # (`ScatteredPlanar.jl:138,151`), so the solver must treat the samples as read-only. An
+        # in-place "optimisation" that aliased them would corrupt the next cascade step silently.
+        Random.seed!(19)
+        M2 = 400
+        xs, ys = 2π .* rand(M2), 2π .* rand(M2)
+        b = [1.0 + 0.4cos(xs[k]) for k in 1:M2]
+        before = copy(b)
+        for spec in (SpectralBackends.DirectSumSpectralBackend(),
+                     ScatteringTransforms.Plans.FINUFFTBackend(),
+                     ScatteringTransforms.Plans.NonuniformFFTsBackend())
+            plan = ScatteringTransforms.Plans.make_scattered_plan(spec, xs, ys, (16, 16), Float64;
+                period = (2π, 2π), solve = true)
+            X = zeros(ComplexF64, (16, 16))
+            ScatteringTransforms.Plans.forward_transform!(X, plan, b)
+            Test.@test b == before
+        end
+    end
+
+    Test.@testset "solve=true under the threaded backend and batched over ntrans" begin
+        # Two gaps at once: the threaded comparison ran `solve = false`, which is what would have hidden
+        # a `task_local_plan` field left un-copied, and the batched solve was refused outright before.
+        Random.seed!(23)
+        M2, B2 = 800, 4
+        xs, ys = 2π .* rand(M2), 2π .* rand(M2)
+        X = hcat([[1.0 + 0.7cos(xs[k]) + 0.5sin(2ys[k]) + 0.05c for k in 1:M2] for c in 1:B2]...)
+        FB = ScatteringTransforms.Plans.FINUFFTBackend()
+        single = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
+            L = 4, max_order = 2, period = (2π, 2π), solve = true, spectral = FB)
+        serial = ScatteringTransforms.scattering_batch(
+            ComputationalBackends.SerialBackend(), single, X)
+        Test.@test all(isfinite, serial)
+        Test.@test ScatteringTransforms.scattering_batch(
+            ComputationalBackends.ThreadedBackend(), single, X) ≈ serial rtol = 1e-10
+
+        batched = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (16, 16), 3;
+            L = 4, max_order = 2, period = (2π, 2π), solve = true, spectral = FB, ntrans = B2)
+        Test.@test ScatteringTransforms.Plans.batch_width(batched.plan) == B2
+        # Asserted, not assumed: without the per-column bookkeeping the batched path is not running.
+        Test.@test batched.plan.ls_batch !== nothing
+        Test.@test ScatteringTransforms.scattering_batch(
+            ComputationalBackends.SerialBackend(), batched, X) ≈ serial rtol = 1e-6
+    end
+
     Test.@testset "a transform rebuilt from its spec analyses the same way" begin
         # A distributed worker cannot receive a plan, so it receives a spec and rebuilds. Everything
         # that decides what the analysis *is* has to survive that trip: `solve` selects a
@@ -178,7 +268,7 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
                          ScatteringTransforms.Plans.NonuniformFFTsBackend())
             st = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
                 L = 4, max_order = 2, period = (2π, 2π), spectral = spectral,
-                solve = true, maxiter = 37, rtol = 1.0e-7, eps = 1.0e-8)
+                solve = true, maxiter = 37, rtol = 1.0e-7, eps = 1.0e-8, damp = 0.25)
             rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
             a0 = ScatteringTransforms.Plans.plan_analysis(st.plan)
             a1 = ScatteringTransforms.Plans.plan_analysis(rb.plan)
@@ -186,6 +276,10 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
             Test.@test a1.maxiter == 37
             Test.@test a1.rtol == a0.rtol
             Test.@test a1.eps == a0.eps
+            # A rebuild that dropped the regulariser would solve a different problem on a worker than
+            # on the caller. Asserted against the value passed, not just against `a0`, since the
+            # default is zero and `0 == 0` would hold however badly the field were plumbed.
+            Test.@test a1.damp == a0.damp == 0.25
             # And the same settings must give the same coefficients, not merely the same fields.
             Test.@test ScatteringTransforms.Coefficients.flatten2d(rb(fs)) ≈
                        ScatteringTransforms.Coefficients.flatten2d(st(fs))

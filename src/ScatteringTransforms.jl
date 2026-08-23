@@ -451,7 +451,7 @@ function transform_spec(st::ScatteredPlanar.ScatteredPlanarScattering)
     a = Plans.plan_analysis(st.plan)
     return (kind = :planar, x = x, y = y, ms = st.plan.ms, J = st.filter_bank.J,
             L = st.filter_bank.L, max_order = st.max_order, weights = st.weights,
-            solve = a.solve, maxiter = a.maxiter, rtol = a.rtol, eps = a.eps,
+            solve = a.solve, maxiter = a.maxiter, rtol = a.rtol, damp = a.damp, eps = a.eps,
             nufft_nthreads = a.nufft_nthreads,
             T = real(eltype(st.filter_bank.averaging)), spectral = Plans.spectral_backend(st.plan))
 end
@@ -512,7 +512,7 @@ function rebuild_transform(spec)
         return ScatteredPlanar.build(spec.T, spec.x, spec.y, spec.ms, spec.J; L = spec.L,
             max_order = spec.max_order, spectral = spec.spectral, weights = spec.weights,
             period = (2π, 2π), solve = spec.solve, maxiter = spec.maxiter, rtol = spec.rtol,
-            eps = spec.eps, nufft_nthreads = spec.nufft_nthreads)
+            damp = spec.damp, eps = spec.eps, nufft_nthreads = spec.nufft_nthreads)
     elseif spec.kind === :sphere
         # The element type follows from the retained points, so it is not passed separately.
         return spherical_scattering(spec.theta, spec.phi, spec.lmax, spec.J;
@@ -548,7 +548,8 @@ scattering_batch(b::CB.AbstractExecutionBackend, st, X) =
 """
     scattered_planar_scattering(x, y, ms, J; L=8, max_order=2, T=Float64,
                                 spectral=SpectralBackends.AutoSpectralBackend(), period=nothing,
-                                solve=false, weights=nothing, eps=nothing, maxiter=100, rtol=1e-8,
+                                solve=false, weights=nothing, eps=nothing, maxiter=100,
+                                rtol=Plans.default_solver_rtol(T, spectral, eps), damp=0,
                                 nufft_nthreads=0)
 
 Build a 2D planar scattering transform for a scalar field sampled at scattered points `(x, y)`, using
@@ -567,10 +568,30 @@ specific fast library (`using FINUFFT` / `using NonuniformFFTs`);
 direct sum. `period` is the physical domain size per
 axis (the Fourier period); it defaults so a uniform `0:m-1` grid reproduces the gridded FFT transform
 exactly. `solve=false` uses the fast adjoint (type-1) — exact for adequately-sampled band-limited
-fields, approximate on gappy/irregular data; `solve=true` uses a conjugate-gradient least-squares
-inversion for the true band-limited coefficients (slower, needed for irregular sampling). `weights`
-(length `M`, summing to 1) sets the quadrature for the spatial mean; the default is the uniform sample
-mean. `eps` is the FINUFFT tolerance (ignored by the exact direct sum).
+fields, approximate on gappy/irregular data; `solve=true` recovers the true band-limited coefficients
+by least squares (slower, needed for irregular sampling). `weights` (length `M`, summing to 1) sets
+the quadrature for the spatial mean; the default is the uniform sample mean. `eps` is the NUFFT
+tolerance (ignored by the exact direct sum).
+
+The solve is LSMR ([`Plans.lsmr_solve!`](@ref ScatteringTransforms.Plans.lsmr_solve!)), which costs
+one type-2 and one type-1 per iteration and keeps both `‖b - Af‖` and `‖A†(b - Af)‖` monotone, so
+stopping at `maxiter` returns the best iterate reached rather than a diverged one. `rtol` defaults to
+the accuracy of the transform underneath it — `sqrt(eps(T))` for the exact direct sum, `~10·eps` for a
+fast library, whose type-1 and type-2 are adjoints only to their own tolerance
+([`Plans.default_solver_rtol`](@ref ScatteringTransforms.Plans.default_solver_rtol)). `damp` is a
+Tikhonov `λ` minimising `‖Af - b‖² + λ²‖f‖²`, `0` by default; with `prod(ms) > M` the problem is
+underdetermined, construction warns, and LSMR returns the minimum-norm solution unless a `λ` is given.
+
+`maxiter` is a budget, not a target: the Krylov process terminates exactly at `prod(ms)` steps, so a
+default of `100` finishes a well-sampled band-limited field in a handful of iterations but truncates a
+field with a large irreducible least-squares residual. Truncation is safe — both error measures are
+monotone, so the returned iterate is the best one reached — but it is not converged, and an
+unconverged iterate is only as reproducible as the transform under it. A multi-threaded NUFFT
+accumulates its spreading in an order that varies between runs, and an unconverged solve amplifies
+that by about `cond(A)²`: measured at `M = 400`, `ms = (16, 16)`, repeating one solve moves the
+coefficients by 5·10⁻⁴ at `maxiter = 100` and 2·10⁻⁸ once the budget lets it converge, while
+`nufft_nthreads = 1` gives bitwise-identical repeats at any budget. Raise `maxiter` for an answer that
+does not depend on the thread count, or pin `nufft_nthreads = 1` for exact reproducibility.
 
 `nufft_nthreads` sets the fast library's own thread count, and is honoured wherever the plan goes,
 including the per-task copies a threaded backend builds. `0` (the default) leaves it to the library,

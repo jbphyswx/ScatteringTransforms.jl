@@ -192,6 +192,23 @@ ScatteringTransforms.ScatteringCore.spatial_average
 ScatteringTransforms.ScatteringCore.task_workspace
 ```
 
+### Scattered least-squares solve
+
+`solve = true` on a scattered planar transform inverts the nonuniform transform by LSMR rather than
+applying its adjoint. These are the solver and the defaults that configure it.
+
+```@docs
+ScatteringTransforms.Plans.lsmr_solve!
+ScatteringTransforms.Plans.lsmr_solve_batched!
+ScatteringTransforms.Plans.lsmr_init
+ScatteringTransforms.Plans.lsmr_step
+ScatteringTransforms.Plans.LSMRState
+ScatteringTransforms.Plans.BatchedLSMRWork
+ScatteringTransforms.Plans.default_solver_rtol
+ScatteringTransforms.Plans.default_nufft_eps
+ScatteringTransforms.Plans.warn_underdetermined
+```
+
 ### Plans supplied by extensions
 
 These are declared in the core and given a method by the corresponding extension. Calling one
@@ -264,7 +281,7 @@ ScatteringTransforms.SphericalCore.task_local_batch_plan
 ScatteringTransforms.SphericalCore.supports_batch
 ScatteringTransforms.SphericalCore.plan_nufft
 ScatteringTransforms.SphericalCore.plan_spin
-ScatteringTransforms.SphericalCore.AnalysisNotConverged
+ScatteringTransforms.Plans.AnalysisNotConverged
 ScatteringTransforms.SphericalCore.default_rtol
 ScatteringTransforms.SphericalCore.with_serial_ft
 ScatteringTransforms.SphericalCore.make_spherical_plan
