@@ -28,23 +28,42 @@ using ScatteringTransforms: ScatteringTransforms as ST
 """
     NonuniformFFTsScatteringPlan{T,P,CV,MM,RV}
 
-Scattered-planar spectral plan backed by a `NonuniformFFTs.PlanNUFFT` over fixed points `(x, y)`
-and a uniform mode grid `ms`. `solve` selects the least-squares inversion over the plain Type-1
-adjoint; the `ls_*` fields are that solver's workspace, so the solve adds nothing per call beyond the
-transforms it issues.
+Scattered-planar spectral plan backed by `NonuniformFFTs.PlanNUFFT` over fixed points `(x, y)` and a
+uniform mode grid `ms`. `solve` selects the least-squares inversion over the plain Type-1 adjoint; the
+solver's workspace lives on the plan, so a solve adds nothing per call beyond the transforms it issues.
 
 Those transforms do allocate, which makes this the one backend where a solve allocates in steady
-state: 880 B per execution and 152 880 B for a 100-iteration solve at `M = 500`, `ms = (16, 16)`.
-An allocation profile attributes it to a `Threads.@threads` region in NonuniformFFTs' deconvolution
-step, which builds its task scaffolding — a `Task`, a task list, a lock and a condition — on every
-call, including at one thread where it parallelises nothing. The FINUFFT plan measures exactly zero
-on the same case because its execution enters no Julia threaded region; its library threads are
-pooled rather than created per call.
+state. Measured at `M = 500`, `ms = (16, 16)`, `nufft_nthreads = 1`, single-threaded Julia: 768 B for
+one execution, and 108 kB for a solve that takes ~70 iterations — about 1.4 kB per iteration, which is
+its two transforms and nothing else. An allocation profile attributes all of it to `Threads.@threads`
+regions in NonuniformFFTs' deconvolution and spreading steps, which build their task scaffolding — a
+`Task`, a task list, a lock and a condition — on every call, including at one thread where they
+parallelise nothing. It therefore scales with `Threads.nthreads()` rather than with problem size. The
+FINUFFT plan measures exactly zero on the same case because its execution enters no Julia threaded
+region; its library threads are pooled rather than created per call.
+
+`B`, the number of co-located fields transformed per execution, is a type parameter rather than a
+field. NonuniformFFTs takes one array per transform instead of a trailing batch axis, so a `(…, B)`
+stack has to be presented as `B` views of its last dimension; carrying `B` in the type keeps that
+tuple's length statically known, so building it costs nothing per call.
+
+Two NUFFT plans are held, because the two directions of the cascade have different data types.
+Everything this backend *analyses* is real — the sampled field, and the modulus `|U|` at every later
+step — so its spectrum is Hermitian and analysis runs on a real-data plan, whose uniform side is the
+half spectrum `(ms[1] ÷ 2 + 1, ms[2])` in `rfftfreq × fftfreq` order. Measured against the complex
+plan on the same points, that is 1.14x at `ms = 16²` rising to 1.76x at `200²` for type-1 and 1.87x
+for type-2, and it halves the mode count the least-squares solve carries. Synthesis cannot use it: the
+wavelet-filtered field is complex by construction and its modulus is the coefficient, so a real-valued
+type-2 would be the wrong quantity. The complex plan serves that direction.
 """
-struct NonuniformFFTsScatteringPlan{T, P, CV <: AbstractVector{Complex{T}},
-                                    MM <: AbstractMatrix{Complex{T}},
-                                    RV <: AbstractVector{T}} <: ST.Plans.AbstractScatteringPlan
-    plan::P
+struct NonuniformFFTsScatteringPlan{T, B, P, PR, CV <: AbstractArray{Complex{T}},
+                                    MM <: AbstractArray{Complex{T}},
+                                    HM <: AbstractArray{Complex{T}},
+                                    HX <: AbstractArray{Complex{T}}, PT <: AbstractArray{T},
+                                    RV <: AbstractVector{T}, IV <: AbstractVector{Int}, US, GK,
+                                    BW} <: ST.Plans.AbstractScatteringPlan
+    plan::P                 # complex-data plan: synthesis (Type-2, modes → complex points)
+    rplan::PR               # real-data plan: analysis and the solve, over the half spectrum
     ms::NTuple{2, Int}
     M::Int
     invN::T                 # 1/prod(ms); makes synthesis the ifft-convention inverse
@@ -58,22 +77,54 @@ struct NonuniformFFTsScatteringPlan{T, P, CV <: AbstractVector{Complex{T}},
                             #     Kept instead of the half-support it maps to, so a rebuild re-applies
                             #     `_half_support` rather than inverting a step function.
     nthreads::Int           # the FFT thread count (0 = whatever the process planner is set to)
-    cj::CV                  # (M) nonuniform exec buffer
-    ls_v::MM                # (ms) solver scratch: the four LSMR mode vectors, with `cj` and `ls_t`
-    ls_w::MM                #      its two point vectors. The transforms overwrite rather than
-    ls_h::MM                #      accumulate, so `A·v` and `A†·u` each need their own destination.
-    ls_hbar::MM
-    ls_t::CV                # (M)
+    # One plan owns both transforms because one cascade needs both: synthesis is always complex, and
+    # every analysis after the first is a modulus and so always real. `forward_transform!` selects by
+    # the element type of the field it is handed — a real field's spectrum is Hermitian and is analysed
+    # and solved on the half grid, a complex field's is not and needs the full grid. Fields below are
+    # prefixed by which path owns them: `c` complex, `r`/`h` real. The two are never in flight at once
+    # on one plan, so the half-grid mode arrays are views of the full-grid ones, not a second set.
+    cj::CV                  # (M[, B]) complex points: synthesis output, and the complex solver's `u`
+    ct::CV                  # (M[, B]) the complex solver's other point vector
+    cv::MM                  # (ms[, B]) the solver's four mode vectors at full size
+    cw::MM
+    ch::MM
+    chbar::MM
+    hv::HM                  # the same four over the half grid: `view(·, 1:ms[1]÷2+1, :[, :])`
+    hw::HM
+    hh::HM
+    hhbar::HM
+    hx::HX                  # (ms[1]÷2+1, ms[2][, B]) the half spectrum itself — the analysis output,
+                            #      and the solve's iterate before expansion onto the full grid
+    rb::PT                  # (M[, B]) the real samples, and the real solver's two point vectors
+    ru::PT
+    rt::PT
+    mir::IV                 # (ms[2]) index of `-f₂` on the second axis, for the conjugate fill
+    us_ovs::US              # the real plan's *oversampled* spectrum, refilled by every execution. Its
+                            #      extent is `Ñ = σ·ms`, so `+ms[2]/2` — absent from `fftfreq(ms[2])`
+                            #      — is an ordinary interior frequency here. That is the one entry the
+                            #      conjugate fill cannot reach; see `_expand_hermitian!`.
+    novs::NTuple{2, Int}    # `Ñ` per axis, axis 1 as its full length rather than the rfft one
+    gk::GK                  # per-axis kernel Fourier coefficients, to undo the deconvolution by hand
+    normfactor::T           # `∏ 2π/Ñ_d`, the normalisation the deconvolution step applies
+    ls_batch::BW            # per-column solver bookkeeping, or `nothing` for a single field
 end
+
+ST.Plans.batch_width(::NonuniformFFTsScatteringPlan{T, B}) where {T, B} = B
+
+# One array per transform is what `exec_type1!`/`exec_type2!` take, so a `(…, B)` stack is handed over
+# as `B` views of its last dimension. Each view is contiguous, and `Val(B)` keeps the tuple's length in
+# the type, so this compiles to no work.
+@inline _fields(A::AbstractArray, ::Val{B}) where {B} =
+    ntuple(i -> selectdim(A, ndims(A), i), Val(B))
 
 # `PlanNUFFT` holds the scratch every execution writes through, so tasks cannot share one. The
 # points are retained above precisely so a task can build its own.
 #
-# The rebuild carries the plan's own thread count, defaulting to one, for the reason given on the
-# FINUFFT sibling: one plan exists per task, so leaving each one the whole machine oversubscribes and
-# makes every execution spawn a Julia task per FFT thread.
-function ST.Plans.task_local_plan(p::NonuniformFFTsScatteringPlan{T}) where {T}
-    return _plan_at(p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol,
+# The rebuild carries the batch width and the thread count. The thread count defaults to one because
+# the tasks already hold the cores, and a multi-threaded FFT plan spawns a Julia task per thread on
+# every execution.
+function ST.Plans.task_local_plan(p::NonuniformFFTsScatteringPlan{T, B}) where {T, B}
+    return _plan_at(p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol, B,
                     ST.Plans.per_task_nthreads(p.nthreads), p.damp)
 end
 
@@ -82,33 +133,201 @@ end
 # plan, device points a device-resident one, through the same code — and a task's rebuilt plan lands
 # on the same device, because it rebuilds from these same points.
 function _plan_at(ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, maxiter,
-                  rtol::T, nthreads::Int = 0, damp::T = zero(T)) where {T}
+                  rtol::T, B::Int = 1, nthreads::Int = 0, damp::T = zero(T)) where {T}
     halfsupport = _half_support(eps)
     # Serialised on the package-wide planner lock: a host plan's smooth-grid FFT is planned through
     # the same libfftw3 every other backend here plans through, and this builder runs inside spawned
     # tasks. `nthreads > 0` additionally pins that planner's thread count, which the FFT plan bakes in
     # — a count of 0 leaves it at whatever the process has, which is NonuniformFFTs' own default.
     function build()
-        pl = NonuniformFFTs.PlanNUFFT(Complex{T}, ms;
-                                      m = NonuniformFFTs.HalfSupport(halfsupport),
-                                      backend = NonuniformFFTs.KA.get_backend(sx))
+        common = (m = NonuniformFFTs.HalfSupport(halfsupport), ntransforms = Val(B),
+                  backend = NonuniformFFTs.KA.get_backend(sx))
+        pl = NonuniformFFTs.PlanNUFFT(Complex{T}, ms; common...)
+        rpl = NonuniformFFTs.PlanNUFFT(T, ms; common...)
         NonuniformFFTs.set_points!(pl, (sx, sy))
-        return pl
+        NonuniformFFTs.set_points!(rpl, (sx, sy))
+        return (pl, rpl)
     end
-    plan = Base.@lock ST.Plans.PLANNER_LOCK begin
+    plan, rplan = Base.@lock ST.Plans.PLANNER_LOCK begin
         nthreads > 0 ? ST.Plans.with_fft_nthreads(build, nthreads) : build()
     end
-    pts() = similar(sx, Complex{T}, M)
-    modes() = similar(sx, Complex{T}, ms)
-    return NonuniformFFTsScatteringPlan(
-        plan, ms, M, one(T) / prod(ms), solve, maxiter, rtol, damp, sx, sy, eps, nthreads,
-        pts(), modes(), modes(), modes(), modes(), pts())
+    m1h = ms[1] ÷ 2 + 1
+    pts() = B == 1 ? similar(sx, Complex{T}, M) : similar(sx, Complex{T}, M, B)
+    rpts() = B == 1 ? similar(sx, T, M) : similar(sx, T, M, B)
+    modes() = B == 1 ? similar(sx, Complex{T}, ms) : similar(sx, Complex{T}, (ms..., B))
+    half() = B == 1 ? similar(sx, Complex{T}, m1h, ms[2]) :
+                      similar(sx, Complex{T}, m1h, ms[2], B)
+    # `mir[j]` is the index of `-f₂` on the second axis. Under `fftfreq` that is `1` for `j = 1` and
+    # `ms[2] - j + 2` otherwise; for even `ms[2]` the entry at `-ms[2]/2` maps to itself, and that one
+    # is filled from the oversampled spectrum instead, so the value is unused there.
+    mir = similar(sx, Int, ms[2])
+    copyto!(mir, [j == 1 ? 1 : ms[2] - j + 2 for j in 1:ms[2]])
+    # The oversampled spectrum and the pieces needed to deconvolve a value read straight out of it.
+    # One oversampled array per transform, so `B` of them when batched — the expansion reads the one
+    # belonging to the column it is filling.
+    us_ovs = rplan.data.ûs
+    novs = (2 * (size(us_ovs[1], 1) - 1), size(us_ovs[1], 2))
+    gk = ntuple(d -> NonuniformFFTs.fourier_coefficients(rplan.kernels[d]), 2)
+    normfactor = prod(2 * T(π) / novs[d] for d in 1:2)
+    # Only a batched solve needs the per-column machinery. The two norms are each held at both ranks
+    # over one allocation, since the point stack is rank 2 and the mode stack rank 3.
+    batch = if solve && B > 1
+        nrm_p = similar(sx, T, 1, B)
+        nrm_m = similar(sx, T, 1, 1, B)
+        coef() = similar(sx, T, 1, 1, B)
+        host() = Vector{T}(undef, B)
+        ST.Plans.BatchedLSMRWork(nrm_p, reshape(nrm_p, 1, 1, B), nrm_m, reshape(nrm_m, 1, B),
+                                 coef(), coef(), coef(),
+                                 host(), host(), host(), host(), host(),
+                                 [ST.Plans.lsmr_init(zero(T), zero(T)) for _ in 1:B])
+    else
+        nothing
+    end
+    cj, ct = pts(), pts()
+    cv, cw, ch, chbar = modes(), modes(), modes(), modes()
+    # Own memory rather than views of the full-grid arrays: a half grid is a *strided sub-block* of a
+    # full one, not a contiguous prefix, and a NUFFT writes its output through a dense buffer.
+    hv, hw, hh, hhbar, hx = half(), half(), half(), half(), half()
+    rb, ru, rt = rpts(), rpts(), rpts()
+    return NonuniformFFTsScatteringPlan{T, B, typeof(plan), typeof(rplan), typeof(cj), typeof(cv),
+                                        typeof(hv), typeof(hx), typeof(rb), typeof(sx), typeof(mir),
+                                        typeof(us_ovs), typeof(gk), typeof(batch)}(
+        plan, rplan, ms, M, one(T) / prod(ms), solve, maxiter, rtol, damp, sx, sy, eps, nthreads,
+        cj, ct, cv, cw, ch, chbar, hv, hw, hh, hhbar, hx, rb, ru, rt,
+        mir, us_ovs, novs, gk, normfactor, batch)
+end
+
+# The adjoint of the real-data Type-2, in the inner product LSMR actually uses.
+#
+# Writing `A` for the half spectrum → real samples map, `A(h)_j = Σ_{k₁=0} hₖ e^{ik·xⱼ} +
+# 2 Σ_{k₁>0} Re(hₖ e^{ik·xⱼ})`: every row above DC enters twice, once as `k` and once as `−k`. So `A`
+# is only ℝ-linear — `A(i·e_k) ≠ i·A(e_k)` — and its adjoint is with respect to the real inner product
+# `⟨h, g⟩ = Re Σ conj(hₖ) gₖ`, which treats real and imaginary parts as separate coordinates. That is
+# exactly the inner product LSMR works in: every scalar in the recurrence is real and every inner
+# product reaches the vectors through `norm`, which for a complex array is the real Euclidean norm.
+#
+# `exec_type1!` supplies half of that adjoint on every row above DC, so those rows are doubled here.
+# Verified against `⟨A h, v⟩ = ⟨h, A† v⟩` to 4e-15 for even and odd `ms[1]`.
+function _real_adjoint!(dst::AbstractArray, plan::NonuniformFFTsScatteringPlan{T, 1},
+                        src::AbstractArray) where {T}
+    NonuniformFFTs.exec_type1!(dst, plan.rplan, src)
+    @views dst[2:end, :] .*= 2
+    return _sym_dc_row!(dst, plan)
+end
+
+function _real_adjoint!(dst::AbstractArray, plan::NonuniformFFTsScatteringPlan{T, B},
+                        src::AbstractArray) where {T, B}
+    NonuniformFFTs.exec_type1!(_fields(dst, Val(B)), plan.rplan, _fields(src, Val(B)))
+    @views dst[2:end, :, :] .*= 2
+    return _sym_dc_row!(dst, plan)
+end
+
+# Replace the DC row by its Hermitian-symmetric part, `h[1,j] ← (h[1,j] + conj(h[1,-j]))/2`.
+#
+# An r2c transform halves one axis, so the stored half keeps the full range on the others — which
+# means the DC row holds both `(0,k₂)` and `(0,−k₂)`. Those are negatives of each other, so they
+# contribute the same `cos` and opposite `sin`: four real parameters over a two-dimensional space. As
+# a transform output that is harmless (the data fixes both), but as free unknowns in a fit it is a
+# null space, and `A` cannot see the antisymmetric part at all.
+#
+# So the fit is restricted to the symmetric part. The projection is self-adjoint and `A∘P = A`, so the
+# operator pair stays consistent and applying it here keeps every iterate in the range of `P`. Without
+# it the bidiagonalisation terminates exactly on that null space, which divides by zero in the update
+# coefficients.
+function _sym_dc_row!(dst::AbstractArray, plan::NonuniformFFTsScatteringPlan)
+    m1, m2 = plan.ms
+    m1h = m1 ÷ 2 + 1
+    nyq = iseven(m2) ? m2 ÷ 2 + 1 : 0            # column holding `-m2/2`, which has no partner
+    nb = ndims(dst) == 2 ? 1 : size(dst, 3)
+    @inbounds for c in 1:nb, j in 1:m2
+        # A mode `(a, c)` puts `h` at `(a, c)` and `conj(h)` at `(-a, -c)`. For even `ms`, one of those
+        # two frequencies is off the `fftfreq` grid — `+ms[1]/2` for the top row, `+ms[2]/2` for this
+        # column — so the expansion onto the grid can only carry half of the mode. Left free, the fit
+        # uses it and the dropped half makes the answer stop reproducing the samples. Excluded, the
+        # solve runs over exactly the real fields the grid can hold.
+        if j == nyq
+            for i in 1:m1h
+                dst[i, j, c] = 0
+            end
+            continue
+        end
+        iseven(m1) && (dst[m1h, j, c] = 0)
+        jj = plan.mir[j]
+        jj < j && continue                       # each pair handled once, at its lower index
+        a, b = dst[1, j, c], dst[1, jj, c]
+        s = (a + conj(b)) / 2                    # `j == jj` at `k₂ = 0`, where this is `real(a)`
+        dst[1, j, c] = s
+        dst[1, jj, c] = conj(s)
+    end
+    return dst
+end
+
+# Expand a half spectrum onto the full `fftfreq × fftfreq` grid the wavelet bank is built on. Rows up
+# to `m1h` are the transform's own output; the rest are the conjugates of their frequency partners,
+# which is exact because the analysed field is real. Trailing `Colon`s carry the batch axis when there
+# is one, so this serves both ranks.
+
+# Oversampled `fftfreq(Ñ)` index (1-based) of integer frequency `f`.
+@inline _ovs_index(f::Int, Ñ::Int) = f >= 0 ? f + 1 : Ñ + f + 1
+
+# Kernel-Fourier-coefficient index of frequency `f`. These plans are built unshifted, so `ĝ` is laid
+# out in `fftfreq` order like the output and the index is the plain one — `f + 1` forward, wrapping for
+# negative `f`. `ĝ` is even, so the out-of-range `+N/2` lands on `-N/2`'s slot, which is the same value.
+@inline _gk_index(f::Int, N::Int) = f >= 0 ? f + 1 : N + f + 1
+
+# Expanding a *solution* is not the same operation as expanding a transform's output, and the
+# difference is exactly the unpaired frequency. There, `H` holds a coefficient the model cannot
+# represent — the mask keeps it at zero — so the full grid gets zero. The analysis expansion instead
+# recovers a genuine transform value from the oversampled buffer. Using that branch here injects the
+# last transform's oversampled spectrum into the answer, which for even `ms` is most of the error.
+function _expand_solution!(F::AbstractArray, plan::NonuniformFFTsScatteringPlan, H::AbstractArray)
+    ms = plan.ms
+    hi1, hi2 = (ms[1] - 1) ÷ 2, (ms[2] - 1) ÷ 2
+    nb = ndims(F) == 2 ? 1 : size(F, 3)
+    @inbounds for c in 1:nb, j in 1:ms[2], i in 1:ms[1]
+        f1 = i - 1 <= hi1 ? i - 1 : i - 1 - ms[1]
+        f2 = j - 1 <= hi2 ? j - 1 : j - 1 - ms[2]
+        F[i, j, c] = if f1 >= 0
+            H[f1 + 1, j, c]
+        elseif !(iseven(ms[2]) && f2 == -(ms[2] ÷ 2))
+            conj(H[-f1 + 1, plan.mir[j], c])
+        else
+            zero(eltype(F))
+        end
+    end
+    return F
+end
+
+function _expand_hermitian!(F::AbstractArray, plan::NonuniformFFTsScatteringPlan, H::AbstractArray)
+    ms = plan.ms
+    hi1, hi2 = (ms[1] - 1) ÷ 2, (ms[2] - 1) ÷ 2
+    nb = ndims(F) == 2 ? 1 : size(F, 3)
+    @inbounds for c in 1:nb, j in 1:ms[2], i in 1:ms[1]
+        f1 = i - 1 <= hi1 ? i - 1 : i - 1 - ms[1]
+        f2 = j - 1 <= hi2 ? j - 1 : j - 1 - ms[2]
+        if f1 >= 0
+            # Straight out of the transform's own output.
+            F[i, j, c] = H[f1 + 1, j, c]
+        elseif !(iseven(ms[2]) && f2 == -(ms[2] ÷ 2))
+            # `X[-k] = conj(X[k])` for real samples, and `-k` is on the grid.
+            F[i, j, c] = conj(H[-f1 + 1, plan.mir[j], c])
+        else
+            # `-k` has `f₂ = +ms[2]/2`, which `fftfreq(ms[2])` does not carry — but the oversampled
+            # spectrum runs to `Ñ₂ > ms[2]`, so there it is an ordinary interior frequency. Read it
+            # from there and apply the deconvolution and normalisation the truncating step would have.
+            n1, n2 = -f1, -f2
+            β = plan.normfactor / plan.gk[1][n1 + 1] / plan.gk[2][_gk_index(n2, ms[2])]
+            F[i, j, c] = conj(β * plan.us_ovs[c][_ovs_index(n1, plan.novs[1]),
+                                                 _ovs_index(n2, plan.novs[2])])
+        end
+    end
+    return F
 end
 
 # The plan holds device/threading state and scratch, so it prints as one line rather than dumping
 # its internals, and a concurrent task takes its own.
-Base.show(io::IO, p::NonuniformFFTsScatteringPlan{T}) where {T} =
-    print(io, "NonuniformFFTsScatteringPlan{", T, "}(ms=", p.ms, ", M=", p.M,
+Base.show(io::IO, p::NonuniformFFTsScatteringPlan{T, B}) where {T, B} =
+    print(io, "NonuniformFFTsScatteringPlan{", T, "}(ms=", p.ms, ", M=", p.M, ", ntrans=", B,
           ", solve=", p.solve, ")")
 Base.show(io::IO, ::MIME"text/plain", p::NonuniformFFTsScatteringPlan) = show(io, p)
 
@@ -118,11 +337,16 @@ ST.Plans.plan_analysis(p::NonuniformFFTsScatteringPlan) =
     (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp, eps = p.eps,
      nufft_nthreads = p.nthreads)
 
-# NonuniformFFTs expresses accuracy as the convolution kernel's half-support, not as a tolerance
-# (its documented default, `m = 4` with `σ = 2.0`, gives ~1e-7 relative for `Float64`). The `eps`
-# the scattered-plan interface takes — a FINUFFT-style tolerance — is therefore mapped to the
-# smallest half-support that meets it, so the two fast backends honour the same request.
-_half_support(tol::Real) = tol >= 1.0e-4 ? 2 : tol >= 1.0e-7 ? 4 : tol >= 1.0e-10 ? 6 : 8
+# NonuniformFFTs expresses accuracy as the convolution kernel's half-support, not as a tolerance, so
+# the `eps` this interface takes — a FINUFFT-style tolerance — is mapped to the smallest half-support
+# that meets it, and the two fast backends then honour the same request.
+#
+# Kaiser–Bessel aliasing error goes as `ε ≈ exp(-2πm√(1 - 1/σ))` for half-support `m` and oversampling
+# `σ`, so that inverted is the mapping. At `σ = 2` — NonuniformFFTs' default, and what these plans use
+# — it agrees with the library's documented `m = 4` giving ~1e-7, and returns the same widths FINUFFT
+# picks for the same tolerance.
+_half_support(tol::Real, σ::Real = 2) =
+    max(2, ceil(Int, log(1 / tol) / (2π * sqrt(1 - 1 / σ))))
 
 function ST.Plans.nonuniformffts_scattered_plan(x, y, ms::NTuple{2, Int}, ::Type{T};
                                                 period = nothing, solve::Bool = false,
@@ -130,11 +354,11 @@ function ST.Plans.nonuniformffts_scattered_plan(x, y, ms::NTuple{2, Int}, ::Type
                                                 rtol::Real = ST.Plans.default_solver_rtol(T, ST.Plans.NonuniformFFTsBackend(), eps),
                                                 damp::Real = 0, ntrans::Int = 1,
                                                 nufft_nthreads::Int = 0) where {T}
-    # Accepted so the caller need not know which backend it will get, and deliberately not acted on:
-    # this plan reports `batch_width == 1`, so the cascade keeps its per-field loop. NonuniformFFTs
-    # does expose `ntransforms`, but measured against the same transforms issued one at a time it is
-    # 1.16x at `B = 8` and 0.70x at `B = 32` on this package's mode-grid sizes — batching it would
-    # cost throughput at the batch sizes that matter.
+    # `ntrans` is honoured, not swallowed: the plan is built `ntrans` wide and the cascade issues one
+    # execution per step for the whole stack. Whether that pays depends on the mode grid, and it is
+    # the caller's choice to make — batching amortises per-call overhead but multiplies the
+    # oversampled working set by `ntrans`, so it wins on small grids and loses once `ntrans` copies of
+    # that grid stop fitting cache.
     M = length(x)
     length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
     ST.Plans.warn_underdetermined(M, ms, solve, damp)
@@ -146,7 +370,8 @@ function ST.Plans.nonuniformffts_scattered_plan(x, y, ms::NTuple{2, Int}, ::Type
     sy = T(2π) .* (T.(y) .- ymin) ./ py
 
     tol = eps === nothing ? ST.Plans.default_nufft_eps(T) : eps
-    return _plan_at(ms, M, sx, sy, T(tol), T, solve, maxiter, T(rtol), nufft_nthreads, T(damp))
+    return _plan_at(ms, M, sx, sy, T(tol), T, solve, maxiter, T(rtol), ntrans, nufft_nthreads,
+                    T(damp))
 end
 
 # Synthesis: modes → points (Type-2), scaled by 1/prod(ms) so it is the ifft-convention inverse.
@@ -158,8 +383,25 @@ function ST.Plans.inverse_transform!(out_pts::AbstractVector, plan::NonuniformFF
 end
 
 # Analysis: points → modes. Type-1 adjoint (fft-equivalent on a uniform grid) unless `solve`.
+#
+# Real samples: their spectrum is Hermitian, so the transform runs on the real-data plan over the half
+# grid and the result is expanded onto the full grid the wavelet bank is built on. Half the FFT work
+# and half the grid memory of the complex form.
 function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NonuniformFFTsScatteringPlan,
-                                     x_pts::AbstractVector)
+                                     x_pts::AbstractVector{<:Real})
+    copyto!(plan.rb, x_pts)
+    if plan.solve
+        _lsmr_solve_real!(Xmodes, plan)
+    else
+        NonuniformFFTs.exec_type1!(plan.hx, plan.rplan, plan.rb)
+        _expand_hermitian!(Xmodes, plan, plan.hx)
+    end
+    return Xmodes
+end
+
+# Complex samples: nothing is redundant, so this is the full-grid transform on the complex plan.
+function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NonuniformFFTsScatteringPlan,
+                                     x_pts::AbstractVector{<:Complex})
     if plan.solve
         _lsmr_solve!(Xmodes, plan, x_pts)
     else
@@ -169,15 +411,98 @@ function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NonuniformFFT
     return Xmodes
 end
 
-# Least-squares inversion, sharing the core solver with the in-core and FINUFFT paths so the three
-# agree to solver tolerance. `A f̃ = x` is solved and scaled by `N` afterwards rather than inflating
-# the right-hand side by `prod(ms)` — see the FINUFFT sibling.
+# Batched forms. A plan built `B` wide executes exactly `B` transforms per call, so these are the only
+# valid shapes for it, just as the shapes above are the only valid ones for a `B = 1` plan.
+function ST.Plans.inverse_transform!(out_pts::AbstractMatrix,
+                                     plan::NonuniformFFTsScatteringPlan{T, B},
+                                     Xmodes::AbstractArray{<:Any, 3}) where {T, B}
+    NonuniformFFTs.exec_type2!(_fields(plan.cj, Val(B)), plan.plan, _fields(Xmodes, Val(B)))
+    @. out_pts = plan.cj * plan.invN
+    return out_pts
+end
+
+function ST.Plans.forward_transform!(Xmodes::AbstractArray{<:Any, 3},
+                                     plan::NonuniformFFTsScatteringPlan{T, B},
+                                     x_pts::AbstractMatrix{<:Real}) where {T, B}
+    copyto!(plan.rb, x_pts)
+    if plan.solve
+        _lsmr_solve_batched_real!(Xmodes, plan)
+    else
+        NonuniformFFTs.exec_type1!(_fields(plan.hx, Val(B)), plan.rplan,
+                                   _fields(plan.rb, Val(B)))
+        _expand_hermitian!(Xmodes, plan, plan.hx)
+    end
+    return Xmodes
+end
+
+function ST.Plans.forward_transform!(Xmodes::AbstractArray{<:Any, 3},
+                                     plan::NonuniformFFTsScatteringPlan{T, B},
+                                     x_pts::AbstractMatrix{<:Complex}) where {T, B}
+    if plan.solve
+        _lsmr_solve_batched!(Xmodes, plan, x_pts)
+    else
+        copyto!(plan.cj, x_pts)
+        NonuniformFFTs.exec_type1!(_fields(Xmodes, Val(B)), plan.plan, _fields(plan.cj, Val(B)))
+    end
+    return Xmodes
+end
+
+# Least-squares inversion. `A f̃ = x` is solved and scaled by `N` afterwards rather than inflating the
+# right-hand side by `prod(ms)`, which keeps intermediates at the field's own magnitude.
+#
+# Real samples: the fit runs over the half grid, which is the space a real field's coefficients
+# actually occupy. `A` is the real Type-2 and `A†` the weighted Type-1 — see `_real_adjoint!`.
+function _lsmr_solve_real!(f::AbstractMatrix, plan::NonuniformFFTsScatteringPlan{T}) where {T}
+    info = ST.Plans.lsmr_solve!(plan.hx,
+        (dst, src) -> NonuniformFFTs.exec_type2!(dst, plan.rplan, src),  # A : half modes → real pts
+        (dst, src) -> _real_adjoint!(dst, plan, src),                    # A†: real pts → half modes
+        plan.rb, plan.ru, plan.rt, plan.hv, plan.hw, plan.hh, plan.hhbar;
+        damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
+        conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
+    ST.Plans._check_solve(info, plan.M, (plan.ms[1] ÷ 2 + 1, plan.ms[2]), plan.rtol, plan.maxiter)
+    plan.hx .*= one(T) / plan.invN
+    return _expand_solution!(f, plan, plan.hx)
+end
+
+# Complex samples: no redundancy to exploit, so the fit is over the full grid on the complex plan.
 function _lsmr_solve!(f::AbstractMatrix, plan::NonuniformFFTsScatteringPlan{T},
                       x_pts::AbstractVector) where {T}
     info = ST.Plans.lsmr_solve!(f,
         (dst, src) -> NonuniformFFTs.exec_type2!(dst, plan.plan, src),   # A : modes → points
         (dst, src) -> NonuniformFFTs.exec_type1!(dst, plan.plan, src),   # A†: points → modes
-        x_pts, plan.cj, plan.ls_t, plan.ls_v, plan.ls_w, plan.ls_h, plan.ls_hbar;
+        x_pts, plan.cj, plan.ct, plan.cv, plan.cw, plan.ch, plan.chbar;
+        damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
+        conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
+    ST.Plans._check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
+    f .*= one(T) / plan.invN
+    return f
+end
+
+# The batched forms of both. A plan's width is fixed, so the whole stack advances together and every
+# scalar in the recurrence becomes one per column — see `Plans.lsmr_solve_batched!`.
+function _lsmr_solve_batched_real!(f::AbstractArray{<:Any, 3},
+                                   plan::NonuniformFFTsScatteringPlan{T, B}) where {T, B}
+    info = ST.Plans.lsmr_solve_batched!(plan.hx,
+        (dst, src) -> NonuniformFFTs.exec_type2!(_fields(dst, Val(B)), plan.rplan,
+                                                 _fields(src, Val(B))),
+        (dst, src) -> _real_adjoint!(dst, plan, src),
+        plan.rb, plan.ru, plan.rt, plan.hv, plan.hw, plan.hh, plan.hhbar, plan.ls_batch;
+        damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
+        conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
+    ST.Plans._check_solve(info, plan.M, (plan.ms[1] ÷ 2 + 1, plan.ms[2]), plan.rtol, plan.maxiter)
+    plan.hx .*= one(T) / plan.invN
+    return _expand_solution!(f, plan, plan.hx)
+end
+
+function _lsmr_solve_batched!(f::AbstractArray{<:Any, 3},
+                              plan::NonuniformFFTsScatteringPlan{T, B},
+                              x_pts::AbstractMatrix) where {T, B}
+    info = ST.Plans.lsmr_solve_batched!(f,
+        (dst, src) -> NonuniformFFTs.exec_type2!(_fields(dst, Val(B)), plan.plan,
+                                                 _fields(src, Val(B))),
+        (dst, src) -> NonuniformFFTs.exec_type1!(_fields(dst, Val(B)), plan.plan,
+                                                 _fields(src, Val(B))),
+        x_pts, plan.cj, plan.ct, plan.cv, plan.cw, plan.ch, plan.chbar, plan.ls_batch;
         damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
         conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     ST.Plans._check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)

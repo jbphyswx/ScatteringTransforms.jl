@@ -44,7 +44,6 @@ struct ScatteredPlanarScattering{T, FB, Tree, G<:AbstractVector, P, WV<:Abstract
     # bank's memory — no filter is copied — and exist only so the batched cascade does not build a
     # reshape per wavelet and per path on every call, which is pure allocation.
     wav_b::WB
-    buf_input_pts::CV        # (M) complexified input / U1
     X_modes::MM              # (ms) signal mode coefficients
     buf_modes::MM            # (ms) wavelet-multiply scratch
     buf_conv_pts::CV         # (M) synthesis output at points
@@ -96,7 +95,7 @@ function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, In
     wav_b = [reshape(ψ, ms..., 1) for ψ in fb.wavelets]
     return ScatteredPlanarScattering(
         fb, tree, groups, max_order, plan, w, wav_b,
-        cpts(), modes(), modes(), cpts(), rpts(), rpts(), modes())
+        modes(), modes(), cpts(), rpts(), rpts(), modes())
 end
 build(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, J::Int; kwargs...) =
     build(Float64, x, y, ms, J; kwargs...)
@@ -109,7 +108,7 @@ _wmean(st::ScatteredPlanarScattering, v::AbstractVector) = LinearAlgebra.dot(st.
 ScatteringCore.task_workspace(st::ScatteredPlanarScattering) = ScatteredPlanarScattering(
     st.filter_bank, st.tree, st.groups, st.max_order, Plans.task_local_plan(st.plan), st.weights,
     st.wav_b,
-    similar(st.buf_input_pts), similar(st.X_modes), similar(st.buf_modes),
+    similar(st.X_modes), similar(st.buf_modes),
     similar(st.buf_conv_pts), similar(st.buf_mod_pts),
     similar(st.buf_u1_pts), similar(st.buf_u1_modes))
 
@@ -135,8 +134,10 @@ function scattered_planar_scattering!(coeffs::Coefficients.ScatteringCoefficient
                                       st::ScatteredPlanarScattering, x::AbstractVector)
     fb, plan = st.filter_bank, st.plan
 
-    st.buf_input_pts .= complex.(x)
-    Plans.forward_transform!(st.X_modes, plan, st.buf_input_pts)         # signal mode coeffs
+    # The field goes to the plan as it is. Widening it to `Complex` here would hide from the transform
+    # the one thing it needs to pick an algorithm: a real field has a Hermitian spectrum and can be
+    # analysed on half the mode grid, a complex one cannot.
+    Plans.forward_transform!(st.X_modes, plan, x)                        # signal mode coeffs
 
     # Both orders in one grouped pass, as in the gridded `cascade!`: each first-order field is
     # synthesised once and reused by its children, rather than once for S1 and again for S2, and
@@ -148,8 +149,8 @@ function scattered_planar_scattering!(coeffs::Coefficients.ScatteringCoefficient
         ScatteringCore.apply_modulus!(st.buf_u1_pts, st.buf_conv_pts)
         coeffs.S1[j1] = _wmean(st, st.buf_u1_pts)
         isempty(children) && continue
-        st.buf_input_pts .= complex.(st.buf_u1_pts)
-        Plans.forward_transform!(st.buf_u1_modes, plan, st.buf_input_pts)
+        # A modulus, so real whatever the input was — and passed as such.
+        Plans.forward_transform!(st.buf_u1_modes, plan, st.buf_u1_pts)
         for j2 in children
             ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.buf_u1_modes, fb.wavelets[j2],
                                              plan, st.buf_modes)
@@ -179,8 +180,7 @@ function scattered_planar_scattering_batch!(S0::AbstractVector, S1::AbstractMatr
                                             S2::AbstractArray{<:Any, 3},
                                             st::ScatteredPlanarScattering, X::AbstractMatrix)
     plan = st.plan
-    st.buf_input_pts .= complex.(X)
-    Plans.forward_transform!(st.X_modes, plan, st.buf_input_pts)
+    Plans.forward_transform!(st.X_modes, plan, X)
 
     isempty(S2) || fill!(S2, zero(eltype(S2)))
     @inbounds for (j1, children, _) in st.groups
@@ -189,8 +189,8 @@ function scattered_planar_scattering_batch!(S0::AbstractVector, S1::AbstractMatr
         ScatteringCore.apply_modulus!(st.buf_u1_pts, st.buf_conv_pts)
         _wmean_batch!(view(S1, j1, :), st, st.buf_u1_pts)
         isempty(children) && continue
-        st.buf_input_pts .= complex.(st.buf_u1_pts)
-        Plans.forward_transform!(st.buf_u1_modes, plan, st.buf_input_pts)
+        # A modulus, so real whatever the input was — and passed as such.
+        Plans.forward_transform!(st.buf_u1_modes, plan, st.buf_u1_pts)
         for j2 in children
             ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.buf_u1_modes, st.wav_b[j2],
                                              plan, st.buf_modes)

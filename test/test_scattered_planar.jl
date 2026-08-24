@@ -190,23 +190,47 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         Test.@test ScatteringTransforms.Plans.per_task_nthreads(5) == 5
     end
 
-    Test.@testset "the three solve paths agree on irregular points" begin
-        # The existing cross-backend comparison runs `solve = false`, so a convention divergence in one
-        # backend's least-squares path was invisible. Same points, same field, all three solvers.
+    Test.@testset "every solve path recovers a band-limited field it was given" begin
+        # Cross-backend equality is the wrong assertion for `solve = true`. Real samples have a
+        # Hermitian spectrum, so a backend with a real-data transform fits them on the half grid, while
+        # a complex-only backend fits the full grid; neither model contains the other (they differ at
+        # the unpaired `±N/2` frequency), so their coefficients legitimately differ.
+        #
+        # What every backend must do is recover a field that lies in its model. So the field here is
+        # planted: Hermitian coefficients, zero on the modes an `fftfreq` grid cannot pair, giving a
+        # genuinely real band-limited field that all three models contain exactly. Recovering it is a
+        # sharper test than agreeing with each other, because it has a known right answer.
         Random.seed!(17)
-        M2 = 1200
+        ms_r, M2 = (16, 16), 1200
         xs, ys = 2π .* rand(M2), 2π .* rand(M2)
-        fs = [1.0 + 0.7cos(xs[k]) + 0.5sin(2ys[k]) - 0.3cos(xs[k]) * sin(ys[k]) for k in 1:M2]
-        coeffs(spec) = ScatteringTransforms.Coefficients.flatten2d(
-            ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
-                L = 4, max_order = 2, period = (2π, 2π), solve = true, spectral = spec)(fs))
-        direct = coeffs(SpectralBackends.DirectSumSpectralBackend())
-        finufft = coeffs(ScatteringTransforms.Plans.FINUFFTBackend())
-        nuffts = coeffs(ScatteringTransforms.Plans.NonuniformFFTsBackend())
-        Test.@test all(isfinite, direct)
-        Test.@test finufft ≈ direct rtol = 1e-5
-        Test.@test nuffts ≈ direct rtol = 1e-5
-        Test.@test nuffts ≈ finufft rtol = 1e-5
+        neg(j, N) = (hi = (N - 1) ÷ 2; f = j - 1 <= hi ? j - 1 : j - 1 - N;
+                     -f > hi ? 0 : (-f >= 0 ? -f + 1 : -f + N + 1))
+        F0 = zeros(ComplexF64, ms_r)
+        for j in 1:ms_r[2], i in 1:ms_r[1]
+            ii, jj = neg(i, ms_r[1]), neg(j, ms_r[2])
+            (ii == 0 || jj == 0) && continue            # unpaired: a real field cannot use it
+            iszero(F0[i, j]) || continue
+            z = randn(ComplexF64) / (1 + abs(i - 1) + abs(j - 1))
+            (i, j) == (ii, jj) ? (F0[i, j] = real(z)) : (F0[i, j] = z; F0[ii, jj] = conj(z))
+        end
+        ref = ScatteringTransforms.Plans.make_scattered_plan(
+            SpectralBackends.DirectSumSpectralBackend(), xs, ys, ms_r, Float64; period = (2π, 2π))
+        pts = zeros(ComplexF64, M2)
+        ScatteringTransforms.Plans.inverse_transform!(pts, ref, F0)
+        Test.@test maximum(abs ∘ imag, pts) < 1e-12 * maximum(abs ∘ real, pts)   # it is real
+        fs = real.(pts)
+        for spec in (SpectralBackends.DirectSumSpectralBackend(),
+                     ScatteringTransforms.Plans.FINUFFTBackend(),
+                     ScatteringTransforms.Plans.NonuniformFFTsBackend())
+            # Converged, not default: the assertion is about the model, and an iterate stopped at
+            # `rtol` would be compared against an exact answer it was never asked to reach.
+            plan = ScatteringTransforms.Plans.make_scattered_plan(spec, xs, ys, ms_r, Float64;
+                period = (2π, 2π), solve = true, maxiter = 2000, rtol = 1.0e-12,
+                nufft_nthreads = 1)
+            F = zeros(ComplexF64, ms_r)
+            ScatteringTransforms.Plans.forward_transform!(F, plan, fs)
+            Test.@test maximum(abs, F .- F0) < 1.0e-6 * maximum(abs, F0)
+        end
     end
 
     Test.@testset "the solve leaves its input untouched" begin
@@ -232,26 +256,46 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
     Test.@testset "solve=true under the threaded backend and batched over ntrans" begin
         # Two gaps at once: the threaded comparison ran `solve = false`, which is what would have hidden
         # a `task_local_plan` field left un-copied, and the batched solve was refused outright before.
+        #
+        # Run over both fast backends, because the batch width is a request a plan can quietly decline:
+        # a backend that accepted `ntrans` and built a single-field plan anyway would return correct
+        # coefficients through a per-field loop, and every assertion except `batch_width` would pass.
         Random.seed!(23)
         M2, B2 = 800, 4
         xs, ys = 2π .* rand(M2), 2π .* rand(M2)
         X = hcat([[1.0 + 0.7cos(xs[k]) + 0.5sin(2ys[k]) + 0.05c for k in 1:M2] for c in 1:B2]...)
-        FB = ScatteringTransforms.Plans.FINUFFTBackend()
-        single = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
-            L = 4, max_order = 2, period = (2π, 2π), solve = true, spectral = FB)
-        serial = ScatteringTransforms.scattering_batch(
-            ComputationalBackends.SerialBackend(), single, X)
-        Test.@test all(isfinite, serial)
-        Test.@test ScatteringTransforms.scattering_batch(
-            ComputationalBackends.ThreadedBackend(), single, X) ≈ serial rtol = 1e-10
+        # Converged settings, because these compare *execution paths* and nothing else. A solve stopped
+        # on a tolerance ends at whichever iteration crosses it, and serial, threaded and batched cross
+        # it an iteration or two apart — so at default `rtol` they differ by roughly that tolerance
+        # (measured 6e-4 at `rtol = 1.5e-8`) no matter how correct each one is. Converging first makes
+        # the comparison about the execution path rather than about where the iteration happened to
+        # stop, which is the only way this test can catch a shared buffer or a dropped batch width.
+        conv = (; maxiter = 2000, rtol = 1.0e-12)
+        for spec in (ScatteringTransforms.Plans.FINUFFTBackend(),
+                     ScatteringTransforms.Plans.NonuniformFFTsBackend())
+            single = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
+                L = 4, max_order = 2, period = (2π, 2π), solve = true, spectral = spec, conv...)
+            serial = ScatteringTransforms.scattering_batch(
+                ComputationalBackends.SerialBackend(), single, X)
+            Test.@test all(isfinite, serial)
+            Test.@test ScatteringTransforms.scattering_batch(
+                ComputationalBackends.ThreadedBackend(), single, X) ≈ serial rtol = 1e-8
 
-        batched = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (16, 16), 3;
-            L = 4, max_order = 2, period = (2π, 2π), solve = true, spectral = FB, ntrans = B2)
-        Test.@test ScatteringTransforms.Plans.batch_width(batched.plan) == B2
-        # Asserted, not assumed: without the per-column bookkeeping the batched path is not running.
-        Test.@test batched.plan.ls_batch !== nothing
-        Test.@test ScatteringTransforms.scattering_batch(
-            ComputationalBackends.SerialBackend(), batched, X) ≈ serial rtol = 1e-6
+            batched = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (16, 16), 3;
+                L = 4, max_order = 2, period = (2π, 2π), solve = true, spectral = spec,
+                ntrans = B2, conv...)
+            Test.@test ScatteringTransforms.Plans.batch_width(batched.plan) == B2
+            # Asserted, not assumed: without the per-column bookkeeping the batched path is not running.
+            Test.@test batched.plan.ls_batch !== nothing
+            Test.@test ScatteringTransforms.scattering_batch(
+                ComputationalBackends.SerialBackend(), batched, X) ≈ serial rtol = 1e-8
+            # A per-task rebuild must keep the width, or a threaded batch silently leaves the batched
+            # path while still returning the right answer.
+            Test.@test ScatteringTransforms.Plans.batch_width(
+                ScatteringTransforms.Plans.task_local_plan(batched.plan)) == B2
+            Test.@test ScatteringTransforms.scattering_batch(
+                ComputationalBackends.ThreadedBackend(), batched, X) ≈ serial rtol = 1e-8
+        end
     end
 
     Test.@testset "a transform rebuilt from its spec analyses the same way" begin

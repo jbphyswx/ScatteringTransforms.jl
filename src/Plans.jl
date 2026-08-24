@@ -283,6 +283,24 @@ function lsmr_step(st::LSMRState{T}, alpha::T, beta::T, damp::T,
     zeta = cbar * st.zetabar
     zetabar = -sbar * st.zetabar
 
+    # Exact termination. When the bidiagonalisation runs out of Krylov space it returns
+    # `alpha = beta = 0`, which sends `rho` — and with it `rhobar` — to zero, and all three update
+    # coefficients below divide by them. The iterate at that point is the answer the process reached,
+    # so this reports a stop rather than dividing.
+    #
+    # It has to be caught here, not by the caller's loop. The stopping tests are computed *after* these
+    # coefficients, so a division by zero produces `NaN` before any `istop` can be set; and a batched
+    # solve shares one loop across its columns, freezing a column only once its `istop` is nonzero, so
+    # the `NaN` would then be carried through every later iteration. Reached whenever the system is
+    # consistent enough to be solved exactly — a smooth field on a well-sampled point set is enough.
+    if iszero(rho) || iszero(rhobar)
+        return (LSMRState{T}(alphabar, rho, rhobar, cbar, sbar, zeta, zetabar,
+                             st.betadd, st.betad, st.rhodold, st.tautildeold, st.thetatilde, st.d,
+                             st.normA2, st.maxrbar, st.minrbar, st.normb, st.normr, st.normar,
+                             st.normA, st.condA, st.istop == 0 ? 1 : st.istop, st.iters + 1),
+                zero(T), zero(T), zero(T))
+    end
+
     chbar = -(thetabar * rho / (rhoold * rhobarold))
     cx = zeta / (rho * rhobar)
     ch = -(thetanew / rho)
