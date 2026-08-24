@@ -662,14 +662,26 @@ Test.@testset "Intermediate subsampling: exact at large oversampling, ≈ exact 
     Test.@test ScatteringTransforms.Coefficients.second_order(c_off) ≈ ScatteringTransforms.Coefficients.second_order(exact)
     Test.@test ScatteringTransforms.Coefficients.zeroth_order(c_off) ≈ ScatteringTransforms.Coefficients.zeroth_order(exact)
 
-    # Aggressive subsampling ⇒ S1 identical (full res), S2 close (decimated envelope).
+    # Aggressive subsampling ⇒ S1 identical (full res), S2 lossy by exactly the aliasing decimation
+    # introduces.
     sub_on = ScatteringTransforms.SubsampledScattering.SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=1)
     c_on = sub_on(signal)
     Test.@test ScatteringTransforms.Coefficients.first_order(c_on) ≈ ScatteringTransforms.Coefficients.first_order(exact)
+
+    # What is asserted is where the loss goes to zero, not how big it is below that. A modulus is
+    # nonlinear, so the envelope it produces has no compact spectrum and decimating it always aliases
+    # something; how much depends on the signal and has no per-draw bound (on white noise: 1.9% mean,
+    # 9.1% over 200 draws at `oversampling = 1`). What does hold for every draw is that retaining
+    # enough band is *exactly* lossless, and that below it the loss is real rather than the subsampled
+    # path quietly declining to decimate.
     S2e = ScatteringTransforms.Coefficients.second_order(exact)
-    S2s = ScatteringTransforms.Coefficients.second_order(c_on)
-    denom = sum(abs2, S2e)
-    Test.@test sum(abs2, S2s .- S2e) / denom < 0.05    # within ~5% relative energy
+    err(ov) = let s = ScatteringTransforms.SubsampledScattering.SubsampledScattering1D(
+                  N, J; Q=1, max_order=2, oversampling=ov)
+        sum(abs2, ScatteringTransforms.Coefficients.second_order(s(signal)) .- S2e) /
+            sum(abs2, S2e)
+    end
+    Test.@test err(3) == 0
+    Test.@test err(0) > 0
 end
 
 Test.@testset "Threaded batch (OhMyThreads) matches serial batch" begin

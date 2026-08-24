@@ -140,7 +140,14 @@ function _plan_at(ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, 
     # tasks. `nthreads > 0` additionally pins that planner's thread count, which the FFT plan bakes in
     # — a count of 0 leaves it at whatever the process has, which is NonuniformFFTs' own default.
     function build()
+        # `sort_points` permutes the points once, at `set_points!`, so every later execution reads them
+        # in block order. A plan here is built once over fixed points and then transformed through
+        # `(1 + nparents) + (nw + npaths)` times per field — many more if it solves — so paying that
+        # once is the right trade at any size. Swept over `ms` from `8²` to `512²` and point counts
+        # from `0.1·prod(ms)` to `10·prod(ms)`: neutral below `64²`, 1.4-1.6x at `256²`-`512²` with
+        # dense point sets, worst case 0.97x.
         common = (m = NonuniformFFTs.HalfSupport(halfsupport), ntransforms = Val(B),
+                  sort_points = NonuniformFFTs.Static.True(),
                   backend = NonuniformFFTs.KA.get_backend(sx))
         pl = NonuniformFFTs.PlanNUFFT(Complex{T}, ms; common...)
         rpl = NonuniformFFTs.PlanNUFFT(T, ms; common...)
