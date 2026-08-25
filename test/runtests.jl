@@ -155,15 +155,49 @@ end
 
 Test.@testset "Filter bank is a tight frame (Littlewood-Paley ≡ 1)" begin
     # |φ(ω)|² + Σⱼ|ψⱼ(ω)|² ≡ 1: non-expansive, no frequency amplified.
+    #
+    # The identity is exact by construction — `φ = √(1 − Σⱼ|ψⱼ|²)`, so the sum is that expression
+    # squared again — and it holds over the whole band, not just the positive half. Measured
+    # deviation is one ulp (2.220e-16 in Float64, 1.192e-07 in Float32, i.e. `eps(T)` in each), so
+    # the tolerance is a small multiple of `eps` rather than a round number that would let a bank
+    # drift a long way before failing.
     for (N, J, Q) in ((1024, 6, 1), (512, 4, 2))
         fb = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=Q)
-        Nh = N ÷ 2
-        lp = abs2.(fb.averaging[1:Nh]) .+ sum(abs2.(ψ[1:Nh]) for ψ in fb.wavelets)
-        Test.@test maximum(abs, lp .- 1) < 1e-2
+        lp = abs2.(fb.averaging) .+ sum(abs2.(ψ) for ψ in fb.wavelets)
+        Test.@test maximum(abs, lp .- 1) < 4 * eps(Float64)
     end
     fb2 = ScatteringTransforms.FilterBanks.build_filter_bank2d((64, 64), 3; L=8)
     lp2 = abs2.(fb2.averaging) .+ sum(abs2.(ψ) for ψ in fb2.wavelets)
-    Test.@test maximum(abs, lp2 .- 1) < 1e-2
+    Test.@test maximum(abs, lp2 .- 1) < 4 * eps(Float64)
+end
+
+Test.@testset "Filter banks are real, and stored as such" begin
+    # A Morlet's Fourier response is real — analyticity is the half-plane support, not a complex
+    # value — so the bank is the same numbers in half the memory, and a wavelet multiply is
+    # complex×real. The bank is the largest single item in a transform, so this is not a detail.
+    #
+    # The narrower container is asserted alongside the tight-frame sum it has to keep satisfying,
+    # so a bank that reached a real element type by discarding information would fail here rather
+    # than pass on the type check alone.
+    for T in (Float64, Float32)
+        banks = (ScatteringTransforms.FilterBanks.build_filter_bank1d(T, 128, 4; Q=2),
+                 ScatteringTransforms.FilterBanks.build_filter_bank2d(T, (32, 32), 3; L=4),
+                 ScatteringTransforms.FilterBanks.build_filter_bank3d(T, (16, 16, 16), 2;
+                                                                     n_orient=4),
+                 ScatteringTransforms.Monogenic.build_monogenic_bank(T, (16, 16), 3))
+        for fb in banks
+            Test.@test eltype(fb.averaging) == T
+            Test.@test all(ψ -> eltype(ψ) == T, fb.wavelets)
+            lp = abs2.(fb.averaging) .+ sum(abs2.(ψ) for ψ in fb.wavelets)
+            Test.@test maximum(abs, lp .- 1) < 4 * eps(T)
+        end
+        # The Riesz multipliers are genuinely complex (`R_d(k) = -i k_d/|k|`) and stay so — the
+        # saving comes from the wavelets being real, not from narrowing everything in sight.
+        mb = banks[end]
+        Test.@test all(R -> eltype(R) == Complex{T}, mb.riesz)
+        Test.@test maximum(R -> maximum(abs ∘ real, R), mb.riesz) == 0
+        Test.@test maximum(R -> maximum(abs ∘ imag, R), mb.riesz) > 0
+    end
 end
 
 Test.@testset "1D Filter Bank Tests" begin
@@ -384,8 +418,12 @@ Test.@testset "2D Filter Tests" begin
     
     resp = ScatteringTransforms.Filters.frequency_response(morlet)
     Test.@test size(resp) == (Ny, Nx)
-    Test.@test eltype(resp) == ComplexF64
-    
+    # A Morlet's *Fourier* response is real: its analyticity is the half-plane support (asserted
+    # below), not a complex value. Storing it as such is what halves the filter bank.
+    Test.@test eltype(resp) == Float64
+    Test.@test eltype(ScatteringTransforms.Filters.frequency_response(
+        ScatteringTransforms.Filters.Morlet2D{Float32}((Ny, Nx), 2, π/4; L=8))) == Float32
+
     # 1. Peak location
     # Since theta = π/4 and j = 2, the center frequency is k0 = 3π / (4 * 2^2) = 3π / 16 ≈ 0.589.
     # Frequency grid: kx = _fftfreq(Nx, ix-1) * 2π, ky = _fftfreq(Ny, iy-1) * 2π.

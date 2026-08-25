@@ -348,4 +348,75 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         Test.@test nuffts ≈ direct rtol=1e-6
         Test.@test nuffts ≈ finufft rtol=1e-6
     end
+
+    Test.@testset "A plan carries scratch only for the path it takes" begin
+        # `task_local_plan` builds one plan per task, so anything a plan holds and never uses is
+        # multiplied by the thread count. Gated by counting bytes rather than by naming fields: the
+        # claim is about what a plan *costs*, and a field-name assertion would pass on a plan that
+        # merely renamed its dead buffers.
+        #
+        # `M` is deliberately much larger than `prod(ms)` — point-space scratch is what dominates a
+        # real problem, and a grid-sized point set would hide it.
+        Random.seed!(21)
+        ms = (32, 32)
+        M2 = 16 * prod(ms)
+        xs, ys = rand(M2), rand(M2)
+        B = 4
+        pt_real = M2 * B * sizeof(Float64)             # one (M, B) real point array
+        pt_cplx = M2 * B * sizeof(ComplexF64)          # one (M, B) complex point array
+        mode_bytes = prod(ms) * B * sizeof(ComplexF64) # one (ms…, B) full mode array
+        for spec in (ScatteringTransforms.Plans.NonuniformFFTsBackend(),
+                     ScatteringTransforms.Plans.FINUFFTBackend())
+            plan(solve) = ScatteringTransforms.Plans.make_scattered_plan(
+                spec, xs, ys, ms, Float64; period = (1.0, 1.0), solve = solve, eps = 1e-8,
+                ntrans = B, nufft_nthreads = 1)
+            # A non-solving plan holds none of the solver's six vectors. Its four mode-space ones
+            # alone exceed this margin, so a plan allocating them unconditionally cannot pass.
+            Test.@test Base.summarysize(plan(false)) + 4 * mode_bytes <=
+                       Base.summarysize(plan(true))
+            # And no point-space scratch at all: everything a non-solving plan owns, the NUFFT plan
+            # underneath included, comes to less than the two coordinate vectors plus a single
+            # point-space buffer.
+            Test.@test Base.summarysize(plan(false)) < 2 * M2 * sizeof(Float64) + pt_cplx
+
+            # The cascade's own arrays reach the transform without a copy, so running one through a
+            # plan adds no buffer. A bound rather than equality because NonuniformFFTs' plan holds a
+            # `TimerOutput` that records each section the first time it is entered: +1910 B here,
+            # against 512 kB for the buffer this is asserting the absence of.
+            p = plan(false)
+            F = zeros(ComplexF64, ms..., B)
+            pc = zeros(ComplexF64, M2, B)
+            base = Base.summarysize(p)
+            ScatteringTransforms.Plans.forward_transform!(F, p, pc)
+            ScatteringTransforms.Plans.inverse_transform!(pc, p, F)
+            Test.@test Base.summarysize(p) - base < pt_real
+            # An array the transform cannot take is still accepted — it lands in a buffer built on
+            # demand, which is the thing the plan no longer carries up front.
+            ScatteringTransforms.Plans.forward_transform!(F, p, zeros(Float32, M2, B))
+            Test.@test Base.summarysize(p) - base >= pt_real
+        end
+
+        # Analysing a real field is what the whole cascade does after its first step, and on the
+        # real-data backend that path needs no complex point buffer either.
+        nr = ScatteringTransforms.Plans.make_scattered_plan(
+            ScatteringTransforms.Plans.NonuniformFFTsBackend(), xs, ys, ms, Float64;
+            period = (1.0, 1.0), solve = false, eps = 1e-8, ntrans = B, nufft_nthreads = 1)
+        Fr = zeros(ComplexF64, ms..., B)
+        base_r = Base.summarysize(nr)
+        ScatteringTransforms.Plans.forward_transform!(Fr, nr, zeros(Float64, M2, B))
+        Test.@test Base.summarysize(nr) - base_r < pt_real
+
+        # A cascade over real fields solves on the half grid only, so the full-grid solver set is
+        # never built — that set is the larger of the two, and building it eagerly was most of a
+        # solving plan's cost.
+        nu = ScatteringTransforms.Plans.make_scattered_plan(
+            ScatteringTransforms.Plans.NonuniformFFTsBackend(), xs, ys, ms, Float64;
+            period = (1.0, 1.0), solve = true, eps = 1e-8, maxiter = 20, nufft_nthreads = 1)
+        Xm = zeros(ComplexF64, ms)
+        ScatteringTransforms.Plans.forward_transform!(Xm, nu, randn(M2))
+        Test.@test nu.csolve[] === nothing
+        # A complex field has no Hermitian redundancy to exploit, so that one does build it.
+        ScatteringTransforms.Plans.forward_transform!(Xm, nu, randn(ComplexF64, M2))
+        Test.@test nu.csolve[] !== nothing
+    end
 end

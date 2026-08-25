@@ -26,11 +26,13 @@ using NonuniformFFTs: NonuniformFFTs
 using ScatteringTransforms: ScatteringTransforms as ST
 
 """
-    NonuniformFFTsScatteringPlan{T,P,CV,MM,RV}
+    NonuniformFFTsScatteringPlan{T,B,…}
 
 Scattered-planar spectral plan backed by `NonuniformFFTs.PlanNUFFT` over fixed points `(x, y)` and a
 uniform mode grid `ms`. `solve` selects the least-squares inversion over the plain Type-1 adjoint; the
 solver's workspace lives on the plan, so a solve adds nothing per call beyond the transforms it issues.
+It is also held only for the path the plan takes — a plan that does not solve carries none of it, and
+the full-grid set is built on the first complex solve, which a cascade over real fields never reaches.
 
 Those transforms do allocate, which makes this the one backend where a solve allocates in steady
 state. Measured at `M = 500`, `ms = (16, 16)`, `nufft_nthreads = 1`, single-threaded Julia: 768 B for
@@ -58,7 +60,6 @@ type-2 would be the wrong quantity. The complex plan serves that direction.
 """
 struct NonuniformFFTsScatteringPlan{T, B, P, PR, CV <: AbstractArray{Complex{T}},
                                     MM <: AbstractArray{Complex{T}},
-                                    HM <: AbstractArray{Complex{T}},
                                     HX <: AbstractArray{Complex{T}}, PT <: AbstractArray{T},
                                     RV <: AbstractVector{T}, IV <: AbstractVector{Int}, US, GK,
                                     BW} <: ST.Plans.AbstractScatteringPlan
@@ -80,24 +81,26 @@ struct NonuniformFFTsScatteringPlan{T, B, P, PR, CV <: AbstractArray{Complex{T}}
     # One plan owns both transforms because one cascade needs both: synthesis is always complex, and
     # every analysis after the first is a modulus and so always real. `forward_transform!` selects by
     # the element type of the field it is handed — a real field's spectrum is Hermitian and is analysed
-    # and solved on the half grid, a complex field's is not and needs the full grid. Fields below are
-    # prefixed by which path owns them: `c` complex, `r`/`h` real. The two are never in flight at once
-    # on one plan, so the half-grid mode arrays are views of the full-grid ones, not a second set.
-    cj::CV                  # (M[, B]) complex points: synthesis output, and the complex solver's `u`
-    ct::CV                  # (M[, B]) the complex solver's other point vector
-    cv::MM                  # (ms[, B]) the solver's four mode vectors at full size
-    cw::MM
-    ch::MM
-    chbar::MM
-    hv::HM                  # the same four over the half grid: `view(·, 1:ms[1]÷2+1, :[, :])`
-    hw::HM
-    hh::HM
-    hhbar::HM
-    hx::HX                  # (ms[1]÷2+1, ms[2][, B]) the half spectrum itself — the analysis output,
-                            #      and the solve's iterate before expansion onto the full grid
-    rb::PT                  # (M[, B]) the real samples, and the real solver's two point vectors
-    ru::PT
-    rt::PT
+    # and solved on the half grid, a complex field's is not and needs the full grid.
+    #
+    # Scratch is held only for the path a plan actually takes. `task_local_plan` builds one plan per
+    # task, so every buffer here is multiplied by the thread count. Point-space scratch dominates once
+    # `M` is large: at `ms = 512²`, `M = 4·prod(ms)`, `ntrans = 8` one `(M, B)` complex array is
+    # 134 MiB against 16.8 MiB for a half spectrum. None is held — the caller's own array serves
+    # wherever it already has the plan's array type, which is the cascade's case since its buffers are
+    # `similar` to the points these plans were built from.
+    hx::HX                  # (ms[1]÷2+1, ms[2][, B]) the half spectrum: the analysis output, and the
+                            #      half-grid solve's iterate before expansion onto the full grid.
+                            #      Unconditional: every step after the first analyses a modulus.
+    # `(u, t, v, w, h, hbar)` for `Plans.lsmr_solve!` — two point-space, four mode-space.
+    rsolve::Union{Nothing, Tuple{PT, PT, HX, HX, HX, HX}}    # `nothing` unless this plan solves
+    csolve::Base.RefValue{Union{Nothing, Tuple{CV, MM, MM, MM, MM}}}  # `(t, v, w, h, hbar)`, built on
+                            #      the first complex solve; a cascade over real fields performs none.
+                            #      `u` is `cbuf`, which no synthesis is using while a solve runs.
+    # One point-space buffer per element type, allocated the first time something needs to land in the
+    # plan's own array type rather than the caller's. The cascade's buffers already have it.
+    rbuf::Base.RefValue{Union{Nothing, PT}}
+    cbuf::Base.RefValue{Union{Nothing, CV}}
     mir::IV                 # (ms[2]) index of `-f₂` on the second axis, for the conjugate fill
     us_ovs::US              # the real plan's *oversampled* spectrum, refilled by every execution. Its
                             #      extent is `Ñ = σ·ms`, so `+ms[2]/2` — absent from `fftfreq(ms[2])`
@@ -146,9 +149,18 @@ function _plan_at(ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, 
         # once is the right trade at any size. Swept over `ms` from `8²` to `512²` and point counts
         # from `0.1·prod(ms)` to `10·prod(ms)`: neutral below `64²`, 1.4-1.6x at `256²`-`512²` with
         # dense point sets, worst case 0.97x.
+        # A pinned thread count has to reach the spreading, not only the FFT. With block partitioning
+        # on, NonuniformFFTs spreads over `Threads.nthreads()` and holds one block buffer per thread
+        # per transform — sized `prod(block_dims .+ 2m)` — no matter what thread count it is given.
+        # A plan built per task would then carry a full set of them each, and `task_local_plan` builds
+        # one plan per task, over two transforms, `ntrans` wide: the buffers multiply by all four.
+        # `block_size = nothing` is the documented way off that path, and also drops FFTW to one
+        # thread. There is no way to cap the spreading to an arbitrary count, so a pin above one keeps
+        # the library's own threading.
+        blocking = nthreads == 1 ? (; block_size = nothing) : (;)
         common = (m = NonuniformFFTs.HalfSupport(halfsupport), ntransforms = Val(B),
                   sort_points = NonuniformFFTs.Static.True(),
-                  backend = NonuniformFFTs.KA.get_backend(sx))
+                  backend = NonuniformFFTs.KA.get_backend(sx), blocking...)
         pl = NonuniformFFTs.PlanNUFFT(Complex{T}, ms; common...)
         rpl = NonuniformFFTs.PlanNUFFT(T, ms; common...)
         NonuniformFFTs.set_points!(pl, (sx, sy))
@@ -159,9 +171,7 @@ function _plan_at(ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, 
         nthreads > 0 ? ST.Plans.with_fft_nthreads(build, nthreads) : build()
     end
     m1h = ms[1] ÷ 2 + 1
-    pts() = B == 1 ? similar(sx, Complex{T}, M) : similar(sx, Complex{T}, M, B)
     rpts() = B == 1 ? similar(sx, T, M) : similar(sx, T, M, B)
-    modes() = B == 1 ? similar(sx, Complex{T}, ms) : similar(sx, Complex{T}, (ms..., B))
     half() = B == 1 ? similar(sx, Complex{T}, m1h, ms[2]) :
                       similar(sx, Complex{T}, m1h, ms[2], B)
     # `mir[j]` is the index of `-f₂` on the second axis. Under `fftfreq` that is `1` for `j = 1` and
@@ -190,18 +200,68 @@ function _plan_at(ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, 
     else
         nothing
     end
-    cj, ct = pts(), pts()
-    cv, cw, ch, chbar = modes(), modes(), modes(), modes()
-    # Own memory rather than views of the full-grid arrays: a half grid is a *strided sub-block* of a
-    # full one, not a contiguous prefix, and a NUFFT writes its output through a dense buffer.
-    hv, hw, hh, hhbar, hx = half(), half(), half(), half(), half()
-    rb, ru, rt = rpts(), rpts(), rpts()
-    return NonuniformFFTsScatteringPlan{T, B, typeof(plan), typeof(rplan), typeof(cj), typeof(cv),
-                                        typeof(hv), typeof(hx), typeof(rb), typeof(sx), typeof(mir),
-                                        typeof(us_ovs), typeof(gk), typeof(batch)}(
+    hx = half()
+    # The half-grid solver's vectors, only for a plan that solves. Own memory rather than views of a
+    # full-grid array: a half grid is a *strided sub-block* of a full one, not a contiguous prefix, and
+    # a NUFFT writes its output through a dense buffer.
+    rsolve = solve ? (rpts(), rpts(), half(), half(), half(), half()) : nothing
+    # Types for the arrays that are not built here, from zero-length arrays so a device plan names its
+    # own array type without this file referring to any device package.
+    PTT = typeof(B == 1 ? similar(sx, T, 0) : similar(sx, T, 0, 0))
+    CVT = typeof(B == 1 ? similar(sx, Complex{T}, 0) : similar(sx, Complex{T}, 0, 0))
+    MMT = typeof(B == 1 ? similar(sx, Complex{T}, 0, 0) : similar(sx, Complex{T}, 0, 0, 0))
+    return NonuniformFFTsScatteringPlan{T, B, typeof(plan), typeof(rplan), CVT, MMT, typeof(hx),
+                                        PTT, typeof(sx), typeof(mir), typeof(us_ovs), typeof(gk),
+                                        typeof(batch)}(
         plan, rplan, ms, M, one(T) / prod(ms), solve, maxiter, rtol, damp, sx, sy, eps, nthreads,
-        cj, ct, cv, cw, ch, chbar, hv, hw, hh, hhbar, hx, rb, ru, rt,
+        hx, rsolve,
+        Base.RefValue{Union{Nothing, Tuple{CVT, MMT, MMT, MMT, MMT}}}(nothing),
+        Base.RefValue{Union{Nothing, PTT}}(nothing),
+        Base.RefValue{Union{Nothing, CVT}}(nothing),
         mir, us_ovs, novs, gk, normfactor, batch)
+end
+
+# ---------------------------------------------------------------------------
+# Reaching the transform without a copy
+# ---------------------------------------------------------------------------
+#
+# `exec_type1!`/`exec_type2!` take an array of the plan's own element type. Every array the cascade
+# hands in already has one — `ScatteredPlanar.build` makes its buffers `similar` to the same points —
+# so these return it unchanged and the plan carries no point-space scratch at all. Any other caller
+# gets one copy through a buffer allocated on its first such call.
+
+@inline _real_in(plan::NonuniformFFTsScatteringPlan{T, B, P, PR, CV, MM, HX, PT},
+                 x::AbstractArray{<:Real}) where {T, B, P, PR, CV, MM, HX, PT} =
+    x isa PT ? x : _rbuf!(plan, x)
+
+@noinline function _rbuf!(plan::NonuniformFFTsScatteringPlan{T, B, P, PR, CV, MM, HX, PT},
+                          x) where {T, B, P, PR, CV, MM, HX, PT}
+    buf = plan.rbuf[]
+    if buf === nothing
+        buf = B == 1 ? similar(plan.sx, T, plan.M) : similar(plan.sx, T, plan.M, B)
+        plan.rbuf[] = buf
+    end
+    copyto!(buf, x)
+    return buf::PT
+end
+
+# Synthesis destination. When it is `out` itself, the scaling that follows is an in-place multiply.
+@inline _pts_out(plan::NonuniformFFTsScatteringPlan{T, B, P, PR, CV},
+                 out::AbstractArray) where {T, B, P, PR, CV} =
+    out isa CV ? out : _cbuf(plan)
+
+@inline _cplx_in(plan::NonuniformFFTsScatteringPlan{T, B, P, PR, CV},
+                 x::AbstractArray) where {T, B, P, PR, CV} =
+    x isa CV ? x : copyto!(_cbuf(plan), x)
+
+@noinline function _cbuf(plan::NonuniformFFTsScatteringPlan{T, B, P, PR, CV}) where {T, B, P, PR, CV}
+    buf = plan.cbuf[]
+    if buf === nothing
+        buf = B == 1 ? similar(plan.sx, Complex{T}, plan.M) :
+                       similar(plan.sx, Complex{T}, plan.M, B)
+        plan.cbuf[] = buf
+    end
+    return buf::CV
 end
 
 # The adjoint of the real-data Type-2, in the inner product LSMR actually uses.
@@ -384,8 +444,9 @@ end
 # Synthesis: modes → points (Type-2), scaled by 1/prod(ms) so it is the ifft-convention inverse.
 function ST.Plans.inverse_transform!(out_pts::AbstractVector, plan::NonuniformFFTsScatteringPlan,
                                      Xmodes::AbstractMatrix)
-    NonuniformFFTs.exec_type2!(plan.cj, plan.plan, Xmodes)
-    @. out_pts = plan.cj * plan.invN
+    dst = _pts_out(plan, out_pts)
+    NonuniformFFTs.exec_type2!(dst, plan.plan, Xmodes)
+    @. out_pts = dst * plan.invN
     return out_pts
 end
 
@@ -396,11 +457,11 @@ end
 # and half the grid memory of the complex form.
 function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NonuniformFFTsScatteringPlan,
                                      x_pts::AbstractVector{<:Real})
-    copyto!(plan.rb, x_pts)
+    b = _real_in(plan, x_pts)
     if plan.solve
-        _lsmr_solve_real!(Xmodes, plan)
+        _lsmr_solve_real!(Xmodes, plan, b)
     else
-        NonuniformFFTs.exec_type1!(plan.hx, plan.rplan, plan.rb)
+        NonuniformFFTs.exec_type1!(plan.hx, plan.rplan, b)
         _expand_hermitian!(Xmodes, plan, plan.hx)
     end
     return Xmodes
@@ -412,8 +473,7 @@ function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NonuniformFFT
     if plan.solve
         _lsmr_solve!(Xmodes, plan, x_pts)
     else
-        copyto!(plan.cj, x_pts)
-        NonuniformFFTs.exec_type1!(Xmodes, plan.plan, plan.cj)
+        NonuniformFFTs.exec_type1!(Xmodes, plan.plan, _cplx_in(plan, x_pts))
     end
     return Xmodes
 end
@@ -423,20 +483,20 @@ end
 function ST.Plans.inverse_transform!(out_pts::AbstractMatrix,
                                      plan::NonuniformFFTsScatteringPlan{T, B},
                                      Xmodes::AbstractArray{<:Any, 3}) where {T, B}
-    NonuniformFFTs.exec_type2!(_fields(plan.cj, Val(B)), plan.plan, _fields(Xmodes, Val(B)))
-    @. out_pts = plan.cj * plan.invN
+    dst = _pts_out(plan, out_pts)
+    NonuniformFFTs.exec_type2!(_fields(dst, Val(B)), plan.plan, _fields(Xmodes, Val(B)))
+    @. out_pts = dst * plan.invN
     return out_pts
 end
 
 function ST.Plans.forward_transform!(Xmodes::AbstractArray{<:Any, 3},
                                      plan::NonuniformFFTsScatteringPlan{T, B},
                                      x_pts::AbstractMatrix{<:Real}) where {T, B}
-    copyto!(plan.rb, x_pts)
+    b = _real_in(plan, x_pts)
     if plan.solve
-        _lsmr_solve_batched_real!(Xmodes, plan)
+        _lsmr_solve_batched_real!(Xmodes, plan, b)
     else
-        NonuniformFFTs.exec_type1!(_fields(plan.hx, Val(B)), plan.rplan,
-                                   _fields(plan.rb, Val(B)))
+        NonuniformFFTs.exec_type1!(_fields(plan.hx, Val(B)), plan.rplan, _fields(b, Val(B)))
         _expand_hermitian!(Xmodes, plan, plan.hx)
     end
     return Xmodes
@@ -448,10 +508,32 @@ function ST.Plans.forward_transform!(Xmodes::AbstractArray{<:Any, 3},
     if plan.solve
         _lsmr_solve_batched!(Xmodes, plan, x_pts)
     else
-        copyto!(plan.cj, x_pts)
-        NonuniformFFTs.exec_type1!(_fields(Xmodes, Val(B)), plan.plan, _fields(plan.cj, Val(B)))
+        NonuniformFFTs.exec_type1!(_fields(Xmodes, Val(B)), plan.plan,
+                                   _fields(_cplx_in(plan, x_pts), Val(B)))
     end
     return Xmodes
+end
+
+# The half-grid solver's vectors. Present whenever the plan was built to solve.
+@inline function _rsolve(plan::NonuniformFFTsScatteringPlan)
+    rs = plan.rsolve
+    rs === nothing && throw(ArgumentError("plan was not built with `solve = true`"))
+    return rs
+end
+
+# `(t, v, w, h, hbar)` for a full-grid solve, built on first use. A cascade over real fields never
+# reaches this, and it is the larger of the two sets — the full mode grid is twice the half grid.
+@noinline function _csolve(plan::NonuniformFFTsScatteringPlan{T, B, P, PR, CV, MM}) where {T, B, P,
+                                                                                           PR, CV, MM}
+    got = plan.csolve[]
+    got === nothing || return got
+    pts() = B == 1 ? similar(plan.sx, Complex{T}, plan.M) :
+                     similar(plan.sx, Complex{T}, plan.M, B)
+    modes() = B == 1 ? similar(plan.sx, Complex{T}, plan.ms) :
+                       similar(plan.sx, Complex{T}, (plan.ms..., B))
+    made = (pts(), modes(), modes(), modes(), modes())
+    plan.csolve[] = made
+    return made::Tuple{CV, MM, MM, MM, MM}
 end
 
 # Least-squares inversion. `A f̃ = x` is solved and scaled by `N` afterwards rather than inflating the
@@ -459,11 +541,13 @@ end
 #
 # Real samples: the fit runs over the half grid, which is the space a real field's coefficients
 # actually occupy. `A` is the real Type-2 and `A†` the weighted Type-1 — see `_real_adjoint!`.
-function _lsmr_solve_real!(f::AbstractMatrix, plan::NonuniformFFTsScatteringPlan{T}) where {T}
+function _lsmr_solve_real!(f::AbstractMatrix, plan::NonuniformFFTsScatteringPlan{T},
+                           b::AbstractVector) where {T}
+    u, t, v, w, h, hbar = _rsolve(plan)
     info = ST.Plans.lsmr_solve!(plan.hx,
         (dst, src) -> NonuniformFFTs.exec_type2!(dst, plan.rplan, src),  # A : half modes → real pts
         (dst, src) -> _real_adjoint!(dst, plan, src),                    # A†: real pts → half modes
-        plan.rb, plan.ru, plan.rt, plan.hv, plan.hw, plan.hh, plan.hhbar;
+        b, u, t, v, w, h, hbar;
         damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
         conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     ST.Plans._check_solve(info, plan.M, (plan.ms[1] ÷ 2 + 1, plan.ms[2]), plan.rtol, plan.maxiter)
@@ -474,10 +558,11 @@ end
 # Complex samples: no redundancy to exploit, so the fit is over the full grid on the complex plan.
 function _lsmr_solve!(f::AbstractMatrix, plan::NonuniformFFTsScatteringPlan{T},
                       x_pts::AbstractVector) where {T}
+    t, v, w, h, hbar = _csolve(plan)
     info = ST.Plans.lsmr_solve!(f,
         (dst, src) -> NonuniformFFTs.exec_type2!(dst, plan.plan, src),   # A : modes → points
         (dst, src) -> NonuniformFFTs.exec_type1!(dst, plan.plan, src),   # A†: points → modes
-        x_pts, plan.cj, plan.ct, plan.cv, plan.cw, plan.ch, plan.chbar;
+        x_pts, _cbuf(plan), t, v, w, h, hbar;
         damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
         conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     ST.Plans._check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
@@ -488,12 +573,14 @@ end
 # The batched forms of both. A plan's width is fixed, so the whole stack advances together and every
 # scalar in the recurrence becomes one per column — see `Plans.lsmr_solve_batched!`.
 function _lsmr_solve_batched_real!(f::AbstractArray{<:Any, 3},
-                                   plan::NonuniformFFTsScatteringPlan{T, B}) where {T, B}
+                                   plan::NonuniformFFTsScatteringPlan{T, B},
+                                   b::AbstractMatrix) where {T, B}
+    u, t, v, w, h, hbar = _rsolve(plan)
     info = ST.Plans.lsmr_solve_batched!(plan.hx,
         (dst, src) -> NonuniformFFTs.exec_type2!(_fields(dst, Val(B)), plan.rplan,
                                                  _fields(src, Val(B))),
         (dst, src) -> _real_adjoint!(dst, plan, src),
-        plan.rb, plan.ru, plan.rt, plan.hv, plan.hw, plan.hh, plan.hhbar, plan.ls_batch;
+        b, u, t, v, w, h, hbar, plan.ls_batch;
         damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
         conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     ST.Plans._check_solve(info, plan.M, (plan.ms[1] ÷ 2 + 1, plan.ms[2]), plan.rtol, plan.maxiter)
@@ -504,12 +591,13 @@ end
 function _lsmr_solve_batched!(f::AbstractArray{<:Any, 3},
                               plan::NonuniformFFTsScatteringPlan{T, B},
                               x_pts::AbstractMatrix) where {T, B}
+    t, v, w, h, hbar = _csolve(plan)
     info = ST.Plans.lsmr_solve_batched!(f,
         (dst, src) -> NonuniformFFTs.exec_type2!(_fields(dst, Val(B)), plan.plan,
                                                  _fields(src, Val(B))),
         (dst, src) -> NonuniformFFTs.exec_type1!(_fields(dst, Val(B)), plan.plan,
                                                  _fields(src, Val(B))),
-        x_pts, plan.cj, plan.ct, plan.cv, plan.cw, plan.ch, plan.chbar, plan.ls_batch;
+        x_pts, _cbuf(plan), t, v, w, h, hbar, plan.ls_batch;
         damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
         conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     ST.Plans._check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
