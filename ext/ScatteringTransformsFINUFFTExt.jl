@@ -55,13 +55,38 @@ struct NUFFTScatteringPlan{T, G, CV<:AbstractArray{Complex{T}},
     sy::RV                        #     retained so a task can build its own guru plans
     eps::T                        # the tolerance those plans were made with
     nthreads::Int                 # and the thread count they were made with (0 = FINUFFT's default)
-    cj::CV                        # (M[, B]) nonuniform exec buffer (shared by Type-1/Type-2)
-    ls_v::MM                      # (ms[, B]) solver scratch: the four LSMR mode vectors, with `cj`
-    ls_w::MM                      #      and `ls_t` its two point vectors. The transforms overwrite
-    ls_h::MM                      #      rather than accumulate, so `A·v` and `A†·u` each need a
-    ls_hbar::MM                   #      destination of their own.
-    ls_t::CV                      # (M[, B])
+    # `(t, v, w, h, hbar)` for `Plans.lsmr_solve!` — one point-space, four mode-space; `u` is `cj`,
+    # which no transform is using while a solve runs. `nothing` unless this plan solves, because at
+    # `ms = 512²`, `M = 4·prod(ms)`, `ntrans = 8` this is 268 MiB and `task_local_plan` builds one
+    # plan per task.
+    ls::Union{Nothing, Tuple{CV, MM, MM, MM, MM}}
+    # (M[, B]) the plan's one point-space buffer, allocated the first time something has to land in
+    # the plan's own array type rather than the caller's — an analysed field is real, so widening it
+    # is that case. Synthesis writes through the caller's array when it already has this type.
+    cj::Base.RefValue{Union{Nothing, CV}}
     ls_batch::BW                  # per-column solver bookkeeping, or `nothing` for a single field
+end
+
+@inline function _ls(plan::NUFFTScatteringPlan)
+    ls = plan.ls
+    ls === nothing && throw(ArgumentError("plan was not built with `solve = true`"))
+    return ls
+end
+
+@inline _pts_out(plan::NUFFTScatteringPlan{T, G, CV}, out::AbstractArray) where {T, G, CV} =
+    out isa CV ? out : _cj(plan)
+
+@inline _pts_in(plan::NUFFTScatteringPlan{T, G, CV}, x::AbstractArray) where {T, G, CV} =
+    x isa CV ? x : copyto!(_cj(plan), x)
+
+@noinline function _cj(plan::NUFFTScatteringPlan{T, G, CV}) where {T, G, CV}
+    buf = plan.cj[]
+    if buf === nothing
+        buf = plan.B == 1 ? similar(plan.sx, Complex{T}, plan.M) :
+                            similar(plan.sx, Complex{T}, plan.M, plan.B)
+        plan.cj[] = buf
+    end
+    return buf::CV
 end
 
 function _make_plan(x, y, ms::NTuple{2,Int}, ::Type{T}, period, eps, solve, maxiter, rtol,
@@ -126,9 +151,14 @@ function _plan_at(ms::NTuple{2,Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, m
     else
         nothing
     end
-    return NUFFTScatteringPlan(
+    ls = solve ? (pts(M), modes(), modes(), modes(), modes()) : nothing
+    # Types for the arrays not built here, from zero-length ones so a device plan names its own array
+    # type without this file referring to any device package.
+    CVT = typeof(B == 1 ? similar(sx, Complex{T}, 0) : similar(sx, Complex{T}, 0, 0))
+    MMT = typeof(B == 1 ? similar(sx, Complex{T}, 0, 0) : similar(sx, Complex{T}, 0, 0, 0))
+    return NUFFTScatteringPlan{T, typeof(guru1), CVT, MMT, typeof(sx), typeof(batch)}(
         guru1, guru2, ms, M, B, one(T) / prod(ms), solve, maxiter, rtol, damp, sx, sy, eps, nthreads,
-        pts(M), modes(), modes(), modes(), modes(), pts(M), batch)
+        ls, Base.RefValue{Union{Nothing, CVT}}(nothing), batch)
 end
 
 # The guru plans hold C pointers and reference-keeping arrays; the default `show` would walk all of
@@ -176,8 +206,9 @@ end
 # Synthesis: modes → points, scaled by 1/prod(ms) (ifft convention). For a Type-2 plan
 # `finufft_exec!(plan, input, output)` takes input=modes, output=points.
 function ST.Plans.inverse_transform!(out_pts::AbstractVector, plan::NUFFTScatteringPlan, Xmodes::AbstractMatrix)
-    ST.Plans.nufft_guru_exec!(plan.guru2, Xmodes, plan.cj)
-    @. out_pts = plan.cj * plan.invN
+    dst = _pts_out(plan, out_pts)
+    ST.Plans.nufft_guru_exec!(plan.guru2, Xmodes, dst)
+    @. out_pts = dst * plan.invN
     return out_pts
 end
 
@@ -185,8 +216,9 @@ end
 # valid shapes for it, just as the shapes above are the only valid ones for a `B = 1` plan.
 function ST.Plans.inverse_transform!(out_pts::AbstractMatrix, plan::NUFFTScatteringPlan,
                                      Xmodes::AbstractArray{<:Any,3})
-    ST.Plans.nufft_guru_exec!(plan.guru2, Xmodes, plan.cj)
-    @. out_pts = plan.cj * plan.invN
+    dst = _pts_out(plan, out_pts)
+    ST.Plans.nufft_guru_exec!(plan.guru2, Xmodes, dst)
+    @. out_pts = dst * plan.invN
     return out_pts
 end
 
@@ -195,8 +227,7 @@ function ST.Plans.forward_transform!(Xmodes::AbstractArray{<:Any,3}, plan::NUFFT
     if plan.solve
         _lsmr_solve_batched!(Xmodes, plan, x_pts)
     else
-        copyto!(plan.cj, x_pts)
-        ST.Plans.nufft_guru_exec!(plan.guru1, plan.cj, Xmodes)
+        ST.Plans.nufft_guru_exec!(plan.guru1, _pts_in(plan, x_pts), Xmodes)
     end
     return Xmodes
 end
@@ -205,10 +236,11 @@ end
 # in the recurrence becomes one per column — see `Plans.lsmr_solve_batched!`.
 function _lsmr_solve_batched!(f::AbstractArray{<:Any,3}, plan::NUFFTScatteringPlan{T},
                               x_pts::AbstractMatrix) where {T}
+    t, v, w, h, hbar = _ls(plan)
     info = ST.Plans.lsmr_solve_batched!(f,
         (dst, src) -> ST.Plans.nufft_guru_exec!(plan.guru2, src, dst),   # A : modes → points
         (dst, src) -> ST.Plans.nufft_guru_exec!(plan.guru1, src, dst),   # A†: points → modes
-        x_pts, plan.cj, plan.ls_t, plan.ls_v, plan.ls_w, plan.ls_h, plan.ls_hbar, plan.ls_batch;
+        x_pts, _cj(plan), t, v, w, h, hbar, plan.ls_batch;
         damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
         conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     ST.Plans._check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
@@ -221,8 +253,7 @@ function ST.Plans.forward_transform!(Xmodes::AbstractMatrix, plan::NUFFTScatteri
     if plan.solve
         _lsmr_solve!(Xmodes, plan, x_pts)
     else
-        copyto!(plan.cj, x_pts)
-        ST.Plans.nufft_guru_exec!(plan.guru1, plan.cj, Xmodes)
+        ST.Plans.nufft_guru_exec!(plan.guru1, _pts_in(plan, x_pts), Xmodes)
     end
     return Xmodes
 end
@@ -233,10 +264,11 @@ end
 # put `Float32` squared quantities near `floatmax`, and it leaves the reported residual a misfit in
 # the field's own units.
 function _lsmr_solve!(f::AbstractMatrix, plan::NUFFTScatteringPlan{T}, x_pts::AbstractVector) where {T}
+    t, v, w, h, hbar = _ls(plan)
     info = ST.Plans.lsmr_solve!(f,
         (dst, src) -> ST.Plans.nufft_guru_exec!(plan.guru2, src, dst),   # A : modes → points
         (dst, src) -> ST.Plans.nufft_guru_exec!(plan.guru1, src, dst),   # A†: points → modes
-        x_pts, plan.cj, plan.ls_t, plan.ls_v, plan.ls_w, plan.ls_h, plan.ls_hbar;
+        x_pts, _cj(plan), t, v, w, h, hbar;
         damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
         conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     ST.Plans._check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
