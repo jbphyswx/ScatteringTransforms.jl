@@ -43,11 +43,12 @@ const GriddedScattering = Union{Scattering1D.ScatteringTransform1D,
     ReconstructionWorkspace(st)
 
 Scratch for the linear wavelet inverse and for phase retrieval: the complex wavelet coefficient
-fields (`nw` of them — that is the representation's own size), the low-pass field, a spectrum
-accumulator, and the conjugated filters.
+fields (`nw` of them — that is the representation's own size), the low-pass field, and a spectrum
+accumulator.
 
-The conjugates are precomputed because `iwavelet!` would otherwise rebuild `conj.(ψ_λ)` for every
-wavelet on every iteration, and `reconstruct_phase` runs `iters` of them.
+No conjugated filters are held. A Morlet's *Fourier* response is real — its analyticity is the
+half-plane support, not a complex value — so `conj(ψ̂_λ) = ψ̂_λ` and the dual frame filter is the
+filter itself. The bank is used directly.
 """
 struct ReconstructionWorkspace{CA, CV, RA}
     wavelet::CV            # (nw) complex coefficient fields
@@ -55,19 +56,17 @@ struct ReconstructionWorkspace{CA, CV, RA}
     Xf::CA                 # spectrum of the current estimate
     Xrec::CA               # reconstruction accumulator
     buf::CA                # multiply / transform scratch
-    conj_wavelets::CV      # (nw) conj(ψ_λ), built once
-    conj_averaging::CA
     field::RA              # real reconstructed field
 end
 
 function ReconstructionWorkspace(st::GriddedScattering)
     fb = st.filter_bank
     proto = fb.averaging
-    T = real(eltype(proto))
+    T = eltype(proto)
+    cplx() = similar(proto, Complex{T})
     return ReconstructionWorkspace(
-        [similar(proto) for _ in eachindex(fb.wavelets)], similar(proto),
-        similar(proto), similar(proto), similar(proto),
-        [conj.(ψ) for ψ in fb.wavelets], conj.(proto),
+        [cplx() for _ in eachindex(fb.wavelets)], cplx(),
+        cplx(), cplx(), cplx(),
         similar(proto, T))
 end
 
@@ -108,14 +107,14 @@ The accumulation is in place: the spectrum sum is built in one buffer rather tha
 wavelet, which is what makes `iters` rounds of phase retrieval affordable.
 """
 function iwavelet!(ws::ReconstructionWorkspace, st::GriddedScattering, wavelet, lowpass::AbstractArray)
-    plan = st.plan
+    fb, plan = st.filter_bank, st.plan
     ws.buf .= lowpass
     Plans.forward_transform!(ws.Xrec, plan, ws.buf)
-    ws.Xrec .*= ws.conj_averaging
+    ws.Xrec .*= fb.averaging
     @inbounds for λ in eachindex(wavelet)
         ws.buf .= wavelet[λ]
         Plans.forward_transform!(ws.Xf, plan, ws.buf)
-        ws.Xrec .+= ws.Xf .* ws.conj_wavelets[λ]
+        ws.Xrec .+= ws.Xf .* fb.wavelets[λ]
     end
     Plans.inverse_transform!(ws.buf, plan, ws.Xrec)
     ws.field .= real.(ws.buf)

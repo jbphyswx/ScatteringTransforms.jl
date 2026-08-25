@@ -25,16 +25,16 @@ export WaveletMeta
 # (near) tight frame, so the transform is non-expansive — no frequency is amplified. The DC bin is
 # pinned to `φ(0)=1` exactly (the wavelets are zero-mean there), which keeps the localized-field
 # spatial mean equal to the globally-averaged coefficient. Works for 1D/2D/3D filter arrays.
-function _complement_lowpass(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{Complex{T}}}
+function _complement_lowpass(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{T}}
     ϕ = similar(first(wavelets))
     @inbounds for i in eachindex(ϕ)
         s = zero(T)
         for ψ in wavelets
             s += abs2(ψ[i])
         end
-        ϕ[i] = Complex{T}(sqrt(max(zero(T), one(T) - s)))
+        ϕ[i] = sqrt(max(zero(T), one(T) - s))
     end
-    ϕ[firstindex(ϕ)] = one(Complex{T})   # exact DC = 1 (preserves mean ⇔ averaged-coefficient)
+    ϕ[firstindex(ϕ)] = one(T)            # exact DC = 1 (preserves mean ⇔ averaged-coefficient)
     return ϕ
 end
 
@@ -43,7 +43,7 @@ end
 # sum `Σⱼ|ψⱼ|² + |φ|² ≡ 1`. The rescale is a single global constant, so it does not change the
 # *relative* coefficient structure — but it is not 1, so a bank built at another resolution must go
 # through here too or its coefficients land on a different scale.
-function _tight_frame_lowpass!(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{Complex{T}}}
+function _tight_frame_lowpass!(wavelets::AbstractVector{A}) where {T, A<:AbstractArray{T}}
     maxs = zero(T)
     @inbounds for i in eachindex(first(wavelets))
         s = zero(T)
@@ -100,7 +100,7 @@ collection, `MV` the metadata collection.
 - `J::Int`: number of octaves (scales)
 - `Q::Int`: wavelets per octave
 """
-struct FilterBank1D{T, V<:AbstractVector{Complex{T}}, W<:AbstractVector{V}, MV<:AbstractVector{WaveletMeta{T}}}
+struct FilterBank1D{T, V<:AbstractVector{T}, W<:AbstractVector{V}, MV<:AbstractVector{WaveletMeta{T}}}
     wavelets::W
     averaging::V
     meta::MV
@@ -163,7 +163,7 @@ collection.
 - `J::Int`: number of scales
 - `L::Int`: number of orientations
 """
-struct FilterBank2D{T, M<:AbstractMatrix{Complex{T}}, W<:AbstractVector{M}, MV<:AbstractVector{WaveletMeta{T}}}
+struct FilterBank2D{T, M<:AbstractMatrix{T}, W<:AbstractVector{M}, MV<:AbstractVector{WaveletMeta{T}}}
     wavelets::W
     averaging::M
     meta::MV
@@ -220,7 +220,7 @@ build_filter_bank2d(N::NTuple{2,Int}, J::Int; kwargs...) = build_filter_bank2d(F
 Complete 3D oriented Morlet filter bank: `J` scales × `n_orient` sphere directions, plus a
 low-pass averaging filter.
 """
-struct FilterBank3D{T, A<:AbstractArray{Complex{T},3}, W<:AbstractVector{A}, MV<:AbstractVector{WaveletMeta{T}}}
+struct FilterBank3D{T, A<:AbstractArray{T,3}, W<:AbstractVector{A}, MV<:AbstractVector{WaveletMeta{T}}}
     wavelets::W
     averaging::A
     meta::MV

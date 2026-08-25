@@ -42,7 +42,7 @@ A transform equivalent to `st` that shares its read-only parts — filter bank, 
 but owns fresh buffers and a task-local spectral plan, so the two can run concurrently.
 
 This is what lets a parallel backend give each task private scratch without duplicating the filter
-bank, which dominates a transform's memory (for a 256×256 J=4 L=8 transform, 33 MiB of the 38 MiB).
+bank, which dominates a transform's memory (for a 256×256 J=4 L=8 transform, 16.5 MiB of the 21.5 MiB).
 Methods are defined per transform type.
 """
 function task_workspace end

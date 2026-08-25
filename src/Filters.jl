@@ -67,7 +67,7 @@ Morlet1D(N::Int, j::Real; kwargs...) = Morlet1D{Float64}(N, j; kwargs...)
 @inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
 
 """
-    frequency_response(m::Morlet1D{T}) -> Vector{Complex{T}}
+    frequency_response(m::Morlet1D{T}) -> Vector{T}
 
 Compute the frequency response Ψ(ω) of a 1D Morlet wavelet.
 
@@ -81,7 +81,7 @@ function frequency_response(m::Morlet1D{T}) where T<:Real
     σ = m.bandwidth
     inv2 = inv(T(2))
     
-    Ψ = Vector{Complex{T}}(undef, N)
+    Ψ = Vector{T}(undef, N)
     
     # kappa: ratio at ω=0 (bin 0). gabor(0)=exp(-(xi/sigma)^2/2), lowpass(0)=1
     kappa = exp(-(ξ / σ)^2 * inv2)
@@ -89,11 +89,11 @@ function frequency_response(m::Morlet1D{T}) where T<:Real
     @inbounds for i in 1:N
         ω = T(_fftfreq(N, i - 1))
         if ω < 0
-            Ψ[i] = zero(Complex{T})
+            Ψ[i] = zero(T)
         else
             g  = exp(-((ω - ξ) / σ)^2 * inv2)
             lp = exp(-(ω / σ)^2 * inv2)
-            Ψ[i] = Complex{T}(g - kappa * lp)
+            Ψ[i] = g - kappa * lp
         end
     end
     
@@ -150,7 +150,7 @@ Morlet2D(N::NTuple{2,Int}, j::Int, theta::Real; kwargs...) =
     Morlet2D{Float64}(N, j, theta; kwargs...)
 
 """
-    frequency_response(m::Morlet2D{T}) -> Matrix{Complex{T}}
+    frequency_response(m::Morlet2D{T}) -> Matrix{T}
 
 Compute the 2D frequency response Ψ(kx, ky) of an oriented Morlet wavelet.
 Element type matches the wavelet's precision.
@@ -167,7 +167,7 @@ function frequency_response(m::Morlet2D{T}) where T<:Real
     σx2_div2 = σx^2 * inv2
     σy2_div2 = σy^2 * inv2
     
-    Ψ = Matrix{Complex{T}}(undef, Ny, Nx)
+    Ψ = Matrix{T}(undef, Ny, Nx)
     
     @inbounds for ix in 1:Nx
         kx = T(_fftfreq(Nx, ix - 1)) * T(2π)
@@ -177,12 +177,12 @@ function frequency_response(m::Morlet2D{T}) where T<:Real
             kxr =  kx * ct + ky * st
             kyr = -kx * st + ky * ct
             if kxr < 0
-                Ψ[iy, ix] = zero(Complex{T})
+                Ψ[iy, ix] = zero(T)
             else
                 dkx = kxr - k0
                 env = exp(-dkx^2 * σx2_div2 - kyr^2 * σy2_div2)
                 cen = exp(-kxr^2 * σx2_div2 - kyr^2 * σy2_div2)
-                Ψ[iy, ix] = Complex{T}(env - β * cen)
+                Ψ[iy, ix] = env - β * cen
             end
         end
     end
@@ -231,7 +231,7 @@ Morlet3D(N::NTuple{3,Int}, j::Int, direction; kwargs...) =
     Morlet3D{Float64}(N, j, direction; kwargs...)
 
 """
-    frequency_response(m::Morlet3D{T}) -> Array{Complex{T},3}
+    frequency_response(m::Morlet3D{T}) -> Array{T,3}
 
 3D frequency response `Ψ(kx,ky,kz)` of an oriented Morlet wavelet.
 """
@@ -244,7 +244,7 @@ function frequency_response(m::Morlet3D{T}) where T<:Real
     β = m.beta
     inv2 = inv(T(2))
 
-    Ψ = Array{Complex{T},3}(undef, Nz, Ny, Nx)
+    Ψ = Array{T,3}(undef, Nz, Ny, Nx)
     @inbounds for ix in 1:Nx
         kx = T(_fftfreq(Nx, ix - 1)) * T(2π)
         for iy in 1:Ny
@@ -253,12 +253,12 @@ function frequency_response(m::Morlet3D{T}) where T<:Real
                 kz = T(_fftfreq(Nz, iz - 1)) * T(2π)
                 kpar = kx * nx + ky * ny + kz * nz
                 if kpar < 0
-                    Ψ[iz, iy, ix] = zero(Complex{T})
+                    Ψ[iz, iy, ix] = zero(T)
                 else
                     kperp2 = kx^2 + ky^2 + kz^2 - kpar^2
                     env = exp(-((kpar - k0)^2 * σpar2 + kperp2 * σperp2) * inv2)
                     cen = exp(-(kpar^2 * σpar2 + kperp2 * σperp2) * inv2)
-                    Ψ[iz, iy, ix] = Complex{T}(env - β * cen)
+                    Ψ[iz, iy, ix] = env - β * cen
                 end
             end
         end

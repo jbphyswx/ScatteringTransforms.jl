@@ -12,7 +12,7 @@ Parallelism is taken on the outermost race-free axis that has enough independent
 
 Each task takes one workspace from `ScatteringCore.task_workspace`, which shares the read-only
 filter bank, path tree and work list and copies only the buffers. The filter bank is the bulk of a
-transform (33 MiB of 38 MiB for a 256×256, J=4, L=8 transform), so per-task cost is `O(N)`, not
+transform (16.5 MiB of 21.5 MiB for a 256×256, J=4, L=8 transform), so per-task cost is `O(N)`, not
 `O(nw·N)`.
 
 The two levels never nest: a batch task runs the serial `cascade!`, so a slice is never subdivided

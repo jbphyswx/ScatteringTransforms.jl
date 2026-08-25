@@ -42,7 +42,7 @@ export build_monogenic_bank, riesz_multipliers, monogenic_amplitude, monogenic_c
 # center ξ with width σ, minus a low-pass term pinning the DC bin to zero (admissibility).
 function _radial_bandpass(dims::NTuple{D,Int}, ξ::T, σ::T) where {D,T}
     κ = exp(-(ξ / σ)^2 / 2)
-    ψ = Array{Complex{T},D}(undef, dims)
+    ψ = Array{T,D}(undef, dims)
     @inbounds for I in CartesianIndices(dims)
         kk = zero(T)
         for d in 1:D
@@ -52,7 +52,7 @@ function _radial_bandpass(dims::NTuple{D,Int}, ξ::T, σ::T) where {D,T}
         kn = sqrt(kk)
         g = exp(-((kn - ξ) / σ)^2 / 2)
         lp = exp(-(kn / σ)^2 / 2)
-        ψ[I] = Complex{T}(g - κ * lp)
+        ψ[I] = g - κ * lp
     end
     return ψ
 end
@@ -86,9 +86,13 @@ end
 Isotropic band-pass wavelets `wavelets` (one per scale/sub-octave), the `D` scale-free Riesz
 multipliers `riesz`, and the complementary low-pass `averaging`, forming a tight frame. Every
 container is a type parameter.
+
+The wavelets and the low-pass are **real**: a radial band-pass is a real function of `|k|`. Only
+the Riesz multipliers `R_d(k) = -i k_d/|k|` are complex, so they carry their own array type.
 """
-struct MonogenicFilterBank{D, T, A<:AbstractArray{Complex{T},D}, W<:AbstractVector{A},
-                           R<:NTuple{D,A}, MV<:AbstractVector{FilterBanks.WaveletMeta{T}}}
+struct MonogenicFilterBank{D, T, A<:AbstractArray{T,D}, W<:AbstractVector{A},
+                           RA<:AbstractArray{Complex{T},D}, R<:NTuple{D,RA},
+                           MV<:AbstractVector{FilterBanks.WaveletMeta{T}}}
     wavelets::W
     riesz::R
     averaging::A
@@ -109,7 +113,7 @@ build_monogenic_bank(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
     build_monogenic_bank(Float64, dims, J; kwargs...)
 
 function build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1) where {T<:Real,D}
-    A = Array{Complex{T},D}
+    A = Array{T,D}
     wavelets = Vector{A}(undef, 0)
     meta = Vector{FilterBanks.WaveletMeta{T}}(undef, 0)
     for j in 0:(J - 1)
@@ -122,7 +126,7 @@ function build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1) 
     end
     ϕ = FilterBanks._tight_frame_lowpass!(wavelets)
     R = riesz_multipliers(dims, T)
-    return MonogenicFilterBank{D,T,A,typeof(wavelets),typeof(R),typeof(meta)}(
+    return MonogenicFilterBank{D,T,A,typeof(wavelets),eltype(R),typeof(R),typeof(meta)}(
         wavelets, R, ϕ, meta, J, Q)
 end
 
