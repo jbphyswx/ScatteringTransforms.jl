@@ -41,7 +41,7 @@ on scattered points the adjoint mis-scales the coefficients degree-dependently, 
 is needed for correct absolute magnitudes. Accurate inversion needs the sampling to resolve the band
 limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed points.
 """
-struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, C, NB, SP} <: ST.SphericalCore.AbstractSphericalPlan
+struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, NB, SP} <: ST.SphericalCore.AbstractSphericalPlan
     plan::P
     M::Int
     lmax::Int
@@ -49,13 +49,13 @@ struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, C, NB, SP} <: ST.Spheri
     phi::V
     rtol::T
     maxiter::Int
-    cbuf::C          # coefficient scratch filtered per band, so `sphere_apply!` allocates nothing
     nufft::NB        # the *resolved* NUFFT backend driving `plan`, never an `Auto` request
     spin::SP         # (spin-0, spin-1) plan pair for `spherical_monogenic_components`, or `nothing`
 end
 
 NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, nufft, spin = nothing) =
-    NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, zero(plan.C), nufft, spin)
+    NUSHTSphericalPlan{typeof(plan), typeof(theta), typeof(rtol), typeof(nufft), typeof(spin)}(
+        plan, M, lmax, theta, phi, rtol, maxiter, nufft, spin)
 
 # The NUFFT backend and batch size are shown because they dominate this plan's speed and are
 # otherwise invisible: an unresolved request falls back to direct summation when no fast NUFFT
@@ -161,17 +161,19 @@ function ST.SphericalCore.sphere_coeffs!(C, plan::NUSHTSphericalPlan, field::Abs
     return C
 end
 
-ST.SphericalCore.sphere_coeffs_buffer(plan::NUSHTSphericalPlan) = zero(plan.plan.C)
+# The caller's own coefficient array — `sphere_coeffs!` clears it and solves into it — so it is
+# allocated here, unlike the wrapped plan's filter scratch, which the plan allocates on first use.
+# `F` gives the coefficient shape and array type without touching that scratch.
+ST.SphericalCore.sphere_coeffs_buffer(plan::NUSHTSphericalPlan) = zero(plan.plan.F)
 
 # Apply the per-degree multiplier `h(ℓ)` to a copy of the coefficients and synthesise at the points.
-# The copy lands in the plan's scratch so a band allocates nothing, and `C` survives for the next one.
-function ST.SphericalCore.sphere_apply!(out::AbstractVecOrMat, plan::NUSHTSphericalPlan, C, h)
-    C2 = plan.cbuf
-    copyto!(C2, C)
-    NUFSHT.apply_transfer!(C2, _FnTransfer(h), plan.lmax)
-    with_serial_ft(() -> NUFSHT.nusht_type2!(out, C2, plan.plan))
-    return out
-end
+# `nusht_synthesize!` is the wrapped plan's own filter-then-synthesise step: it copies into scratch it
+# owns and allocates on first use, so `C` survives for the next band and repeated bands allocate
+# nothing — which is exactly what a cascade filtering one field at many scales needs.
+ST.SphericalCore.sphere_apply!(out::AbstractVecOrMat, plan::NUSHTSphericalPlan, C, h) =
+    with_serial_ft() do
+        NUFSHT.nusht_synthesize!(out, C, _FnTransfer(h), plan.plan)
+    end
 
 # Unweighted sample mean over the (quasi-uniform) scattered points ≈ the spherical average. An
 # `(M, B)` stack averages each field separately, so a batch gets one mean per column.
@@ -221,7 +223,9 @@ function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_ph
     # Resolve before building, and build against the concrete result. Handing `Auto` straight to
     # `make_plan` works, but then nothing downstream — not the plan, not `show`, not a benchmark —
     # can say whether the fast NUFFT or the O(M·K) direct-sum fallback is actually running.
-    nb = NUFSHT._resolve_nufft(nufft)
+    # Resolved against the *field* element type, which is what selects the folded real layout — the
+    # same `T` the plan is then built with below.
+    nb = NUFSHT._resolve_nufft(nufft, T)
     # The whole build is serialised, not just the sphere plans: `make_plan` also builds the NUFFT,
     # which plans through the same libfftw3, so two builds racing fault inside the FFTW planner —
     # observed as a segfault in `fftw_mkapiplan` under `ft_plan_sph_synthesis` when independent point
