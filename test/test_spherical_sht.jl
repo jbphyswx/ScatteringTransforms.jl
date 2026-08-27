@@ -51,6 +51,54 @@ end
 # and only passed the scale-invariant checks. First order is compared tightly; second order is looser
 # because its input is a modulus (broadband), which the two backends truncate at the shared band limit
 # slightly differently — so the tolerance there guards the ~7× regression, not machine agreement.
+Test.@testset "Per-band band limits converge to the full-band-limit cascade" begin
+    # Band-pass `j` is confined to degrees `≲ ℓ_j`, so synthesising it at the full band limit
+    # transforms a grid it cannot use. `band_headroom` is what that trades: the band's transfer above
+    # its cutoff decays as `exp(-ℓ(ℓ+1)/2ℓ_j(ℓ_j+1))`, so a smaller headroom discards more of it.
+    SC = ScatteringTransforms.SphericalCore
+    Random.seed!(77)
+    lmax, J = 64, 4
+
+    # Default narrows nothing, so it is the full-band-limit cascade exactly.
+    st0 = ScatteringTransforms.structured_spherical_scattering(lmax, J; max_order = 2)
+    Test.@test st0.bands === nothing
+
+    # A field band-limited well inside the grid, so the reference is itself meaningful.
+    pl = st0.plan
+    C0 = SC.sphere_coeffs_buffer(pl)
+    fill!(C0, 0.0)
+    nlo = (lmax + 1) ÷ 4
+    C0[1:nlo, 1:(2nlo - 1)] .= randn(nlo, 2nlo - 1)
+    field = SC.sphere_field_buffer(pl)
+    SC.sphere_apply!(field, pl, C0, l -> 1.0)
+    r = st0(field)
+
+    prev1 = prev2 = 0.0
+    for h in (6, 4, 3)
+        st = ScatteringTransforms.structured_spherical_scattering(lmax, J; max_order = 2,
+                                                                  band_headroom = h)
+        Test.@test st.bands !== nothing
+        # Every band limit is at most the full one, and at least one is strictly smaller.
+        Test.@test all(p -> p.lmax <= lmax, st.bands)
+        Test.@test any(p -> p.lmax < lmax, st.bands)
+        c = st(field)
+        # `S0` is the field's own mean and never passes through a band, so no narrowing moves it.
+        Test.@test c.S0 ≈ r.S0
+        e1 = maximum(abs, c.S1 .- r.S1) / maximum(abs, r.S1)
+        e2 = maximum(abs, c.S2 .- r.S2) / maximum(abs, r.S2)
+        Test.@test e1 < 1e-2
+        Test.@test e2 < 5e-2
+        prev1, prev2 = e1, e2
+    end
+    Test.@test prev1 > 0        # narrowing really does something, rather than silently not narrowing
+    Test.@test prev2 > 0
+
+    # A band limit carrying the whole bank reproduces the unnarrowed cascade bit for bit.
+    stw = ScatteringTransforms.structured_spherical_scattering(lmax, J; max_order = 2,
+                                                               band_headroom = 4 * 2^J)
+    Test.@test stw.bands === nothing
+end
+
 Test.@testset "Structured (SHT) and scattered (NUFSHT) spherical scattering agree" begin
     lmax, J = 16, 3
     Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)

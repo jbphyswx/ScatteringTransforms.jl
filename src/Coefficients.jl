@@ -118,6 +118,16 @@ flat_length(n::Integer) = n * (n - 1) ÷ 2 + n + 1
     1 + n + ((j1 - 1) * n - ((j1 - 1) * j1) ÷ 2) + (j2 - j1)
 
 """
+    flat_eltype(c) -> Type
+
+Element type a flattened column of `c` needs.
+
+`S1` and `S2` are moduli and stay real whatever the input is, but `S0` is the field mean and is
+complex for a complex field, so the flat layout is as wide as the two together.
+"""
+@inline flat_eltype(c) = promote_type(eltype(c.S1), typeof(zeroth_order(c)))
+
+"""
     flatten_length(c) -> Int
 
 Length of the flattened coefficient vector `[S0; S1; vec(S2 upper triangle)]`.
@@ -131,7 +141,7 @@ Flatten to vector: [S0; S1; vec(S2 upper triangular)].
 Only includes unique S2 elements where j2 > j1 (saves ~50% space).
 """
 function flatten1d(c::ScatteringCoefficients1D)
-    return flatten1d!(similar(c.S1, flatten_length(c)), c)
+    return flatten1d!(similar(c.S1, flat_eltype(c), flatten_length(c)), c)
 end
 
 """
@@ -216,7 +226,7 @@ flatten_length(c::ScatteringCoefficients2D) = flat_length(c.n_wavelets)
 Flatten to vector: [S0; S1; vec(S2 upper triangular)].
 """
 function flatten2d(c::ScatteringCoefficients2D)
-    return flatten2d!(similar(c.S1, flatten_length(c)), c)
+    return flatten2d!(similar(c.S1, flat_eltype(c), flatten_length(c)), c)
 end
 
 """

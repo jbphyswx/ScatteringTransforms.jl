@@ -61,20 +61,29 @@ function _like(ref::AbstractArray, A::AbstractArray)
     return d
 end
 
+# The bank, moved to wherever the points live. A computed bank moves only its low-pass and its one
+# scratch array — the wavelets are parameters, and are evaluated into that scratch on the device the
+# same way they are on the host.
+_to_points(ref::AbstractArray, fb::FilterBanks.FilterBank2D) =
+    FilterBanks.FilterBank2D([_like(ref, ψ) for ψ in fb.wavelets], _like(ref, fb.averaging),
+                             fb.meta, fb.J, fb.L)
+_to_points(ref::AbstractArray, fb::FilterBanks.ComputedFilterBank2D) =
+    FilterBanks.ComputedFilterBank2D(fb.morlets, fb.rescale, _like(ref, fb.averaging),
+                                     _like(ref, fb.scratch), fb.meta, fb.J, fb.L)
+
 function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, J::Int;
                L::Int = 8, max_order::Int = 2,
                spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
                period = nothing, solve::Bool = false, weights = nothing,
                eps = nothing, maxiter::Int = 100,
                rtol::Real = Plans.default_solver_rtol(T, spectral, eps), damp::Real = 0,
-               ntrans::Int = 1, nufft_nthreads::Int = 0) where {T}
+               ntrans::Int = 1, nufft_nthreads::Int = 0, cache::Bool = true) where {T}
     M = length(x)
-    cpu_fb = FilterBanks.build_filter_bank2d(T, ms, J; L = L)
+    cpu_fb = FilterBanks.build_filter_bank2d(T, ms, J, Val(cache); L = L)
     # The transform lives wherever its points do. Every array is `similar` to `x`, so host points
     # give a host transform and device points a device-resident one through the same code — there is
     # no separate device constructor, and no device package is referenced here.
-    fb = FilterBanks.FilterBank2D([_like(x, ψ) for ψ in cpu_fb.wavelets],
-                                  _like(x, cpu_fb.averaging), cpu_fb.meta, cpu_fb.J, cpu_fb.L)
+    fb = _to_points(x, cpu_fb)
     tree = PathGraph.build_tree([m.j_eff for m in fb.meta], max_order)
     plan = Plans.make_scattered_plan(spectral, x, y, ms, T;
                                      period = period, solve = solve, maxiter = maxiter,
@@ -84,7 +93,7 @@ function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, In
     # that cannot batch reports 1 regardless of what was asked for.
     B = Plans.batch_width(plan)
     w = _like(x, weights === nothing ? fill(one(T) / M, M) : T.(weights) ./ sum(weights))
-    nw = length(fb.wavelets)
+    nw = FilterBanks.nwavelets(fb)
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
              [(j, Int[], Int[]) for j in 1:nw]
     # One first-order field and one mode array, not `nw` of each: the cascade finishes every child of
@@ -92,10 +101,13 @@ function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, In
     cpts() = B == 1 ? similar(x, Complex{T}, M) : similar(x, Complex{T}, M, B)
     rpts() = B == 1 ? similar(x, T, M) : similar(x, T, M, B)
     modes() = B == 1 ? similar(x, Complex{T}, ms) : similar(x, Complex{T}, (ms..., B))
-    wav_b = [reshape(ψ, ms..., 1) for ψ in fb.wavelets]
+    wav_b = FilterBanks.batch_views(fb, ms)
+    # `buf_mod_pts` and `buf_u1_pts` are one array: `U₁` is dead once its analysis has read it, which
+    # is before any child writes its own modulus.
+    u1pts = rpts()
     return ScatteredPlanarScattering(
         fb, tree, groups, max_order, plan, w, wav_b,
-        modes(), modes(), cpts(), rpts(), rpts(), modes())
+        modes(), modes(), cpts(), u1pts, u1pts, modes())
 end
 build(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, J::Int; kwargs...) =
     build(Float64, x, y, ms, J; kwargs...)
@@ -105,12 +117,18 @@ _wmean(st::ScatteredPlanarScattering, v::AbstractVector) = LinearAlgebra.dot(st.
 # Shares the read-only bank, tree, work list and weights; copies only the buffers and the plan's
 # scratch. The filter bank and the plan's interpolation tables are the bulk of a scattered
 # transform, so a task pays `O(M + prod(ms))`, not the whole transform.
-ScatteringCore.task_workspace(st::ScatteredPlanarScattering) = ScatteredPlanarScattering(
-    st.filter_bank, st.tree, st.groups, st.max_order, Plans.task_local_plan(st.plan), st.weights,
-    st.wav_b,
-    similar(st.X_modes), similar(st.buf_modes),
-    similar(st.buf_conv_pts), similar(st.buf_mod_pts),
-    similar(st.buf_u1_pts), similar(st.buf_u1_modes))
+function ScatteringCore.task_workspace(st::ScatteredPlanarScattering)
+    fb = FilterBanks.task_bank(st.filter_bank)
+    # A stored bank is shared and its batch views with it. A computed one hands the task its own
+    # scratch, so the views have to be rebuilt against that scratch rather than the original's.
+    ms = size(st.X_modes)[1:2]
+    wav_b = fb === st.filter_bank ? st.wav_b : FilterBanks.batch_views(fb, ms)
+    u1pts = similar(st.buf_u1_pts)   # shared with `buf_mod_pts`, as in the original
+    return ScatteredPlanarScattering(
+        fb, st.tree, st.groups, st.max_order, Plans.task_local_plan(st.plan), st.weights, wav_b,
+        similar(st.X_modes), similar(st.buf_modes),
+        similar(st.buf_conv_pts), u1pts, u1pts, similar(st.buf_u1_modes))
+end
 
 """
     (st::ScatteredPlanarScattering)(x) -> ScatteringCoefficients2D
@@ -144,7 +162,7 @@ function scattered_planar_scattering!(coeffs::Coefficients.ScatteringCoefficient
     # only one first-order field and one mode array are live at a time.
     isempty(coeffs.S2) || fill!(coeffs.S2, zero(eltype(coeffs.S2)))
     @inbounds for (j1, children, _) in st.groups
-        ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.X_modes, fb.wavelets[j1],
+        ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.X_modes, FilterBanks.filter_at(fb, j1),
                                          plan, st.buf_modes)
         ScatteringCore.apply_modulus!(st.buf_u1_pts, st.buf_conv_pts)
         coeffs.S1[j1] = _wmean(st, st.buf_u1_pts)
@@ -152,7 +170,7 @@ function scattered_planar_scattering!(coeffs::Coefficients.ScatteringCoefficient
         # A modulus, so real whatever the input was — and passed as such.
         Plans.forward_transform!(st.buf_u1_modes, plan, st.buf_u1_pts)
         for j2 in children
-            ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.buf_u1_modes, fb.wavelets[j2],
+            ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.buf_u1_modes, FilterBanks.filter_at(fb, j2),
                                              plan, st.buf_modes)
             ScatteringCore.apply_modulus!(st.buf_mod_pts, st.buf_conv_pts)
             coeffs.S2[j1, j2] = _wmean(st, st.buf_mod_pts)
@@ -184,6 +202,7 @@ function scattered_planar_scattering_batch!(S0::AbstractVector, S1::AbstractMatr
 
     isempty(S2) || fill!(S2, zero(eltype(S2)))
     @inbounds for (j1, children, _) in st.groups
+        FilterBanks.filter_at(st.filter_bank, j1)
         ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.X_modes, st.wav_b[j1], plan,
                                          st.buf_modes)
         ScatteringCore.apply_modulus!(st.buf_u1_pts, st.buf_conv_pts)
@@ -192,6 +211,7 @@ function scattered_planar_scattering_batch!(S0::AbstractVector, S1::AbstractMatr
         # A modulus, so real whatever the input was — and passed as such.
         Plans.forward_transform!(st.buf_u1_modes, plan, st.buf_u1_pts)
         for j2 in children
+            FilterBanks.filter_at(st.filter_bank, j2)
             ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.buf_u1_modes, st.wav_b[j2],
                                              plan, st.buf_modes)
             ScatteringCore.apply_modulus!(st.buf_mod_pts, st.buf_conv_pts)

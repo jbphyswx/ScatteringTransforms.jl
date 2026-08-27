@@ -12,8 +12,11 @@ at resolution `N / s` (`s` = subsample factor). Every path shares the same outpu
 (set by the φ_J low-pass), so the natural storage is a single dense array with a trailing
 "path" axis indexed by the scattering tree's path ids (order-0 root first, then order 1, …).
 
-The globally-averaged coefficient of a path is the spatial mean of its localized field, so the
-two outputs are consistent by construction (`φ̂(0) = 1`, and the mean is the DC component).
+The globally-averaged coefficient of a path is the spatial mean of its localized field. Keeping that
+true under `↓ s` requires `φ̂_J(0) = 1` *and* `φ̂_J` to vanish on the subsampling lattice, which is why
+`φ_J` is [`Filters.gaussian_lowpass!`](@ref) and not the bank's `averaging`.
+
+A field owns the cascade workspace it was built for, so filling it repeatedly allocates nothing.
 """
 
 using ..PathGraph: PathGraph
@@ -37,27 +40,30 @@ In-place localized scattering transform into a pre-allocated `ScatteringField`.
 function scattering_field! end
 
 """
-    ScatteringField1D{T,A,Tree}
+    ScatteringField1D{T,A,Tree,WS}
 
 Localized 1D scattering field. `data` is `(M, npaths)`; column `p` is the localized field of
-path `p` at the subsampled resolution `M = N ÷ s`. `data`/the integer fields stay parametric.
+path `p` at the subsampled resolution `M = N ÷ s`. `ws` is the `Cascade.FieldWorkspace` that fills
+it.
 """
-struct ScatteringField1D{T, A<:AbstractMatrix{T}, Tree<:PathGraph.ScatteringTree}
+struct ScatteringField1D{T, A<:AbstractMatrix{T}, Tree<:PathGraph.ScatteringTree, WS}
     tree::Tree
     data::A
     subsample::Int
+    ws::WS
 end
 
 """
-    ScatteringField2D{T,A,Tree}
+    ScatteringField2D{T,A,Tree,WS}
 
 Localized 2D scattering field. `data` is `(My, Mx, npaths)`; slice `[:, :, p]` is the localized
 field of path `p` at subsampled resolution `(My, Mx) = (Ny, Nx) ÷ s`.
 """
-struct ScatteringField2D{T, A<:AbstractArray{T,3}, Tree<:PathGraph.ScatteringTree}
+struct ScatteringField2D{T, A<:AbstractArray{T,3}, Tree<:PathGraph.ScatteringTree, WS}
     tree::Tree
     data::A
     subsample::Int
+    ws::WS
 end
 
 """

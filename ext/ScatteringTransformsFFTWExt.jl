@@ -22,9 +22,10 @@ using ScatteringTransforms: ScatteringTransforms as ST
 FFTW-backed spectral plan. Holds pre-planned forward/inverse transforms applied in place via `mul!`
 (no allocation). Plan objects are concrete type parameters.
 """
-struct FFTWScatteringPlan{T, D, FP, IP} <: ST.Plans.AbstractScatteringPlan
+struct FFTWScatteringPlan{T, D, FP, IP, IPI} <: ST.Plans.AbstractScatteringPlan
     fwd::FP
     inv::IP
+    inv!::IPI          # the same inverse, planned in place — see `inverse_transform!`
     dims::NTuple{D, Int}
     nbatch::Int
 end
@@ -69,7 +70,9 @@ function ST.Plans.fftw_plan(::Type{T}, dims::NTuple{D, Int}; nbatch::Int = 1,
     return Base.@lock ST.Plans.PLANNER_LOCK ST.Plans.with_fft_nthreads(fft_nthreads) do
         fwd = FFTW.plan_fft(scratch, region; flags = planning)
         inv = FFTW.plan_ifft(scratch, region; flags = planning)
-        return FFTWScatteringPlan{T, D, typeof(fwd), typeof(inv)}(fwd, inv, dims, nbatch)
+        invp = FFTW.plan_ifft!(scratch, region; flags = planning)
+        return FFTWScatteringPlan{T, D, typeof(fwd), typeof(inv), typeof(invp)}(
+            fwd, inv, invp, dims, nbatch)
     end
 end
 
@@ -100,8 +103,10 @@ ST.Plans.task_local_plan(p::FFTWScatteringPlan) = p
 
 ST.Plans.forward_transform!(out::AbstractArray, p::FFTWScatteringPlan, x::AbstractArray) =
     (LinearAlgebra.mul!(out, p.fwd, x); out)
+# `mul!` on an out-of-place FFTW plan with aliased arguments is undefined, so `out === x` dispatches.
 ST.Plans.inverse_transform!(out::AbstractArray, p::FFTWScatteringPlan, x::AbstractArray) =
-    (LinearAlgebra.mul!(out, p.inv, x); out)
+    out === x ? (p.inv! * x) : (LinearAlgebra.mul!(out, p.inv, x); out)
+ST.Plans.inplace_inverse(::FFTWScatteringPlan) = true
 
 # Non-mutating, autodiff-friendly fast path: `plan * x` allocates and is differentiable via the
 # `AbstractFFTs` ChainRules (reverse-mode Mooncake/Zygote). The primal must be the planned eltype,

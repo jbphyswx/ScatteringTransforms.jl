@@ -96,6 +96,54 @@ scattered points, the exact quadrature integral for a structured grid. Provided 
 function sphere_mean end
 
 """
+    sphere_plan_at(plan, lmax) -> plan or nothing
+
+A plan of the same kind at the lower band limit `lmax`, or `nothing` when this backend cannot be
+narrowed. `nothing` is not a defect — it means every band is synthesised at the full band limit, which
+is what the cascade did before.
+
+This is the spherical form of decimation. Band-pass wavelet `j` is confined to degrees `≲ ℓ_j`, so
+synthesising it at the full `lmax` transforms a grid whose resolution the band cannot use.
+"""
+sphere_plan_at(::Any, ::Integer) = nothing
+
+"""
+    sphere_restrict!(Cdst, pdst, Csrc, psrc) -> Cdst
+
+Copy the spherical-harmonic coefficients of degree `≤ pdst`'s band limit out of `Csrc` (laid out for
+`psrc`) into `Cdst` (laid out for `pdst`), zeroing anything `Cdst` holds beyond them.
+
+Coefficient layout is backend-specific, so narrowing a band limit is a backend operation rather than
+an array slice.
+"""
+function sphere_restrict! end
+
+"""
+    sphere_field_buffer(plan) -> field
+
+A grid container of the right type and size for `plan`, for a band synthesised at that plan's band
+limit. Defaults to [`sphere_coeffs_buffer`](@ref), which is the same shape on backends whose
+coefficients and samples share a layout.
+"""
+sphere_field_buffer(plan) = sphere_coeffs_buffer(plan)
+
+"""
+    band_lmax(lmax, J, j, headroom) -> Int
+
+Band limit that carries wavelet `j`: `headroom · ℓ_j`, clamped to `lmax`.
+
+Band `j` is a difference of Gaussians whose transfer above its cutoff is
+`exp(-ℓ(ℓ+1) / 2ℓ_j(ℓ_j+1))`, which decays slowly — `0.135` at `2ℓ_j`, `0.011` at `3ℓ_j`, `3.4e-4` at
+`4ℓ_j`. `headroom` is therefore what is actually traded here, and `4` keeps the discarded tail below
+the transform's other approximations.
+"""
+function band_lmax(lmax::Integer, J::Integer, j::Integer, headroom::Real)
+    isfinite(headroom) || return Int(lmax)
+    ℓj = lmax / 2.0^(J - j)
+    return min(Int(lmax), max(1, ceil(Int, headroom * ℓj)))
+end
+
+"""
     plan_points(plan) -> (θ, φ) or nothing
 
 The sample locations a spherical plan was built on, or `nothing` when the plan is defined by its
@@ -150,9 +198,13 @@ residual instead of erroring. Widening to another width already builds a fresh p
 same-width case copies.
 """
 function task_local_batch_plan(plan, B::Integer)
-    widened = batch_plan(plan, B)
-    widened === nothing && return nothing
-    return widened === plan ? Plans.task_local_plan(plan) : widened
+    supports_batch(plan) || return nothing
+    # Widen a task-local copy rather than deciding afterwards whether `batch_plan` handed `plan` back.
+    # These plans are immutable structs, so `===` on one is a field-by-field comparison rather than an
+    # identity test — it cannot reliably tell a returned original from an equal-valued rebuild, and
+    # getting it wrong hands two tasks the same analysis scratch. Copying first makes that structural:
+    # a width that matches returns the copy, and any other width is built from it.
+    return batch_plan(Plans.task_local_plan(plan), B)
 end
 
 """
@@ -272,12 +324,33 @@ Spherical scattering transform over a backend `plan::P`. `sigma2[k+1]` is the Ga
 variance for the dyadic low-pass cutoff `ℓ_k` (`k=0..J`); band-pass wavelet `j` is
 `lowpass(ℓ_j) − lowpass(ℓ_{j-1})`.
 """
-struct SphericalScattering{T, P, V <: AbstractVector{T}}
+struct SphericalScattering{T, P, V <: AbstractVector{T}, BV}
     lmax::Int
     J::Int
     max_order::Int
     plan::P
     sigma2::V
+    # Per-scale narrowed plans, or `nothing` when the backend cannot narrow (or the caller asked for
+    # no narrowing). `nothing` runs the full-band-limit cascade unchanged.
+    bands::BV
+end
+
+SphericalScattering(lmax::Int, J::Int, max_order::Int, plan, sigma2) =
+    SphericalScattering(lmax, J, max_order, plan, sigma2, nothing)
+
+"""
+    band_plans(plan, lmax, J, headroom) -> Vector or nothing
+
+One narrowed plan per scale, or `nothing` if this backend cannot narrow. A scale whose band needs the
+full band limit reuses `plan` itself rather than building a duplicate.
+"""
+function band_plans(plan, lmax::Integer, J::Integer, headroom::Real)
+    ls = [band_lmax(lmax, J, j, headroom) for j in 1:J]
+    # Nothing to narrow: fall back to the full-band-limit cascade rather than run the narrowed one
+    # with `plan` in every slot, which would add a no-op coefficient copy per band.
+    all(>=(lmax), ls) && return nothing
+    sphere_plan_at(plan, lmax) === nothing && return nothing
+    return map(l -> l >= lmax ? plan : sphere_plan_at(plan, l), ls)
 end
 
 """
@@ -288,8 +361,14 @@ Gram factor and point set are read-only and shared, while the plan's analysis/sy
 duplicated by `Plans.task_local_plan`. Analysis writes through that scratch, so tasks sharing one
 plan would overwrite each other's coefficients.
 """
-task_local(st::SphericalScattering) =
-    SphericalScattering(st.lmax, st.J, st.max_order, Plans.task_local_plan(st.plan), st.sigma2)
+function task_local(st::SphericalScattering)
+    plan = Plans.task_local_plan(st.plan)
+    # Each narrowed plan carries its own synthesis scratch, so a task needs its own — except where
+    # the scale reuses `st.plan` itself, which must go on aliasing the copy.
+    bands = st.bands === nothing ? nothing :
+            map(p -> p === st.plan ? plan : Plans.task_local_plan(p), st.bands)
+    return SphericalScattering(st.lmax, st.J, st.max_order, plan, st.sigma2, bands)
+end
 
 """
     SphericalWorkspace{A,C}
@@ -302,16 +381,33 @@ starting the next.
 Build one with `SphericalWorkspace(st, field)` and reuse it across calls; a task that transforms
 concurrently needs its own (and its own `Plans.task_local_plan` of the spherical plan).
 """
-struct SphericalWorkspace{A, C}
+struct SphericalWorkspace{A, C, AV, CV}
     band::A
     u1::A
     C::C
     C1::C
+    # Per-scale scratch at that scale's narrowed band limit; empty when the cascade runs at the full
+    # band limit, where `band`/`u1`/`C1` above are all it needs.
+    bband::AV
+    bu1::AV
+    bC::CV
+    bC1::CV
 end
 
-SphericalWorkspace(st, field::AbstractArray) =
-    SphericalWorkspace(similar(field), similar(field),
-                       sphere_coeffs_buffer(st.plan), sphere_coeffs_buffer(st.plan))
+function SphericalWorkspace(st, field::AbstractArray)
+    C() = sphere_coeffs_buffer(st.plan)
+    if st.bands === nothing
+        e = similar(field, 0)
+        ec = [C()][1:0]
+        return SphericalWorkspace(similar(field), similar(field), C(), C(),
+                                  typeof(e)[], typeof(e)[], ec, ec)
+    end
+    bband = [sphere_field_buffer(p) for p in st.bands]
+    bu1 = [sphere_field_buffer(p) for p in st.bands]
+    bC = [sphere_coeffs_buffer(p) for p in st.bands]
+    bC1 = [sphere_coeffs_buffer(p) for p in st.bands]
+    return SphericalWorkspace(similar(field), similar(field), C(), C(), bband, bu1, bC, bC1)
+end
 
 """
     (st::SphericalScattering)(field) -> (; S0, S1, S2)
@@ -342,6 +438,7 @@ function spherical_scattering!(S1::AbstractVector, S2::AbstractMatrix,
     S0 = sphere_mean(st.plan, field)
     isempty(S2) || fill!(S2, zero(eltype(S2)))
     sphere_coeffs!(ws.C, st.plan, field)                  # analyse the field once
+    st.bands === nothing || return _banded_cascade!(S1, S2, st, ws, S0)
     for j1 in 1:J
         sphere_apply!(ws.band, st.plan, ws.C, band_multiplier(st.sigma2[j1 + 1], st.sigma2[j1]))
         @. ws.u1 = abs(ws.band)
@@ -352,6 +449,35 @@ function spherical_scattering!(S1::AbstractVector, S2::AbstractMatrix,
             sphere_apply!(ws.band, st.plan, ws.C1, band_multiplier(st.sigma2[j2 + 1], st.sigma2[j2]))
             @. ws.band = abs(ws.band)
             S2[j1, j2] = sphere_mean(st.plan, ws.band)
+        end
+    end
+    return (S0 = S0, S1 = S1, S2 = S2)
+end
+
+# The same cascade with every band synthesised at its own band limit. `ws.C` already holds the
+# field's coefficients at the full band limit.
+#
+# Scale `j2 < j1` reuses its own scale's buffers, which its first-order pass has already finished
+# with — the cascade visits `j1` in increasing order, so those are dead by the time a child needs
+# them.
+function _banded_cascade!(S1, S2, st::SphericalScattering, ws::SphericalWorkspace, S0)
+    bands = st.bands
+    for j1 in 1:st.J
+        p1 = bands[j1]
+        h1 = band_multiplier(st.sigma2[j1 + 1], st.sigma2[j1])
+        sphere_restrict!(ws.bC[j1], p1, ws.C, st.plan)
+        sphere_apply!(ws.bband[j1], p1, ws.bC[j1], h1)
+        @. ws.bu1[j1] = abs(ws.bband[j1])
+        S1[j1] = sphere_mean(p1, ws.bu1[j1])
+        (st.max_order >= 2 && j1 > 1) || continue
+        sphere_coeffs!(ws.bC1[j1], p1, ws.bu1[j1])
+        for j2 in 1:(j1 - 1)
+            p2 = bands[j2]
+            h2 = band_multiplier(st.sigma2[j2 + 1], st.sigma2[j2])
+            sphere_restrict!(ws.bC[j2], p2, ws.bC1[j1], p1)
+            sphere_apply!(ws.bband[j2], p2, ws.bC[j2], h2)
+            @. ws.bband[j2] = abs(ws.bband[j2])
+            S2[j1, j2] = sphere_mean(p2, ws.bband[j2])
         end
     end
     return (S0 = S0, S1 = S1, S2 = S2)

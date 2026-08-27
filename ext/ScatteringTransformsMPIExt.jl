@@ -53,10 +53,6 @@ ST.scattering_batch(b::CB.AbstractMPIBackend, st::ST.Scattering3D.ScatteringTran
 # The nonuniform and spherical surfaces need no rebuild here — SPMD means every rank already holds
 # its own transform — so they differ only in which axis the batch runs along.
 ST.scattering_batch(b::CB.AbstractMPIBackend,
-                    st::ST.SubsampledScattering.MultiResolutionScattering, X::AbstractArray) =
-    _mpi_batch(b, st, X, (A, cols) -> selectdim(A, ndims(A), cols))
-
-ST.scattering_batch(b::CB.AbstractMPIBackend,
                     st::ST.ScatteredPlanar.ScatteredPlanarScattering, X::AbstractMatrix) =
     _mpi_batch(b, st, X, (A, cols) -> view(A, :, cols))
 

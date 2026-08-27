@@ -26,7 +26,6 @@ Documenter.makedocs(
         ScatteringTransforms.Scattering2D,
         ScatteringTransforms.Scattering3D,
         ScatteringTransforms.ScatteredPlanar,
-        ScatteringTransforms.SubsampledScattering,
         ScatteringTransforms.Monogenic,
         ScatteringTransforms.SphericalCore,
         ScatteringTransforms.Inverse,

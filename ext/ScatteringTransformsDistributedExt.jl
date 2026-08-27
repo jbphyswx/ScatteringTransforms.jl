@@ -65,10 +65,6 @@ ST.scattering_batch(b::CB.AbstractDistributedBackend, st::ST.Scattering3D.Scatte
 # The nonuniform and spherical surfaces rebuild from a spec that carries their sample locations, so
 # they distribute the same way; only the batch axis differs.
 ST.scattering_batch(b::CB.AbstractDistributedBackend,
-                    st::ST.SubsampledScattering.MultiResolutionScattering, X::AbstractArray) =
-    _distributed_batch(b, st, X, (A, cols) -> selectdim(A, ndims(A), cols))
-
-ST.scattering_batch(b::CB.AbstractDistributedBackend,
                     st::ST.ScatteredPlanar.ScatteredPlanarScattering, X::AbstractMatrix) =
     _distributed_batch(b, st, X, (A, cols) -> view(A, :, cols))
 

@@ -25,6 +25,7 @@ against a [`ReconstructionWorkspace`](@ref), which matters because phase retriev
 """
 
 using ..Plans: Plans
+using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Scattering1D: Scattering1D
 using ..Scattering2D: Scattering2D
@@ -65,7 +66,7 @@ function ReconstructionWorkspace(st::GriddedScattering)
     T = eltype(proto)
     cplx() = similar(proto, Complex{T})
     return ReconstructionWorkspace(
-        [cplx() for _ in eachindex(fb.wavelets)], cplx(),
+        [cplx() for _ in 1:FilterBanks.nwavelets(fb)], cplx(),
         cplx(), cplx(), cplx(),
         similar(proto, T))
 end
@@ -83,8 +84,9 @@ function wavelet_transform!(ws::ReconstructionWorkspace, st::GriddedScattering, 
     fb, plan = st.filter_bank, st.plan
     ws.buf .= complex.(x)
     Plans.forward_transform!(ws.Xf, plan, ws.buf)
-    @inbounds for λ in eachindex(fb.wavelets)
-        ScatteringCore.wavelet_convolve!(ws.wavelet[λ], ws.Xf, fb.wavelets[λ], plan, ws.buf)
+    @inbounds for λ in 1:FilterBanks.nwavelets(fb)
+        ScatteringCore.wavelet_convolve!(ws.wavelet[λ], ws.Xf, FilterBanks.filter_at(fb, λ),
+                                         plan, ws.buf)
     end
     ScatteringCore.wavelet_convolve!(ws.lowpass, ws.Xf, fb.averaging, plan, ws.buf)
     return (; wavelet = ws.wavelet, lowpass = ws.lowpass)
@@ -114,7 +116,7 @@ function iwavelet!(ws::ReconstructionWorkspace, st::GriddedScattering, wavelet, 
     @inbounds for λ in eachindex(wavelet)
         ws.buf .= wavelet[λ]
         Plans.forward_transform!(ws.Xf, plan, ws.buf)
-        ws.Xrec .+= ws.Xf .* fb.wavelets[λ]
+        ws.Xrec .+= ws.Xf .* FilterBanks.filter_at(fb, λ)
     end
     Plans.inverse_transform!(ws.buf, plan, ws.Xrec)
     ws.field .= real.(ws.buf)
@@ -146,8 +148,8 @@ One workspace is built up front and reused across all `iters`, so the loop alloc
 function reconstruct_phase(st::GriddedScattering, moduli;
                            iters::Int=200, init=nothing, seed_lowpass=nothing)
     fb = st.filter_bank
-    length(moduli) == length(fb.wavelets) ||
-        throw(ArgumentError("expected $(length(fb.wavelets)) moduli, got $(length(moduli))"))
+    length(moduli) == FilterBanks.nwavelets(fb) ||
+        throw(ArgumentError("expected $(FilterBanks.nwavelets(fb)) moduli, got $(length(moduli))"))
     T = real(eltype(fb.averaging))
     sz = size(first(moduli))
 

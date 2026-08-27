@@ -7,53 +7,47 @@ Implements Morlet wavelets in the frequency domain for FFT-based convolutions.
 """
 
 export Morlet1D, Morlet2D, Morlet3D
-export frequency_response
+export frequency_response, frequency_response!
+export gaussian_lowpass, gaussian_lowpass!
 export fibonacci_directions
 
 """
     Morlet1D{T<:Real}
 
-1D Morlet wavelet in frequency domain.
+1D Morlet wavelet in frequency domain, over normalized frequency `ω ∈ [0, ½]`:
 
-The Morlet wavelet is a complex sinusoid modulated by a Gaussian:
-    ψ(x) = (1/√|Σ|) exp(-x²/(2σ²)) (exp(i k₀ x) - β)
+    Ψ(ω) = exp(-(ω-ξ)²/2σ²) - κ exp(-ω²/2σ²),   κ = exp(-(ξ/σ)²/2)
 
-where β = exp(-σ²k₀²/2) ensures zero mean (admissibility condition).
-
-In frequency domain:
-    Ψ(ω) = exp(-(ω-k₀)²σ²/2) - β exp(-ω²σ²/2)
+`σ` here is a **frequency-domain** width (unlike `Morlet2D`/`Morlet3D`, whose `σ` is a real-space
+width), so the zero-mean term is `κ`, evaluated in [`frequency_response!`](@ref) — `Ψ(0) = 1·κ - κ·1`
+after normalising, which is what makes the wavelet admissible. The filter is analytic: zero for
+`ω < 0`.
 
 # Type Parameters
 - `T`: Element type (Float32, Float64, etc.)
 
 # Fields
-- `center_freq::T`: Center frequency k₀
-- `bandwidth::T`: Standard deviation σ of Gaussian envelope  
-- `beta::T`: Correction factor for zero mean
+- `center_freq::T`: Center frequency ξ
+- `bandwidth::T`: Frequency-domain width σ
 - `N::Int`: Filter length (FFT size)
 """
 struct Morlet1D{T<:Real}
     center_freq::T
     bandwidth::T
-    beta::T
     N::Int
-    
+
     function Morlet1D{T}(N::Int, j::Real; Q::Int=1, r::T=T(sqrt(0.5))) where T<:Real
         # Center frequency: xi = 0.5 * 2^(-j/Q) in normalized frequency [0, 1]
         xi = T(0.5) / (T(2.0)^(j / Q))
-        
+
         # Bandwidth: sigma = xi * (1 - 2^(-1/Q)) / (1 + 2^(-1/Q)) / sqrt(2*log(1/r))
         # This ensures proper coverage of frequency axis (from Lostanlen 2017, Kymatio)
         factor = T(1.0) / (T(2.0)^(T(1.0) / Q))
         term1 = (T(1.0) - factor) / (T(1.0) + factor)
         term2 = T(1.0) / Base.sqrt(T(2.0) * Base.log(T(1.0) / r))
         sigma = xi * term1 * term2  # Bandwidth proportional to center frequency
-        
-        # β ensures zero mean (wavelet admissibility)
-        # The wavelet is: Ψ(ω) = G(ω - ξ) - β·G(ω) where G is Gaussian
-        β = Base.exp(-(sigma * xi)^2 / T(2))
-        
-        new{T}(xi, sigma, β, N)
+
+        new{T}(xi, sigma, N)
     end
 end
 
@@ -75,13 +69,21 @@ Returns a length-N vector with the Fourier-domain filter coefficients.
 The response is analytic (zero for negative frequencies) for proper
 wavelet transform. Element type matches the wavelet's precision.
 """
-function frequency_response(m::Morlet1D{T}) where T<:Real
+frequency_response(m::Morlet1D{T}) where {T<:Real} =
+    frequency_response!(Vector{T}(undef, m.N), m)
+
+"""
+    frequency_response!(Ψ, m) -> Ψ
+
+Write the response into `Ψ` instead of allocating it. A bank that evaluates its filters on demand
+rather than storing them needs exactly one array, and this is what lets it reuse that array.
+"""
+function frequency_response!(Ψ::AbstractVector{T}, m::Morlet1D{T}) where T<:Real
     N = m.N
     ξ = m.center_freq
     σ = m.bandwidth
     inv2 = inv(T(2))
-    
-    Ψ = Vector{T}(undef, N)
+    length(Ψ) == N || throw(DimensionMismatch("Ψ must have length $N"))
     
     # kappa: ratio at ω=0 (bin 0). gabor(0)=exp(-(xi/sigma)^2/2), lowpass(0)=1
     kappa = exp(-(ξ / σ)^2 * inv2)
@@ -155,8 +157,12 @@ Morlet2D(N::NTuple{2,Int}, j::Int, theta::Real; kwargs...) =
 Compute the 2D frequency response Ψ(kx, ky) of an oriented Morlet wavelet.
 Element type matches the wavelet's precision.
 """
-function frequency_response(m::Morlet2D{T}) where T<:Real
+frequency_response(m::Morlet2D{T}) where {T<:Real} =
+    frequency_response!(Matrix{T}(undef, m.N), m)
+
+function frequency_response!(Ψ::AbstractMatrix{T}, m::Morlet2D{T}) where T<:Real
     Ny, Nx = m.N
+    size(Ψ) == m.N || throw(DimensionMismatch("Ψ must have size $(m.N)"))
     k0  = m.center_freq
     σx  = m.bandwidth_x
     σy  = m.bandwidth_y
@@ -166,8 +172,6 @@ function frequency_response(m::Morlet2D{T}) where T<:Real
     inv2 = inv(T(2))
     σx2_div2 = σx^2 * inv2
     σy2_div2 = σy^2 * inv2
-    
-    Ψ = Matrix{T}(undef, Ny, Nx)
     
     @inbounds for ix in 1:Nx
         kx = T(_fftfreq(Nx, ix - 1)) * T(2π)
@@ -235,7 +239,10 @@ Morlet3D(N::NTuple{3,Int}, j::Int, direction; kwargs...) =
 
 3D frequency response `Ψ(kx,ky,kz)` of an oriented Morlet wavelet.
 """
-function frequency_response(m::Morlet3D{T}) where T<:Real
+frequency_response(m::Morlet3D{T}) where {T<:Real} =
+    frequency_response!(Array{T,3}(undef, m.N), m)
+
+function frequency_response!(Ψ::AbstractArray{T,3}, m::Morlet3D{T}) where T<:Real
     Nz, Ny, Nx = m.N
     k0 = m.center_freq
     σpar2 = m.sigma_par^2
@@ -244,7 +251,7 @@ function frequency_response(m::Morlet3D{T}) where T<:Real
     β = m.beta
     inv2 = inv(T(2))
 
-    Ψ = Array{T,3}(undef, Nz, Ny, Nx)
+    size(Ψ) == m.N || throw(DimensionMismatch("Ψ must have size $(m.N)"))
     @inbounds for ix in 1:Nx
         kx = T(_fftfreq(Nx, ix - 1)) * T(2π)
         for iy in 1:Ny
@@ -265,6 +272,42 @@ function frequency_response(m::Morlet3D{T}) where T<:Real
     end
     return Ψ
 end
+
+"""
+    gaussian_lowpass!(φ, σ) -> φ
+    gaussian_lowpass(T, dims, J; sigma0=0.8) -> Array{T,D}
+
+Isotropic Gaussian low-pass `φ̂(k) = exp(-|k|²σ²/2)` on the FFT grid of `dims`, with `k` the angular
+frequency (`2π·fftfreq` per axis) and `σ = sigma0·2^J` a real-space width. The scaling function of
+the localized (Mallat) transform `S_p = (U_p ⋆ φ_J) ↓ s`.
+
+Two properties are load-bearing. `φ̂(0) = 1` makes the convolution preserve a field's mean; and `φ̂`
+must vanish on the subsampling lattice `{m·N/s, m ≠ 0}`, since that is exactly the condition for
+`⟨S_p⟩` to survive decimation and still equal the scattering coefficient `⟨U_p⟩`. The lattice starts
+at `|k| = 2π/s`, so at the default `s = 2^(J-1)` the largest surviving term is `exp(-(4π·sigma0)²/2)`
+— `1e-22` at `sigma0 = 0.8`. That condition is the requirement; the Gaussian family and `sigma0` are
+a choice with wide margin.
+
+Distinct from a filter bank's `averaging`, the tight-frame complement `√(max(0, 1-Σ|ψ|²))`: every `ψ̂`
+here is analytic, so that one is identically `1` across the analytic complement and fails the lattice
+condition outright.
+"""
+function gaussian_lowpass!(φ::AbstractArray{T, D}, σ::Real) where {T <: Real, D}
+    n = size(φ)
+    h = T(σ)^2 / 2
+    @inbounds for I in CartesianIndices(φ)
+        s = zero(T)
+        for d in 1:D
+            k = T(2π) * T(_fftfreq(n[d], I[d] - 1))
+            s += k * k
+        end
+        φ[I] = exp(-s * h)
+    end
+    return φ
+end
+
+gaussian_lowpass(::Type{T}, dims::NTuple{D, Int}, J::Integer; sigma0::Real = 0.8) where {T <: Real, D} =
+    gaussian_lowpass!(Array{T, D}(undef, dims), T(sigma0) * T(2)^J)
 
 """
     fibonacci_directions(n, ::Type{T}=Float64) -> Vector{NTuple{3,T}}
