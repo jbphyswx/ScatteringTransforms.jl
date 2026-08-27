@@ -34,17 +34,56 @@ Test.@testset "Cascade issues each first-order transform exactly once" begin
     end
 end
 
+Test.@testset "Decimation reduces cascade work, not just its shape" begin
+    # The execution *count* is identical at every `oversampling`: the same transforms happen, at
+    # smaller sizes. So a call-count gate is invariant to this entire optimisation and would pass
+    # while nothing got faster. Weighing each execution by its butterfly count is what pins it.
+    dims = (64, 64)
+    input = randn(dims)
+    build(α) = ScatteringTransforms.Scattering2D.ScatteringTransform2D(dims, 4; L = 4,
+                   oversampling = α, spectral = SpectralBackends.FFTSpectralBackend())
+    ref = count_executions((s, x) -> s(x), build(4), input)
+    Test.@test ref.work == ref.total * prod(dims) * 12      # 64² · log₂(64²), i.e. nothing decimated
+    prev = ref.work
+    for α in (2, 1, 0)
+        counts = count_executions((s, x) -> s(x), build(α), input)
+        Test.@test counts.total == ref.total                # same transforms ...
+        Test.@test counts.work < prev                       # ... strictly cheaper at each step
+        prev = counts.work
+    end
+    Test.@test prev < ref.work ÷ 5
+end
+
 Test.@testset "Workspace is O(field), not O(nw * field)" begin
     # Only one first-order field and one spectrum are live at a time, so a transform's scratch must
     # not grow with the number of wavelets. It used to hold `nw` of each.
-    ws_bytes(s) = sum(sizeof, (s.buffer_input, s.buffer_signal_fft, s.buffer_conv,
-                               s.buffer_mod, s.buffer_u1, s.buffer_u1_fft))
+    #
+    # Deduplicating by identity is load-bearing, not tidiness: `buffer_conv` is `buffer_input`
+    # itself when the plan inverts in place, and each periodized resolution's inverse destination is
+    # its own working array, so a naive `sum(sizeof, ...)` reports scratch that was never allocated.
+    function ws_bytes(s)
+        seen = Base.IdSet{Any}()
+        for a in (s.buffer_input, s.buffer_signal_fft, s.buffer_conv, s.buffer_u1_fft)
+            push!(seen, a)
+        end
+        for d in (s.pw.work, s.pw.out, s.pw.spec), a in values(d)
+            push!(seen, a)
+        end
+        return sum(sizeof, seen)
+    end
     small = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 2; L = 2,
                 spectral = SpectralBackends.FFTSpectralBackend())
     big = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 4; L = 8,
               spectral = SpectralBackends.FFTSpectralBackend())
     Test.@test length(big.filter_bank.wavelets) > 7 * length(small.filter_bank.wavelets)
     Test.@test ws_bytes(small) == ws_bytes(big)
+
+    # Decimation adds one buffer set per live resolution, but those shrink geometrically, so total
+    # scratch stays a small multiple of one field however deep the cascade goes.
+    field = 2 * sizeof(ComplexF64) * 32 * 32           # buffer_input + buffer_signal_fft
+    deep = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 4; L = 8,
+               oversampling = 0, spectral = SpectralBackends.FFTSpectralBackend())
+    Test.@test ws_bytes(deep) < 3 * field
 end
 
 Test.@testset "task_workspace shares read-only state, copies only scratch" begin
@@ -57,8 +96,25 @@ Test.@testset "task_workspace shares read-only state, copies only scratch" begin
     Test.@test ws.tree === st.tree
     Test.@test ws.groups === st.groups
     Test.@test ws.buffer_conv !== st.buffer_conv
-    Test.@test ws.buffer_u1 !== st.buffer_u1
+    Test.@test ws.buffer_u1_fft !== st.buffer_u1_fft
     Test.@test ws.buffer_signal_fft !== st.buffer_signal_fft
+
+    # The cascade workspace is where the mutable state actually lives now, so the same split has to
+    # hold inside it: buffers per task, filters shared. Sharing the buffers is a silent data race.
+    Test.@test ws.pw !== st.pw
+    Test.@test ws.pw.filters === st.pw.filters
+    # Every resolution, not just some: one shared buffer is a data race, and a resolution missing
+    # from the copy would fall back to the original's rather than error.
+    Test.@test keys(ws.pw.work) == keys(st.pw.work)
+    Test.@test keys(ws.pw.spec) == keys(st.pw.spec)
+    for r in keys(st.pw.work)
+        Test.@test ws.pw.work[r] !== st.pw.work[r]
+    end
+    # Aliasing must survive the copy: an out that was its own work stays so, one that was not stays
+    # distinct. Getting this backwards either wastes an array or silently overwrites the input.
+    for r in keys(st.pw.out)
+        Test.@test (ws.pw.out[r] === ws.pw.work[r]) == (st.pw.out[r] === st.pw.work[r])
+    end
 end
 
 Test.@testset "Every backend returns the serial result" begin
@@ -107,41 +163,43 @@ end
 # both cost bytes that `@allocated` would attribute to the callee.
 _alloc3(f::F, a, b, c) where {F} = (f(a, b, c); @allocated f(a, b, c))
 
-Test.@testset "Multi-resolution second order converges to the exact transform (1D/2D/3D)" begin
-    # Decimating `U₁` before the second wavelet transform is exact in the frequency domain; what is
-    # approximate is assuming `U₁` carries no energy above the reduced Nyquist, and `oversampling`
-    # buys that down. So the error must fall monotonically, and vanish once no scale is decimated.
+Test.@testset "Periodized cascade converges to the undecimated one (1D/2D/3D)" begin
+    # Producing each convolution on its own decimated grid is exact in the frequency domain; what is
+    # approximate is that `U₁`'s spectrum is then the *aliased* spectrum of the full `U₁`, and
+    # `oversampling` buys that down. So the error must fall monotonically and vanish once no scale is
+    # decimated.
     #
-    # This also pins the reduced-resolution banks to the *normalised* builder: bare frequency
-    # responses omit the tight-frame factor (`0.90` in 1D, `0.38` in 2D), which would rescale every
-    # decimated second-order coefficient and show up here as a floor the error never drops below.
+    # This also pins the coarse filters to *periodizations of the original*: rebuilding a Morlet on
+    # the coarse grid stretches its frequency axis and yields the next octave's filter, which would
+    # show up here as a floor the error never drops below.
     Random.seed!(21)
     FB = SpectralBackends.FFTSpectralBackend()
-    MR = ScatteringTransforms.SubsampledScattering
 
     s2err(cs, ce) = (idx = findall(!iszero, ce.S2);
                      isempty(idx) ? 0.0 :
                      sum(abs, cs.S2[idx] .- ce.S2[idx]) / sum(abs, ce.S2[idx]))
 
-    for (mk, exact, x, ov_exact) in (
-            (ov -> MR.SubsampledScattering1D(512, 5; Q = 1, oversampling = ov, spectral = FB),
-             ScatteringTransforms.Scattering1D.ScatteringTransform1D(512, 5; Q = 1, spectral = FB),
-             randn(512), 5),
-            (ov -> MR.SubsampledScattering2D((64, 64), 3; L = 4, oversampling = ov, spectral = FB),
-             ScatteringTransforms.Scattering2D.ScatteringTransform2D((64, 64), 3; L = 4, spectral = FB),
-             randn(64, 64), 3),
-            (ov -> MR.SubsampledScattering3D((16, 16, 16), 2; n_orient = 4, oversampling = ov, spectral = FB),
-             ScatteringTransforms.Scattering3D.ScatteringTransform3D((16, 16, 16), 2; n_orient = 4, spectral = FB),
-             randn(16, 16, 16), 2))
-        ce = exact(x)
-        Test.@test s2err(mk(ov_exact)(x), ce) < 1e-12          # nothing decimated: exact
+    for (mk, x, ov_exact, run!) in (
+            (ov -> ScatteringTransforms.Scattering1D.ScatteringTransform1D(512, 5; Q = 1,
+                       oversampling = ov, spectral = FB),
+             randn(512), 5, ScatteringTransforms.Scattering1D.scattering_transform!),
+            (ov -> ScatteringTransforms.Scattering2D.ScatteringTransform2D((64, 64), 3; L = 4,
+                       oversampling = ov, spectral = FB),
+             randn(64, 64), 3, ScatteringTransforms.Scattering2D.scattering_transform2d!),
+            (ov -> ScatteringTransforms.Scattering3D.ScatteringTransform3D((16, 16, 16), 2;
+                       n_orient = 4, oversampling = ov, spectral = FB),
+             randn(16, 16, 16), 2, ScatteringTransforms.Scattering3D.scattering_transform3d!))
+        ce = mk(ov_exact)(x)
+        Test.@test s2err(mk(ov_exact + 2)(x), ce) == 0         # nothing decimated: bit-identical
         Test.@test s2err(mk(1)(x), ce) <= s2err(mk(0)(x), ce) + 1e-12
-        Test.@test isapprox(mk(0)(x).S1, ce.S1; rtol = 1e-10)  # first order is never decimated
 
-        # One shared cascade, so the `!` form is allocation-free at every dimension.
-        st = mk(1)
-        coeffs = ScatteringTransforms.batch_coeffs(st, Float64)
-        Test.@test _alloc3(MR.subsampled_scattering!, coeffs, st, x) == 0
+        # The `r > 1` path builds an index range and a view per alias block; those must stay off the
+        # heap, or the saving is spent on allocation.
+        for ov in (ov_exact, 1, 0)
+            st = mk(ov)
+            coeffs = ScatteringTransforms.batch_coeffs(st, Float64)
+            Test.@test _alloc3(run!, coeffs, st, x) == 0
+        end
     end
 end
 
@@ -167,12 +225,15 @@ Test.@testset "Every surface has a batch entry point, matching its per-field res
     Random.seed!(20)
     FB = SpectralBackends.FFTSpectralBackend()
 
-    sub = ScatteringTransforms.SubsampledScattering.SubsampledScattering1D(256, 4; Q = 1,
-              max_order = 2, spectral = FB)
+    # Decimating: the batched cascade carries one divisor per resolution, and a single `1/∏spatial`
+    # would leave every decimated row short by exactly `∏r`. That is invisible to a
+    # batched-versus-batched comparison, so this compares against the per-slice transform.
+    sub = ScatteringTransforms.Scattering1D.ScatteringTransform1D(256, 4; Q = 1, max_order = 2,
+              oversampling = 1, spectral = FB)
     Xs = randn(256, 5)
     outs = ScatteringTransforms.scattering_batch(sub, Xs)
     for b in 1:5
-        Test.@test view(outs, :, b) ≈ ScatteringTransforms.Coefficients.flatten1d(sub(Xs[:, b]))
+        Test.@test view(outs, :, b) == ScatteringTransforms.Coefficients.flatten1d(sub(Xs[:, b]))
     end
 
     M = 200

@@ -104,7 +104,7 @@ end
 function ST.scattering_batch(b::CB.AbstractThreadedBackend,
                              st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix)
     T = real(eltype(st.filter_bank.averaging))
-    nw = length(st.filter_bank.wavelets)
+    nw = ST.FilterBanks.nwavelets(st.filter_bank)
     flen = ST.Coefficients.flatten_length(
         ST.Coefficients.ScatteringCoefficients1D(nw, T; compute_S2 = st.max_order >= 2))
     return ST.scattering_batch!(Matrix{T}(undef, flen, size(X, 2)), b, st, X)
@@ -165,21 +165,6 @@ end
 # ---------------------------------------------------------------------------
 
 function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
-                              st::ST.SubsampledScattering.MultiResolutionScattering, X::AbstractArray)
-    T = eltype(out)
-    D = ndims(X)
-    OMT.@tasks for b in 1:size(X, D)
-        @local begin
-            ws = ST.ScatteringCore.task_workspace(st)
-            coeffs = ST.batch_coeffs(st, T)
-        end
-        c = ST.SubsampledScattering.subsampled_scattering!(coeffs, ws, selectdim(X, D, b))
-        ST._flatten_into!(view(out, :, b), c)
-    end
-    return out
-end
-
-function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
                               st::ST.ScatteredPlanar.ScatteredPlanarScattering, X::AbstractMatrix)
     T = eltype(out)
     W = ST.Plans.batch_width(st.plan)
@@ -192,7 +177,7 @@ function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
     B % W == 0 || throw(DimensionMismatch(
         "this transform was built with ntrans = $W, so a threaded batch must be a multiple of $W; " *
         "got $B."))
-    nw = length(st.filter_bank.wavelets)
+    nw = ST.FilterBanks.nwavelets(st.filter_bank)
     with_serial_blas() do
         OMT.@tasks for c0 in 1:W:B
             @local begin
@@ -314,10 +299,6 @@ function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
 end
 
 ST.scattering_batch(b::CB.AbstractThreadedBackend,
-                    st::ST.SubsampledScattering.MultiResolutionScattering{T}, X::AbstractArray) where {T} =
-    ST.scattering_batch!(Matrix{T}(undef, ST.flat_rows(st), size(X)[end]), b, st, X)
-
-ST.scattering_batch(b::CB.AbstractThreadedBackend,
                     st::ST.ScatteredPlanar.ScatteredPlanarScattering, X::AbstractMatrix) =
     ST.scattering_batch!(Matrix{real(eltype(st.filter_bank.averaging))}(undef, ST.flat_rows(st),
                                                                        size(X, 2)), b, st, X)
@@ -342,25 +323,12 @@ for (Mod, TT, FT) in ((:Scattering1D, :ScatteringTransform1D, :AbstractVector),
                                     ::CB.AbstractThreadedBackend, st::ST.$Mod.$TT,
                                     signal_fft::$FT)
         isempty(S2) || fill!(S2, zero(eltype(S2)))
-        wavelets = st.filter_bank.wavelets
         OMT.@tasks for g in st.groups
             @set scheduler = OMT.DynamicScheduler()
+            # Each task takes its own workspace: the periodized cascade's buffers are mutable, and
+            # a computed bank evaluates its filters into shared scratch.
             @local ws = ST.ScatteringCore.task_workspace(st)
-            j1, children = g[1], g[2]
-            ST.ScatteringCore.wavelet_convolve!(ws.buffer_conv, signal_fft, wavelets[j1],
-                                                ws.plan, ws.buffer_input)
-            if isempty(children)
-                S1[j1] = ST.ScatteringCore.modulus_mean(ws.buffer_conv)
-            else
-                S1[j1] = ST.ScatteringCore.modulus_mean!(ws.buffer_u1, ws.buffer_conv)
-                ws.buffer_input .= complex.(ws.buffer_u1)
-                ST.Plans.forward_transform!(ws.buffer_u1_fft, ws.plan, ws.buffer_input)
-                for j2 in children
-                    ST.ScatteringCore.wavelet_convolve!(ws.buffer_conv, ws.buffer_u1_fft,
-                                                        wavelets[j2], ws.plan, ws.buffer_input)
-                    S2[j1, j2] = ST.ScatteringCore.modulus_mean(ws.buffer_conv)
-                end
-            end
+            ST.Cascade.group!(S1, S2, ws.pw, ws.filter_bank, g, signal_fft)
         end
         return S1, S2
     end

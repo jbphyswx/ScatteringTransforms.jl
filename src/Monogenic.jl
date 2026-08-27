@@ -31,8 +31,9 @@ using SpectralBackends: SpectralBackends as SB
 using ..PathGraph: PathGraph
 using ..Coefficients: Coefficients
 using ..ScatteringCore: ScatteringCore
+using ..Cascade: Cascade
 
-export MonogenicFilterBank, MonogenicScattering
+export MonogenicFilterBank, ComputedMonogenicFilterBank, MonogenicScattering
 export build_monogenic_bank, riesz_multipliers, monogenic_amplitude, monogenic_components
 
 # Inline fftfreq for bin k (0-indexed), length N — normalized frequency in cycles/sample.
@@ -40,9 +41,12 @@ export build_monogenic_bank, riesz_multipliers, monogenic_amplitude, monogenic_c
 
 # Radial (isotropic) band-pass response over a D-dim frequency grid: a Gaussian bump on |k| at
 # center ξ with width σ, minus a low-pass term pinning the DC bin to zero (admissibility).
-function _radial_bandpass(dims::NTuple{D,Int}, ξ::T, σ::T) where {D,T}
+_radial_bandpass(dims::NTuple{D,Int}, ξ::T, σ::T) where {D,T} =
+    _radial_bandpass!(Array{T,D}(undef, dims), ξ, σ)
+
+function _radial_bandpass!(ψ::AbstractArray{T,D}, ξ::T, σ::T) where {D,T}
     κ = exp(-(ξ / σ)^2 / 2)
-    ψ = Array{T,D}(undef, dims)
+    dims = size(ψ)
     @inbounds for I in CartesianIndices(dims)
         kk = zero(T)
         for d in 1:D
@@ -88,10 +92,10 @@ multipliers `riesz`, and the complementary low-pass `averaging`, forming a tight
 container is a type parameter.
 
 The wavelets and the low-pass are **real**: a radial band-pass is a real function of `|k|`. Only
-the Riesz multipliers `R_d(k) = -i k_d/|k|` are complex, so they carry their own array type.
+the Riesz multipliers `R_d(k) = -i k_d/|k|` are complex.
 """
 struct MonogenicFilterBank{D, T, A<:AbstractArray{T,D}, W<:AbstractVector{A},
-                           RA<:AbstractArray{Complex{T},D}, R<:NTuple{D,RA},
+                           R<:NTuple{D,AbstractArray{Complex{T},D}},
                            MV<:AbstractVector{FilterBanks.WaveletMeta{T}}}
     wavelets::W
     riesz::R
@@ -126,8 +130,74 @@ function build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1) 
     end
     ϕ = FilterBanks._tight_frame_lowpass!(wavelets)
     R = riesz_multipliers(dims, T)
-    return MonogenicFilterBank{D,T,A,typeof(wavelets),eltype(R),typeof(R),typeof(meta)}(
+    return MonogenicFilterBank{D,T,A,typeof(wavelets),typeof(R),typeof(meta)}(
         wavelets, R, ϕ, meta, J, Q)
+end
+
+"""
+    ComputedMonogenicFilterBank{D,T,A,R,MV}
+
+The monogenic bank with its radial band-passes evaluated on demand instead of stored — the
+counterpart of [`FilterBanks.ComputedFilterBank2D`](@ref). The Riesz multipliers stay stored: there
+are `D` of them however many scales the bank has, so they do not grow with `J`.
+"""
+struct ComputedMonogenicFilterBank{D, T, A<:AbstractArray{T,D},
+                                   R<:NTuple{D,AbstractArray{Complex{T},D}},
+                                   MV<:AbstractVector{FilterBanks.WaveletMeta{T}},
+                                   PV<:AbstractVector{NTuple{2,T}}}
+    profiles::PV   # (ξ, σ) per wavelet — everything `_radial_bandpass` needs
+    rescale::T
+    riesz::R
+    averaging::A
+    scratch::A
+    meta::MV
+    J::Int
+    Q::Int
+end
+
+const AnyMonogenicBank = Union{MonogenicFilterBank, ComputedMonogenicFilterBank}
+
+FilterBanks.nwavelets(fb::MonogenicFilterBank) = length(fb.wavelets)
+FilterBanks.nwavelets(fb::ComputedMonogenicFilterBank) = length(fb.profiles)
+FilterBanks.filter_at(fb::MonogenicFilterBank, j::Integer) = fb.wavelets[j]
+function FilterBanks.filter_at(fb::ComputedMonogenicFilterBank, j::Integer)
+    ξ, σ = fb.profiles[j]
+    _radial_bandpass!(fb.scratch, ξ, σ)
+    fb.scratch .*= fb.rescale
+    return fb.scratch
+end
+FilterBanks.iscomputed(::MonogenicFilterBank) = false
+FilterBanks.iscomputed(::ComputedMonogenicFilterBank) = true
+FilterBanks.task_bank(fb::MonogenicFilterBank) = fb
+FilterBanks.task_bank(fb::ComputedMonogenicFilterBank) =
+    ComputedMonogenicFilterBank(fb.profiles, fb.rescale, fb.riesz, fb.averaging,
+                                similar(fb.scratch), fb.meta, fb.J, fb.Q)
+
+build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int, ::Val{true};
+                     Q::Int=1) where {T<:Real,D} = build_monogenic_bank(T, dims, J; Q=Q)
+
+function build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int, ::Val{false};
+                              Q::Int=1) where {T<:Real,D}
+    profiles = NTuple{2,T}[]
+    meta = FilterBanks.WaveletMeta{T}[]
+    for j in 0:(J - 1), q in 0:(Q - 1)
+        m = Filters.Morlet1D{T}(1, j * Q + q; Q=Q)
+        push!(profiles, (m.center_freq, m.bandwidth))
+        push!(meta, FilterBanks.WaveletMeta{T}(j, q, 0, T(j + q / Q), m.center_freq, zero(T)))
+    end
+    scratch = Array{T,D}(undef, dims)
+    acc = zeros(T, dims)
+    for (ξ, σ) in profiles
+        _radial_bandpass!(scratch, ξ, σ)
+        @. acc += abs2(scratch)
+    end
+    mx = maximum(acc)
+    c = mx > zero(T) ? inv(sqrt(mx)) : one(T)
+    ϕ = Array{T,D}(undef, dims)
+    @. ϕ = sqrt(max(zero(T), one(T) - acc * c^2))
+    ϕ[firstindex(ϕ)] = one(T)
+    R = riesz_multipliers(dims, T)
+    return ComputedMonogenicFilterBank(profiles, c, R, ϕ, scratch, meta, J, Q)
 end
 
 """
@@ -145,26 +215,71 @@ function monogenic_amplitude(m0::AbstractArray, riesz)
 end
 
 """
-    MonogenicScattering{D,T,FB,Tree,P,V}
+    MonogenicWorkspace{T,D}
+
+The periodized cascade plus what the monogenic amplitude needs on top of it: one real accumulator
+per resolution, and the Riesz-weighted band-passes `R_d ψ_j` periodized to each *parent* resolution.
+
+`R_d ψ_j` is stored as one periodized filter rather than two, because periodizing the factors
+separately is a different function from periodizing their product. Level 1 stores nothing: there
+`r = 1`, so the two full-resolution filters fuse directly in the multiply
+([`ScatteringCore.periodize_mul2!`](@ref)).
+"""
+struct MonogenicWorkspace{T, D, PW <: Cascade.PeriodizedWorkspace{T, D},
+                          AV <: AbstractVector{<:AbstractArray{T, D}}, FV <: AbstractVector}
+    pw::PW
+    amp::AV        # per level: the amplitude accumulator at that resolution
+    rfilters::FV   # rfilters[l][j][d]; empty at level 1 and wherever `j` is not applied at `l`
+end
+
+"""
+    MonogenicScattering{D,T,FB,Tree,P,G,CB,MW}
 
 Monogenic scattering transform on a `D`-dimensional grid: an isotropic [`MonogenicFilterBank`](@ref),
-the scattering path tree (strictly-increasing scale), a spectral `plan`, and reusable workspace
-buffers.
+the scattering path tree (strictly-increasing scale), a spectral `plan`, and the periodized
+[`MonogenicWorkspace`](@ref) the cascade runs in.
 """
-struct MonogenicScattering{D, T, FB<:MonogenicFilterBank, Tree<:PathGraph.ScatteringTree,
-                           P<:Plans.AbstractScatteringPlan,
-                           CB<:AbstractArray{Complex{T},D}, RB<:AbstractArray{T,D}, UF<:AbstractVector}
+struct MonogenicScattering{D, T, FB<:AnyMonogenicBank, Tree<:PathGraph.ScatteringTree,
+                           P<:Plans.AbstractScatteringPlan, G<:AbstractVector,
+                           CB<:AbstractArray{Complex{T},D}, MW<:MonogenicWorkspace{T,D}}
     filter_bank::FB
     tree::Tree
+    groups::G               # (j1, children, path ids), longest-first — the cascade's work list
     max_order::Int
     plan::P
     dims::NTuple{D,Int}
-    buffer_input::CB        # complex promotion of input
-    buffer_signal_fft::CB   # preserved signal FFT
-    buffer_freq::CB         # pointwise-multiply scratch (inside the amplitude kernel)
-    buffer_conv::CB         # inverse-transform output
-    amp::RB                 # monogenic-amplitude accumulator
-    U1_fft::UF              # per-scale FFT of the first-order amplitude field (S2)
+    buffer_signal_fft::CB   # preserved signal FFT, at full resolution
+    mw::MW
+end
+
+# `R_d ψ_j` periodized onto each parent resolution. Only the pairs the cascade actually applies are
+# built, so the storage follows the same geometric decay the working buffers do.
+function _monogenic_workspace(fb, groups, dims::NTuple{D, Int}, ::Type{T}, α::Int,
+                              spectral) where {T, D}
+    pw = Cascade.build(fb, groups, dims, T, α, spectral)
+    nw = FilterBanks.nwavelets(fb)
+    R = fb.riesz
+    amp = [zeros(T, ntuple(d -> dims[d] ÷ r[d], D)) for r in pw.resolutions]
+    empty_r = ntuple(_ -> zeros(Complex{T}, ntuple(_ -> 0, D)), D)
+    scratch = Array{Complex{T}, D}(undef, dims)
+    rfilters = map(eachindex(pw.resolutions)) do l
+        v = fill(empty_r, nw)
+        l == 1 && return v
+        rl = pw.resolutions[l]
+        rd = ntuple(d -> dims[d] ÷ rl[d], D)
+        for j in 1:nw
+            isempty(pw.filters[l][j]) && continue        # `j` is never applied at this level
+            ψ = FilterBanks.filter_at(fb, j)
+            v[j] = ntuple(D) do d
+                @. scratch = R[d] * ψ
+                pf = zeros(Complex{T}, rd)
+                ScatteringCore.periodize_filter!(pf, scratch, rl)
+                pf
+            end
+        end
+        v
+    end
+    return MonogenicWorkspace{T, D, typeof(pw), typeof(amp), typeof(rfilters)}(pw, amp, rfilters)
 end
 
 """
@@ -174,16 +289,18 @@ Construct a monogenic scattering transform for fields of size `dims` (`Int` or `
 The element type is positional, as for `zeros(T, …)`; omit it for `Float64`.
 """
 function MonogenicScattering(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1, max_order::Int=2,
+                             cache::Bool=true, oversampling::Int=J,
                              spectral::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T,D}
-    fb = build_monogenic_bank(T, dims, J; Q=Q)
+    fb = build_monogenic_bank(T, dims, J, Val(cache); Q=Q)
     tree = PathGraph.build_tree([m.j_eff for m in fb.meta], max_order)
     plan = Plans.make_plan(spectral, T, dims)
-    cb() = zeros(Complex{T}, dims)
-    nw = length(fb.wavelets)
-    U1_fft = max_order >= 2 ? [cb() for _ in 1:nw] : Array{Complex{T},D}[]
-    return MonogenicScattering{D,T,typeof(fb),typeof(tree),typeof(plan),
-                               typeof(cb()),typeof(zeros(T, dims)),typeof(U1_fft)}(
-        fb, tree, max_order, plan, dims, cb(), cb(), cb(), cb(), zeros(T, dims), U1_fft)
+    nw = FilterBanks.nwavelets(fb)
+    groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
+             [(j, Int[], Int[]) for j in 1:nw]
+    mw = _monogenic_workspace(fb, groups, dims, T, oversampling, spectral)
+    return MonogenicScattering{D,T,typeof(fb),typeof(tree),typeof(plan),typeof(groups),
+                               typeof(mw.pw.work[1]),typeof(mw)}(
+        fb, tree, groups, max_order, plan, dims, zeros(Complex{T}, dims), mw)
 end
 MonogenicScattering(::Type{T}, N::Int, J::Int; kwargs...) where {T} =
     MonogenicScattering(T, (N,), J; kwargs...)
@@ -191,18 +308,53 @@ MonogenicScattering(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
     MonogenicScattering(Float64, dims, J; kwargs...)
 MonogenicScattering(N::Int, J::Int; kwargs...) = MonogenicScattering(Float64, (N,), J; kwargs...)
 
-# In-place monogenic amplitude of the field whose FFT is `Xf`, band-passed by wavelet `ψ`.
-# Writes √(m₀² + Σ_d m_d²) into `dst`. Reuses buffer_freq/buffer_conv; leaves Xf intact.
-function _monogenic_amplitude!(dst, st::MonogenicScattering{D}, Xf, ψ) where {D}
-    plan = st.plan
-    R = st.filter_bank.riesz
-    @. st.buffer_freq = Xf * ψ
-    Plans.inverse_transform!(st.buffer_conv, plan, st.buffer_freq)
-    @. dst = real(st.buffer_conv)^2
+# `√(m₀² + Σ_d m_d²)` into `dst`, from the full-resolution spectrum `Xf` band-passed by wavelet `j`
+# and produced on level `l`'s grid. Both filters are full resolution, so the Riesz weighting fuses
+# into the multiply and nothing is materialised. Leaves `Xf` intact.
+function _amp_from_full!(dst, mw::MonogenicWorkspace{T, D}, fb, Xf, j::Int, l::Int) where {T, D}
+    pw = mw.pw
+    r = pw.resolutions[l]
+    R = fb.riesz
+    w, o = pw.work[l], pw.out[l]
+    ψ = Cascade._filter(pw, fb, 1, pw.filters[1], j)
+    ScatteringCore.periodize_mul!(w, Xf, ψ, r)
+    Plans.inverse_transform!(o, pw.plans[l], w)
+    @. dst = real(o)^2
     for d in 1:D
-        @. st.buffer_freq = Xf * R[d] * ψ
-        Plans.inverse_transform!(st.buffer_conv, plan, st.buffer_freq)
-        @. dst += real(st.buffer_conv)^2
+        ScatteringCore.periodize_mul2!(w, Xf, R[d], ψ, r)
+        Plans.inverse_transform!(o, pw.plans[l], w)
+        @. dst += real(o)^2
+    end
+    @. dst = sqrt(dst)
+    return dst
+end
+
+# The same, from a first-order amplitude's spectrum `u1f` living on level `l1`, produced on `l2`.
+# Here the band-pass has already been periodized to `l1`, so the Riesz-weighted one must be the
+# periodized *product* — except at `l1 == 1`, where the factors are still full resolution and fuse.
+function _amp_from_parent!(dst, mw::MonogenicWorkspace{T, D}, fb, u1f, j::Int, l1::Int,
+                           l2::Int) where {T, D}
+    pw = mw.pw
+    rr = ntuple(d -> pw.resolutions[l2][d] ÷ pw.resolutions[l1][d], D)
+    w, o = pw.work[l2], pw.out[l2]
+    ScatteringCore.periodize_mul!(w, u1f, Cascade._filter(pw, fb, l1, pw.filters[l1], j), rr)
+    Plans.inverse_transform!(o, pw.plans[l2], w)
+    @. dst = real(o)^2
+    if l1 == 1
+        R = fb.riesz
+        ψ = Cascade._filter(pw, fb, 1, pw.filters[1], j)
+        for d in 1:D
+            ScatteringCore.periodize_mul2!(w, u1f, R[d], ψ, rr)
+            Plans.inverse_transform!(o, pw.plans[l2], w)
+            @. dst += real(o)^2
+        end
+    else
+        rf = mw.rfilters[l1][j]
+        for d in 1:D
+            ScatteringCore.periodize_mul!(w, u1f, rf[d], rr)
+            Plans.inverse_transform!(o, pw.plans[l2], w)
+            @. dst += real(o)^2
+        end
     end
     @. dst = sqrt(dst)
     return dst
@@ -215,34 +367,37 @@ Apply the monogenic scattering transform; returns averaged coefficients in a
 `ScatteringCoefficients1D` (`S0` mean, `S1` over scales, `S2` over scale pairs).
 """
 function (st::MonogenicScattering{D})(x::AbstractArray) where {D}
-    T = eltype(st.amp)
-    n = length(st.filter_bank.wavelets)
+    mw = st.mw
+    pw = mw.pw
+    T = eltype(first(mw.amp))
+    fb = st.filter_bank
+    n = FilterBanks.nwavelets(fb)
     coeffs = Coefficients.ScatteringCoefficients1D(n, T; compute_S2=st.max_order >= 2)
 
-    @. st.buffer_input = complex(x)
-    Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
+    c0 = pw.work[1]
+    @. c0 = complex(x)
+    Plans.forward_transform!(st.buffer_signal_fft, st.plan, c0)
     Xf = st.buffer_signal_fft
 
-    nw = length(st.filter_bank.wavelets)
     S1 = coeffs.S1
-    @inbounds for (j, ψ) in enumerate(st.filter_bank.wavelets)
-        _monogenic_amplitude!(st.amp, st, Xf, ψ)
-        S1[j] = ScatteringCore.spatial_average(st.amp)
-        # For S2: cache the FFT of each first-order amplitude field (re-analysis input).
-        if st.max_order >= 2
-            @. st.buffer_input = complex(st.amp)
-            Plans.forward_transform!(st.U1_fft[j], st.plan, st.buffer_input)
-        end
-    end
-
-    if st.max_order >= 2 && length(st.tree.by_order) >= 3
-        S2 = coeffs.S2
-        @inbounds for p in PathGraph.order_range(st.tree, 2)
-            idx = PathGraph.path_indices(st.tree, p)
-            j1, j2 = idx[1], idx[2]
-            # Re-analyze the cached order-1 amplitude (FFT) at the coarser scale j2.
-            _monogenic_amplitude!(st.amp, st, st.U1_fft[j1], st.filter_bank.wavelets[j2])
-            S2[j1, j2] = ScatteringCore.spatial_average(st.amp)
+    S2 = coeffs.S2
+    isempty(S2) || fill!(S2, zero(eltype(S2)))
+    @inbounds for (j1, children, _) in st.groups
+        l1 = pw.level[j1]
+        a1 = mw.amp[l1]
+        _amp_from_full!(a1, mw, fb, Xf, j1, l1)
+        S1[j1] = ScatteringCore.spatial_average(a1)
+        isempty(children) && continue
+        # `a1` is copied out before any child can reuse its level's accumulator.
+        w1 = pw.work[l1]
+        @. w1 = complex(a1)
+        u1f = pw.spec[l1]
+        Plans.forward_transform!(u1f, pw.plans[l1], w1)
+        for j2 in children
+            l2 = pw.level[j2]
+            a2 = mw.amp[l2]
+            _amp_from_parent!(a2, mw, fb, u1f, j2, l1, l2)
+            S2[j1, j2] = ScatteringCore.spatial_average(a2)
         end
     end
 
@@ -261,7 +416,7 @@ vector's direction gives the local orientation (e.g. `atan(riesz[2], riesz[1])` 
 function monogenic_components(st::MonogenicScattering{D}, x::AbstractArray, j::Integer) where {D}
     plan = st.plan
     fb = st.filter_bank
-    ψ = fb.wavelets[j]
+    ψ = FilterBanks.filter_at(fb, j)
     Xf = Plans.forward_transform(plan, complex.(x))
     bandpass = real.(Plans.inverse_transform(plan, Xf .* ψ))
     riesz = ntuple(d -> real.(Plans.inverse_transform(plan, Xf .* fb.riesz[d] .* ψ)), D)

@@ -47,13 +47,13 @@ include("FilterBanks.jl")
 include("ScatteringCore.jl")
 include("Coefficients.jl")
 include("PathGraph.jl")
+include("Cascade.jl")
 include("Batched.jl")
 include("ScatteringFields.jl")
 include("Scattering1D.jl")
 include("Scattering2D.jl")
 include("Scattering3D.jl")
 include("ScatteredPlanar.jl")
-include("SubsampledScattering.jl")
 include("Reductions.jl")
 include("Monogenic.jl")
 include("SphericalCore.jl")
@@ -71,12 +71,12 @@ using .Filters: Filters
 using .FilterBanks: FilterBanks
 using .ScatteringCore: ScatteringCore
 using .PathGraph: PathGraph
+using .Cascade: Cascade
 using .Batched: Batched
 using .ScatteringFields: ScatteringFields
 using .Scattering1D: Scattering1D
 using .Scattering2D: Scattering2D
 using .Scattering3D: Scattering3D
-using .SubsampledScattering: SubsampledScattering
 using .Coefficients: Coefficients
 using .Reductions: Reductions
 using .Monogenic: Monogenic
@@ -109,18 +109,26 @@ large enough to be worth it, transformed with no parallelism above.
 function batch_workspace(st, B::Int; spectral = Plans.spectral_backend(st.plan),
                          fft_nthreads::Int = 1, kwargs...)
     T = real(eltype(st.filter_bank.averaging))
-    spatial = size(st.buffer_mod)
-    stack = (spatial..., B)
-    plan = Plans.make_plan(spectral, T, spatial; nbatch = B, batched = true,
-                           fft_nthreads = fft_nthreads, kwargs...)
-    cz() = zeros(Complex{T}, stack)
-    red = zeros(T, (ntuple(_ -> 1, length(spatial))..., B))
-    # Shape the filters and the reduction target once, so the cascade's inner loop never calls
-    # `reshape` — each call would allocate a fresh array object, once per wavelet and per path.
-    wavelets = [reshape(psi, (spatial..., 1)) for psi in st.filter_bank.wavelets]
-    return Batched.BatchWorkspace(
-        plan, zeros(T, stack), cz(), cz(), cz(), cz(), zeros(T, stack),
-        red, reshape(red, B), wavelets, length(wavelets), st.groups, 1 / prod(spatial))
+    spatial = st.dims
+    D = length(spatial)
+    # Every buffer and plan carries the stack axis; the filters carry a trailing singleton so they
+    # broadcast across it. `reshape` happens here, never in the cascade, where it would allocate a
+    # fresh array object per wavelet and per path.
+    pw = Cascade.build(st.filter_bank, st.groups, spatial, T, st.pw.oversampling;
+                       alloc = rd -> zeros(Complex{T}, (rd..., B)),
+                       makeplan = rd -> Plans.make_plan(spectral, T, rd; nbatch = B, batched = true,
+                                                        fft_nthreads = fft_nthreads, kwargs...),
+                       shapefilter = f -> reshape(f, (size(f)..., 1)))
+    rdims(l) = ntuple(d -> spatial[d] ÷ pw.resolutions[l][d], D)
+    # A level is a parent exactly where the cascade gave it a `Û₁` buffer, and only a parent's
+    # modulus is ever read again.
+    rmod = [isempty(pw.spec[l]) ? zeros(T, ntuple(_ -> 0, D + 1)) : zeros(T, (rdims(l)..., B))
+            for l in eachindex(pw.resolutions)]
+    invN = [T(1) / prod(rdims(l)) for l in eachindex(pw.resolutions)]
+    red = zeros(T, (ntuple(_ -> 1, D)..., B))
+    return Batched.BatchWorkspace(pw, zeros(T, (spatial..., B)), zeros(Complex{T}, (spatial..., B)),
+                                  rmod, red, reshape(red, B), invN,
+                                  FilterBanks.nwavelets(st.filter_bank), st.groups, st.filter_bank)
 end
 
 """
@@ -133,33 +141,41 @@ re-allocated per column).
 """
 function scattering_batch(st::Scattering1D.ScatteringTransform1D, X::AbstractMatrix)
     T = eltype(st.filter_bank.averaging) |> real
-    nw = length(st.filter_bank.wavelets)
+    nw = FilterBanks.nwavelets(st.filter_bank)
     flen = Coefficients.flatten_length(
         Coefficients.ScatteringCoefficients1D(nw, T; compute_S2 = st.max_order >= 2))
-    return scattering_batch!(Matrix{T}(undef, flen, size(X, 2)), st, X)
+    return scattering_batch!(Matrix{_flat_eltype(T, X)}(undef, flen, size(X, 2)), st, X)
 end
 
+# Element type a flattened batch column needs: `S1`/`S2` are moduli and stay real, but `S0` is the
+# field mean and follows the input, so a complex field widens the column.
+_flat_eltype(::Type{T}, X::AbstractArray) where {T} = promote_type(T, eltype(X))
+
 """
-    batch_coeffs(st, T) -> coefficient container
+    batch_coeffs(st, T, S0T = T) -> coefficient container
 
 A coefficient container for `st` whose `S0` is a 1-element array, so a loop over a batch writes every
 field in place instead of rebuilding the struct once per slice.
+
+`S0T` is given separately because `S1`/`S2` are moduli and stay real whatever the input is, while
+`S0` is the field mean and is complex for a complex field.
 """
-batch_coeffs(st::Scattering1D.ScatteringTransform1D, ::Type{T}) where {T} =
-    (nw = length(st.filter_bank.wavelets);
+batch_coeffs(st::Scattering1D.ScatteringTransform1D, ::Type{T}, ::Type{S0T} = T) where {T, S0T} =
+    (nw = FilterBanks.nwavelets(st.filter_bank);
      Coefficients.ScatteringCoefficients1D(
         Vector{T}(undef, nw),
-        st.max_order >= 2 ? zeros(T, nw, nw) : Matrix{T}(undef, 0, 0); S0 = [zero(T)]))
+        st.max_order >= 2 ? zeros(T, nw, nw) : Matrix{T}(undef, 0, 0); S0 = [zero(S0T)]))
 
-_batch_coeffs2d(st, ::Type{T}, ns, no) where {T} = Coefficients.ScatteringCoefficients2D(
-    Vector{T}(undef, ns * no),
-    st.max_order >= 2 ? zeros(T, ns * no, ns * no) : Matrix{T}(undef, 0, 0);
-    S0 = [zero(T)], n_scales = ns, n_orientations = no)
+_batch_coeffs2d(st, ::Type{T}, ::Type{S0T}, ns, no) where {T, S0T} =
+    Coefficients.ScatteringCoefficients2D(
+        Vector{T}(undef, ns * no),
+        st.max_order >= 2 ? zeros(T, ns * no, ns * no) : Matrix{T}(undef, 0, 0);
+        S0 = [zero(S0T)], n_scales = ns, n_orientations = no)
 
-batch_coeffs(st::Scattering2D.ScatteringTransform2D, ::Type{T}) where {T} =
-    _batch_coeffs2d(st, T, st.filter_bank.J, st.filter_bank.L)
-batch_coeffs(st::Scattering3D.ScatteringTransform3D, ::Type{T}) where {T} =
-    _batch_coeffs2d(st, T, st.filter_bank.J, st.filter_bank.n_orient)
+batch_coeffs(st::Scattering2D.ScatteringTransform2D, ::Type{T}, ::Type{S0T} = T) where {T, S0T} =
+    _batch_coeffs2d(st, T, S0T, st.filter_bank.J, st.filter_bank.L)
+batch_coeffs(st::Scattering3D.ScatteringTransform3D, ::Type{T}, ::Type{S0T} = T) where {T, S0T} =
+    _batch_coeffs2d(st, T, S0T, st.filter_bank.J, st.filter_bank.n_orient)
 
 """
     scattering_batch!(out, st, X; workspace = nothing) -> out
@@ -187,8 +203,8 @@ for (Mod, TT, XT, tfun, flat, ND) in (
         (:Scattering3D, :ScatteringTransform3D, :(AbstractArray{<:Any,4}), :scattering_transform3d!, :flatten2d!, 4))
     @eval function scattering_batch!(out::AbstractMatrix, st::$Mod.$TT, X::$XT; workspace = nothing)
         workspace === nothing || return Batched.batch_cascade!(out, workspace, X)
-        T = real(eltype(st.filter_bank.averaging))
-        coeffs = batch_coeffs(st, T)
+        # `out` decides: real columns get a real `S0` slot, complex columns a complex one.
+        coeffs = batch_coeffs(st, real(eltype(out)), eltype(out))
         @inbounds for b in 1:size(X, $ND)
             c = $Mod.$tfun(coeffs, st, selectdim(X, $ND, b))
             Coefficients.$flat(view(out, :, b), c)
@@ -209,7 +225,7 @@ function scattering_batch(st::Scattering2D.ScatteringTransform2D, X::AbstractArr
     flen = Coefficients.flatten_length(
         Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.L, T;
                                               compute_S2 = st.max_order >= 2))
-    return scattering_batch!(Matrix{T}(undef, flen, size(X, 3)), st, X)
+    return scattering_batch!(Matrix{_flat_eltype(T, X)}(undef, flen, size(X, 3)), st, X)
 end
 
 """
@@ -223,7 +239,7 @@ function scattering_batch(st::Scattering3D.ScatteringTransform3D, X::AbstractArr
     flen = Coefficients.flatten_length(
         Coefficients.ScatteringCoefficients2D(st.filter_bank.J, st.filter_bank.n_orient, T;
                                               compute_S2 = st.max_order >= 2))
-    return scattering_batch!(Matrix{T}(undef, flen, size(X, 4)), st, X)
+    return scattering_batch!(Matrix{_flat_eltype(T, X)}(undef, flen, size(X, 4)), st, X)
 end
 
 # ----------------------------------------------------------------------------
@@ -235,26 +251,15 @@ end
 # a batch of slices, and stays a loop over transforms.
 # ----------------------------------------------------------------------------
 
-batch_coeffs(st::SubsampledScattering.MultiResolutionScattering{<:Any,1}, ::Type{T}) where {T} =
-    (nw = length(st.filter_bank.wavelets);
-     Coefficients.ScatteringCoefficients1D(
-        Vector{T}(undef, nw),
-        st.max_order >= 2 ? zeros(T, nw, nw) : Matrix{T}(undef, 0, 0); S0 = [zero(T)]))
-
-batch_coeffs(st::SubsampledScattering.MultiResolutionScattering, ::Type{T}) where {T} =
-    _batch_coeffs2d(st, T, st.filter_bank.J,
-                    SubsampledScattering._orient_count(st.filter_bank))
-
-batch_coeffs(st::ScatteredPlanar.ScatteredPlanarScattering, ::Type{T}) where {T} =
-    _batch_coeffs2d(st, T, st.filter_bank.J, st.filter_bank.L)
+batch_coeffs(st::ScatteredPlanar.ScatteredPlanarScattering, ::Type{T},
+             ::Type{S0T} = T) where {T, S0T} =
+    _batch_coeffs2d(st, T, S0T, st.filter_bank.J, st.filter_bank.L)
 
 """
     flat_rows(st) -> Int
 
 Rows a flattened coefficient column of `st` occupies — the height of `scattering_batch`'s output.
 """
-flat_rows(st::SubsampledScattering.MultiResolutionScattering) =
-    Coefficients.flat_length(length(st.filter_bank.wavelets))
 flat_rows(st::ScatteredPlanar.ScatteredPlanarScattering) =
     Coefficients.flat_length(st.filter_bank.J * st.filter_bank.L)
 flat_rows(st::SphericalCore.SphericalScattering) = Coefficients.flat_length(st.J)
@@ -266,27 +271,11 @@ _flatten_into!(col, c::Coefficients.ScatteringCoefficients1D) = Coefficients.fla
 _flatten_into!(col, c::Coefficients.ScatteringCoefficients2D) = Coefficients.flatten2d!(col, c)
 
 """
-    scattering_batch(st::SubsampledScattering.MultiResolutionScattering, X) -> Matrix
     scattering_batch(st::ScatteredPlanar.ScatteredPlanarScattering, X) -> Matrix
 
 Transform every slice of `X` against one transform, returning a `(flatten_length, B)` matrix. `X` is
-`(dims…, B)` for a multi-resolution transform and `(M, B)` for the scattered planar one, where `M` is
-the plan's point count.
+`(M, B)`, where `M` is the plan's point count.
 """
-function scattering_batch(st::SubsampledScattering.MultiResolutionScattering{T}, X::AbstractArray) where {T}
-    return scattering_batch!(Matrix{T}(undef, flat_rows(st), size(X)[end]), st, X)
-end
-
-function scattering_batch!(out::AbstractMatrix, st::SubsampledScattering.MultiResolutionScattering,
-                           X::AbstractArray)
-    coeffs = batch_coeffs(st, eltype(out))
-    D = ndims(X)
-    @inbounds for b in 1:size(X, D)
-        c = SubsampledScattering.subsampled_scattering!(coeffs, st, selectdim(X, D, b))
-        _flatten_into!(view(out, :, b), c)
-    end
-    return out
-end
 
 function scattering_batch(st::ScatteredPlanar.ScatteredPlanarScattering, X::AbstractMatrix)
     T = real(eltype(st.filter_bank.averaging))
@@ -306,7 +295,7 @@ function scattering_batch!(out::AbstractMatrix, st::ScatteredPlanar.ScatteredPla
         "got a batch of $B. Rebuild with ntrans = $B, or with ntrans = 1 for a per-field loop."))
     if W > 1
         T = eltype(out)
-        nw = length(st.filter_bank.wavelets)
+        nw = FilterBanks.nwavelets(st.filter_bank)
         S0 = Vector{T}(undef, B)
         S1 = Matrix{T}(undef, nw, B)
         S2 = st.max_order >= 2 ? zeros(T, nw, nw, B) : Array{T, 3}(undef, 0, 0, 0)
@@ -413,32 +402,25 @@ end
 # tag is carried on the transform rather than guessed from the plan type, so a device-resident
 # transform is not rebuilt as a host FFTW one.
 transform_spec(st::Scattering1D.ScatteringTransform1D) =
-    (kind = :st1d, N = length(st.buffer_mod), J = st.filter_bank.J, Q = st.filter_bank.Q,
+    (kind = :st1d, N = st.dims[1], J = st.filter_bank.J, Q = st.filter_bank.Q,
      max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)),
+     oversampling = st.pw.oversampling, cache = !FilterBanks.iscomputed(st.filter_bank),
      spectral = Plans.spectral_backend(st.plan))
 transform_spec(st::Scattering2D.ScatteringTransform2D) =
-    (kind = :st2d, N = size(st.buffer_mod), J = st.filter_bank.J, L = st.filter_bank.L,
+    (kind = :st2d, N = st.dims, J = st.filter_bank.J, L = st.filter_bank.L,
      max_order = st.max_order, T = real(eltype(st.filter_bank.averaging)),
+     oversampling = st.pw.oversampling, cache = !FilterBanks.iscomputed(st.filter_bank),
      spectral = Plans.spectral_backend(st.plan))
 transform_spec(st::Scattering3D.ScatteringTransform3D) =
-    (kind = :st3d, N = size(st.buffer_mod), J = st.filter_bank.J,
+    (kind = :st3d, N = st.dims, J = st.filter_bank.J,
      n_orient = st.filter_bank.n_orient, max_order = st.max_order,
-     T = real(eltype(st.filter_bank.averaging)), spectral = Plans.spectral_backend(st.plan))
+     T = real(eltype(st.filter_bank.averaging)), oversampling = st.pw.oversampling,
+     cache = !FilterBanks.iscomputed(st.filter_bank),
+     spectral = Plans.spectral_backend(st.plan))
 
 # The nonuniform and spherical surfaces are defined by their sample locations, so those travel in
 # the spec — a worker cannot rebuild the plan without them. They are `O(M)`, sent once per worker,
 # against a batch the worker then transforms entirely locally.
-transform_spec(st::SubsampledScattering.MultiResolutionScattering{T, 1}) where {T} =
-    (kind = :mr1d, N = st.dims[1], J = st.J, Q = st.filter_bank.Q, max_order = st.max_order,
-     oversampling = st.oversampling, T = T, spectral = Plans.spectral_backend(st.plan_full))
-transform_spec(st::SubsampledScattering.MultiResolutionScattering{T, 2}) where {T} =
-    (kind = :mr2d, N = st.dims, J = st.J, L = st.filter_bank.L, max_order = st.max_order,
-     oversampling = st.oversampling, T = T, spectral = Plans.spectral_backend(st.plan_full))
-transform_spec(st::SubsampledScattering.MultiResolutionScattering{T, 3}) where {T} =
-    (kind = :mr3d, N = st.dims, J = st.J, n_orient = st.filter_bank.n_orient,
-     max_order = st.max_order, oversampling = st.oversampling, T = T,
-     spectral = Plans.spectral_backend(st.plan_full))
-
 # The batch width is deliberately not carried: a rebuilt transform is handed whatever column block
 # its worker was assigned, and a plan fixed at the origin's width would reject every block that did
 # not happen to match. Workers therefore rebuild single-field and loop, which is correct at any block
@@ -489,23 +471,16 @@ end
 function rebuild_transform(spec)
     if spec.kind === :st1d
         return Scattering1D.ScatteringTransform1D(spec.T, spec.N, spec.J; Q = spec.Q,
-                                                  max_order = spec.max_order, spectral = spec.spectral)
+            max_order = spec.max_order, oversampling = spec.oversampling, cache = spec.cache,
+            spectral = spec.spectral)
     elseif spec.kind === :st2d
         return Scattering2D.ScatteringTransform2D(spec.T, spec.N, spec.J; L = spec.L,
-                                                  max_order = spec.max_order, spectral = spec.spectral)
+            max_order = spec.max_order, oversampling = spec.oversampling, cache = spec.cache,
+            spectral = spec.spectral)
     elseif spec.kind === :st3d
         return Scattering3D.ScatteringTransform3D(spec.T, spec.N, spec.J; n_orient = spec.n_orient,
-                                                  max_order = spec.max_order, spectral = spec.spectral)
-    elseif spec.kind === :mr1d
-        return SubsampledScattering.SubsampledScattering1D(spec.T, spec.N, spec.J; Q = spec.Q,
-            max_order = spec.max_order, oversampling = spec.oversampling, spectral = spec.spectral)
-    elseif spec.kind === :mr2d
-        return SubsampledScattering.SubsampledScattering2D(spec.T, spec.N, spec.J; L = spec.L,
-            max_order = spec.max_order, oversampling = spec.oversampling, spectral = spec.spectral)
-    elseif spec.kind === :mr3d
-        return SubsampledScattering.SubsampledScattering3D(spec.T, spec.N, spec.J;
-            n_orient = spec.n_orient, max_order = spec.max_order,
-            oversampling = spec.oversampling, spectral = spec.spectral)
+            max_order = spec.max_order, oversampling = spec.oversampling, cache = spec.cache,
+            spectral = spec.spectral)
     elseif spec.kind === :planar
         # The retained points are already on the plan's periodic domain, so the period is passed
         # explicitly rather than re-derived from their extent.
@@ -682,10 +657,14 @@ direct SHT.
 """
 function structured_spherical_scattering(::Type{T}, lmax::Int, J::Int; max_order::Int = 2,
                                          spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
+                                         band_headroom::Real = Inf,
                                          rtol::Real = 1.0e-8, maxiter::Int = 500) where {T}
     plan = SphericalCore.make_structured_plan(spectral, lmax, T; rtol = rtol, maxiter = maxiter)
+    # Exact by default: `Inf` narrows nothing and reproduces the full-band-limit cascade bit for bit.
+    # Lower it to trade band tail for speed — see `SphericalCore.band_lmax` for the tail it discards.
+    bands = SphericalCore.band_plans(plan, lmax, J, band_headroom)
     return SphericalCore.SphericalScattering(lmax, J, max_order, plan,
-                                             SphericalCore.dog_sigma2(lmax, J, T))
+                                             SphericalCore.dog_sigma2(lmax, J, T), bands)
 end
 structured_spherical_scattering(lmax::Int, J::Int; kwargs...) =
     structured_spherical_scattering(Float64, lmax, J; kwargs...)

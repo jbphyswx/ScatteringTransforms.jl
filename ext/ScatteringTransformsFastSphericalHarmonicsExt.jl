@@ -96,13 +96,18 @@ ST.Plans.task_local_plan(p::SHTSphericalPlan) =
     SHTSphericalPlan(p.lmax, p.inv_sqrt4pi, p.θweights, p.invnφ, similar(p.cbuf),
                      _warmed_cache(size(p.cbuf)...))
 
-# Multiply each spherical-harmonic coefficient of degree ℓ by h(ℓ), in the FastSphericalHarmonics
-# triangular `sph_mode` layout (in place).
-function _apply_degree_multiplier!(C::AbstractMatrix, h, lmax::Int)
-    @inbounds for l in 0:lmax
-        hl = h(l)
-        for m in -l:l
-            C[FSH.sph_mode(l, m)] *= hl
+# Multiply each spherical-harmonic coefficient of degree ℓ by h(ℓ), in place.
+#
+# Indexed by position rather than by `sph_mode(l, m)` over `l ≤ lmax`: an `(nθ, nφ)` matrix holds
+# `nθ·nφ` coefficients, of which only `nθ²` have `|m| ≤ l ≤ nθ-1`, so a loop bounded by the plan's
+# band limit leaves the rest unmultiplied and they pass into the synthesis unfiltered. Column `c`
+# carries `|m| = c ÷ 2` and row `r` carries `l - |m|`, which gives every entry its degree.
+function _apply_degree_multiplier!(C::AbstractMatrix, h)
+    nθ, nφ = size(C)
+    @inbounds for c in 1:nφ
+        am = c >> 1
+        for r in 1:nθ
+            C[r, c] *= h(r - 1 + am)
         end
     end
     return C
@@ -123,13 +128,30 @@ end
 ST.SphericalCore.sphere_coeffs_buffer(plan::SHTSphericalPlan) =
     Matrix{Float64}(undef, plan.lmax + 1, 2plan.lmax + 1)
 
+# A structured plan is defined by its band limit alone, so narrowing is just building a smaller one.
+ST.SphericalCore.sphere_plan_at(::SHTSphericalPlan, lmax::Integer) = SHTSphericalPlan(Int(lmax))
+
+# A coefficient's position encodes `(l, m)` the same way at every grid size — the column carries `m`
+# and the row carries `l - |m|` — so the coefficients a narrower grid can represent are exactly the
+# leading sub-block, and restriction is that copy.
+#
+# Not a per-`sph_mode` loop over `l ≤ lmax`: this layout also carries degrees above `nθ-1` at high
+# `|m|` (an `(nθ, nφ)` matrix holds `nθ·nφ` coefficients, not `(nθ)²`), so a loop bounded by the
+# plan's `lmax` would silently drop them.
+function ST.SphericalCore.sphere_restrict!(Cd::AbstractMatrix, ::SHTSphericalPlan,
+                                           Cs::AbstractMatrix, ::SHTSphericalPlan)
+    nθ, nφ = size(Cd)
+    @inbounds copyto!(Cd, view(Cs, 1:nθ, 1:nφ))
+    return Cd
+end
+
 # Apply the per-degree multiplier h(ℓ) to a copy of the coefficients and synthesise back to the grid.
 # The copy goes into the plan's scratch, so a band allocates nothing; `C` itself is left intact for
 # the next band.
 function ST.SphericalCore.sphere_apply!(out::AbstractMatrix, plan::SHTSphericalPlan, C, h)
     C2 = plan.cbuf
     copyto!(C2, C)
-    _apply_degree_multiplier!(C2, h, plan.lmax)
+    _apply_degree_multiplier!(C2, h)
     with_serial_ft(() -> FSH.sph_evaluate!(C2; cache = plan.cache))
     copyto!(out, C2)
     return out

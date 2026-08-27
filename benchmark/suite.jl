@@ -361,12 +361,6 @@ function allocations()
     Printf.@printf("  %-42s %6d B\n", "Scattering3D.scattering_transform3d!",
                    _alloc3(ST.Scattering3D.scattering_transform3d!, c3, st3, randn(16, 16, 16)))
 
-    mr = ST.SubsampledScattering.SubsampledScattering2D((64, 64), 3; L = 4, oversampling = 1,
-                                                        spectral = FB)
-    cm = ST.batch_coeffs(mr, Float64)
-    Printf.@printf("  %-42s %6d B\n", "SubsampledScattering.subsampled_scattering!",
-                   _alloc3(ST.SubsampledScattering.subsampled_scattering!, cm, mr, randn(64, 64)))
-
     X = randn(64, 64, 8)
     ws = ST.batch_workspace(st2, 8)
     out = ST.scattering_batch(st2, X)
@@ -418,20 +412,20 @@ function main()
         gridded("3D $(N)^3 J=$J", st, randn(N, N, N), randn(N, N, N, B), (N, N, N))
     end
 
-    header("Multi-resolution second order — speedup vs the approximation it trades for")
+    header("Periodized cascade — speedup vs the approximation it trades for")
     multires("1D N=4096 J=8",
              ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, spectral = FB),
-             ov -> ST.SubsampledScattering.SubsampledScattering1D(4096, 8; Q = 1, oversampling = ov,
-                                                                  spectral = FB), randn(4096), 1:3)
+             ov -> ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, oversampling = ov,
+                                                         spectral = FB), randn(4096), 1:3)
     multires("2D 128^2 J=4 L=8",
              ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8, spectral = FB),
-             ov -> ST.SubsampledScattering.SubsampledScattering2D((128, 128), 4; L = 8,
-                                                                  oversampling = ov, spectral = FB),
+             ov -> ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8,
+                                                         oversampling = ov, spectral = FB),
              randn(128, 128), 0:2)
     multires("3D 64^3 J=3",
              ST.Scattering3D.ScatteringTransform3D((64, 64, 64), 3; n_orient = 6, spectral = FB),
-             ov -> ST.SubsampledScattering.SubsampledScattering3D((64, 64, 64), 3; n_orient = 6,
-                                                                  oversampling = ov, spectral = FB),
+             ov -> ST.Scattering3D.ScatteringTransform3D((64, 64, 64), 3; n_orient = 6,
+                                                         oversampling = ov, spectral = FB),
              randn(64, 64, 64), 0:1)
 
     header("Nonuniform and spherical surfaces — batch reuse and threading")

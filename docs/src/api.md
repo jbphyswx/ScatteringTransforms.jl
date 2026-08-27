@@ -62,6 +62,8 @@ ScatteringTransforms.scattering_loss
 ```@docs
 ScatteringTransforms.Monogenic.MonogenicScattering
 ScatteringTransforms.Monogenic.MonogenicFilterBank
+ScatteringTransforms.Monogenic.ComputedMonogenicFilterBank
+ScatteringTransforms.Monogenic.MonogenicWorkspace
 ScatteringTransforms.Monogenic.build_monogenic_bank
 ScatteringTransforms.Monogenic.riesz_multipliers
 ScatteringTransforms.Monogenic.monogenic_amplitude
@@ -96,6 +98,7 @@ ScatteringTransforms.Coefficients.flatten1d!
 ScatteringTransforms.Coefficients.flatten2d!
 ScatteringTransforms.Coefficients.flatten_length
 ScatteringTransforms.Coefficients.flat_length
+ScatteringTransforms.Coefficients.flat_eltype
 ScatteringTransforms.Coefficients.update_S0
 ScatteringTransforms.Scattering2D.compute_shape_sparsity
 ScatteringTransforms.Reductions.normalized_coefficients
@@ -125,17 +128,36 @@ ScatteringTransforms.Batched.BatchWorkspace
 ScatteringTransforms.Batched.batch_cascade!
 ```
 
-## Multi-resolution second order
+## The periodized cascade
 
-The second order runs on a decimated grid, which is where most of a transform's work is. Opt-in and
-approximate; `oversampling` converges it to the exact transform.
+Each wavelet's output is produced directly on the grid its band needs, decimated by
+`r = 2^max(j-oversampling, 0)` per axis. Exact at `oversampling ≥ J`, which reproduces the
+undecimated cascade bit for bit; below that it trades accuracy for speed.
 
 ```@docs
-ScatteringTransforms.SubsampledScattering.MultiResolutionScattering
-ScatteringTransforms.SubsampledScattering.SubsampledScattering1D
-ScatteringTransforms.SubsampledScattering.SubsampledScattering2D
-ScatteringTransforms.SubsampledScattering.SubsampledScattering3D
-ScatteringTransforms.SubsampledScattering.subsampled_scattering!
+ScatteringTransforms.Cascade.decimation
+ScatteringTransforms.Cascade.PeriodizedWorkspace
+ScatteringTransforms.Cascade.build
+ScatteringTransforms.Cascade.cascade!
+ScatteringTransforms.Cascade.group!
+ScatteringTransforms.Cascade.scattering_values
+ScatteringTransforms.Cascade.task_copy
+ScatteringTransforms.Cascade.with_plans
+ScatteringTransforms.Cascade.FieldWorkspace
+ScatteringTransforms.Cascade.build_field
+ScatteringTransforms.Cascade.field_workspace
+ScatteringTransforms.Cascade.field_oversampling
+ScatteringTransforms.Cascade.localize!
+ScatteringTransforms.Cascade.field_group!
+ScatteringTransforms.Cascade.field_cascade!
+ScatteringTransforms.ScatteringCore.periodize_mul!
+ScatteringTransforms.ScatteringCore.periodize_mul2!
+ScatteringTransforms.ScatteringCore._modulus
+ScatteringTransforms.ScatteringCore.periodize
+ScatteringTransforms.ScatteringCore.periodize_filter!
+ScatteringTransforms.Filters.gaussian_lowpass!
+ScatteringTransforms.Plans.plan_like
+ScatteringTransforms.Plans.inplace_inverse
 ```
 
 ## Filter banks, filters & path graph
@@ -148,10 +170,18 @@ ScatteringTransforms.FilterBanks.WaveletMeta
 ScatteringTransforms.FilterBanks.build_filter_bank1d
 ScatteringTransforms.FilterBanks.build_filter_bank2d
 ScatteringTransforms.FilterBanks.build_filter_bank3d
+ScatteringTransforms.FilterBanks.ComputedFilterBank1D
+ScatteringTransforms.FilterBanks.ComputedFilterBank2D
+ScatteringTransforms.FilterBanks.nwavelets
+ScatteringTransforms.FilterBanks.filter_at
+ScatteringTransforms.FilterBanks.iscomputed
+ScatteringTransforms.FilterBanks.task_bank
+ScatteringTransforms.FilterBanks.batch_views
 ScatteringTransforms.Filters.Morlet1D
 ScatteringTransforms.Filters.Morlet2D
 ScatteringTransforms.Filters.Morlet3D
 ScatteringTransforms.Filters.frequency_response
+ScatteringTransforms.Filters.frequency_response!
 ScatteringTransforms.Filters.fibonacci_directions
 ScatteringTransforms.PathGraph.ScatteringTree
 ScatteringTransforms.PathGraph.build_tree
@@ -245,7 +275,6 @@ ScatteringTransforms.Scattering3D.cascade!
 ScatteringTransforms.ScatteredPlanar.ScatteredPlanarScattering
 ScatteringTransforms.ScatteredPlanar.scattered_planar_scattering!
 ScatteringTransforms.ScatteredPlanar.scattered_planar_scattering_batch!
-ScatteringTransforms.SubsampledScattering.Level
 ```
 
 ## Spherical scattering
@@ -259,8 +288,13 @@ ScatteringTransforms.SphericalCore.AbstractSphericalPlan
 ScatteringTransforms.SphericalCore.sphere_coeffs
 ScatteringTransforms.SphericalCore.sphere_coeffs!
 ScatteringTransforms.SphericalCore.sphere_coeffs_buffer
+ScatteringTransforms.SphericalCore.sphere_field_buffer
 ScatteringTransforms.SphericalCore.sphere_apply!
 ScatteringTransforms.SphericalCore.sphere_mean
+ScatteringTransforms.SphericalCore.sphere_plan_at
+ScatteringTransforms.SphericalCore.sphere_restrict!
+ScatteringTransforms.SphericalCore.band_lmax
+ScatteringTransforms.SphericalCore.band_plans
 ScatteringTransforms.SphericalCore.SphericalScattering
 ScatteringTransforms.SphericalCore.SphericalMonogenicScattering
 ScatteringTransforms.SphericalCore.SphericalWorkspace

@@ -27,8 +27,9 @@ where `p'` drops the last index `λ_k`. The package exposes two reductions of `U
   ```math
   S_p x = \big(\,U_p x \star \phi_J\,\big)\!\downarrow s .
   ```
-  Because `\hat\phi_J(0)=1`, the spatial mean of `S_p x` equals `\bar S_p x` — the two outputs
-  are consistent, and the package tests enforce this exactly.
+  The spatial mean of `S_p x` equals `\bar S_p x`, so the two outputs are consistent and the tests
+  enforce that exactly. Under `↓ s` this needs more of `φ_J` than `\hat\phi_J(0)=1` — see
+  [Low-passes: which output uses which, and why](@ref).
 
 The averaging (or `φ_J` low-pass) is what makes the descriptors invariant to translations; the
 localized field additionally inherits Mallat's stability to small diffeomorphisms.
@@ -58,8 +59,33 @@ admissibility condition `\hat\psi_j(0)=0`. The filter is analytic (zero for `ω<
 ### 2D oriented Morlet
 
 Oriented Morlet wavelets at scale `j` and orientation `θ = πℓ/L` (`ℓ = 0,…,L-1`), elliptical in
-the Fourier plane and analytic on the half-plane `k·\hat θ ≥ 0`. The low-pass `φ_J` is a Gaussian
-matched to the coarsest scale.
+the Fourier plane and analytic on the half-plane `k·\hat θ ≥ 0`.
+
+### Low-passes: which output uses which, and why
+
+The **coefficients** `\bar S_p x = ⟨U_p x⟩` contain no low-pass: the average is over the whole
+domain and the cascade multiplies wavelets only. Nor does decimation need one — the periodization
+identity below is exact for any spectrum. Two other filters exist, for two other jobs:
+
+- A bank's `averaging`, `\hatφ = \sqrt{\max(0,\,1-\sum_λ|\hatψ_λ|^2)}`, is the **tight-frame dual**:
+  it is what makes `\sum_λ|\hatψ_λ|^2+|\hatφ|^2 ≡ 1`, and hence what `iwavelet` inverts with. It is
+  not a low-pass — every `\hatψ_λ` is analytic, so the sum vanishes across the analytic complement
+  and `\hatφ ≡ 1` there.
+- The **localized field** `S_p x = U_p x \star φ_J` is *defined* by its low-pass; `φ_J` is the
+  operator, not an accuracy device, and the coefficient is its whole-domain-window limit.
+
+Subsampling that field by `s` then forces one condition. Since
+
+```math
+\langle S_p x\rangle = \tfrac1N \sum_m \big(\hat U_p\,\hat φ_J\big)[m N/s],
+```
+
+`⟨S_p x⟩ = \bar S_p x` **iff `\hatφ_J` vanishes on the subsampling lattice** `\{mN/s : m ≠ 0\}`. The
+tight-frame dual is identically `1` on half of that lattice, so it fails the condition. The Gaussian
+`\hatφ_J(k) = e^{-|k|^2σ^2/2}` with `σ = σ_0 2^J` ([`ScatteringTransforms.Filters.gaussian_lowpass!`](@ref)) satisfies it
+with wide margin — the lattice starts at `|k| = 2π/s`, so at the default `s = 2^{J-1}` the largest
+surviving term is `e^{-(4πσ_0)^2/2}`, i.e. `10^{-22}` at `σ_0 = 0.8`. The lattice condition is what
+is required; the Gaussian family and `σ_0` are a choice with room to spare.
 
 ## Reduced descriptors
 

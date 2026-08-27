@@ -18,7 +18,7 @@ Zygote). For reverse-mode synthesis the direct-sum backend is the most portable 
 using DifferentiationInterface: DifferentiationInterface as DI
 using ScatteringTransforms: ScatteringTransforms
 
-# The gridded transforms expose the same non-mutating `scattering` + `buffer_mod` shape.
+# The gridded transforms expose the same non-mutating `scattering` + `dims` shape.
 const _Gridded = Union{ScatteringTransforms.Scattering1D.ScatteringTransform1D,
                        ScatteringTransforms.Scattering2D.ScatteringTransform2D,
                        ScatteringTransforms.Scattering3D.ScatteringTransform3D}
@@ -28,7 +28,7 @@ _target_coeffs(st, target::AbstractArray) = ScatteringTransforms.ScatteringCore.
 _target_coeffs(::Any, target) = target
 
 # Spatial shape of the transform input (the real modulus workspace carries it).
-_field_shape(st) = size(st.buffer_mod)
+_field_shape(st) = st.dims
 
 # The differentiated function takes the transform, the target and the loss as arguments instead of
 # capturing them, so that they can be declared `DI.Constant` below. A closure over the transform is a

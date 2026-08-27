@@ -40,8 +40,9 @@ Fast, generic wavelet scattering transforms in Julia.
 - **Batching & threading**: `scattering_batch` reuses one plan/workspace across the batch, on every
   surface — gridded 1D/2D/3D, scattered planar, and the sphere; `using OhMyThreads` enables
   `scattering_batch(ThreadedBackend(), …)`, which is bit-identical to serial.
-- **Multi-resolution second order**: `SubsampledScattering1D/2D/3D` run the order-2 cascade on a
-  decimated grid, converging to the exact transform as `oversampling` grows.
+- **Periodized cascade**: every convolution is produced directly on the decimated grid its band
+  needs (`oversampling` keyword), exactly — `oversampling ≥ J` reproduces the undecimated cascade
+  bit for bit, and lower values trade accuracy for speed.
 - **Vendor-neutral GPU**: `using KernelAbstractions, AbstractFFTs` + a device backend (e.g.
   `using CUDA`) gives a device-resident transform via `GPUBackend(CUDA.CUDABackend())` and a
   batched-throughput `scattering_batch(gpu, st, X)` — CUDA/ROCm/oneAPI/Metal, validated on `KA.CPU()`.

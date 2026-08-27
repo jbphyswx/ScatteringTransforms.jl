@@ -47,6 +47,16 @@ In-place inverse (ifft-convention, `1/N`-scaled) spectral transform.
 function inverse_transform! end
 
 """
+    inplace_inverse(plan) -> Bool
+
+Whether `inverse_transform!(x, plan, x)` is valid. When it is, a transform points its convolution
+output at its multiply scratch and owns one fewer field-sized array; when it is not, the two stay
+distinct. Default `false`: the direct-sum plan alternates through its own scratch and aliasing would
+corrupt an odd number of axes.
+"""
+inplace_inverse(::AbstractScatteringPlan) = false
+
+"""
     forward_transform(plan, x) -> X̂
     inverse_transform(plan, x) -> x
 
@@ -145,13 +155,18 @@ answer means nothing — a non-finite residual, or a conditioning estimate past 
 represent — because those propagate into every coefficient downstream, and a silent `NaN` is worse
 than a stop.
 """
-struct AnalysisNotConverged <: Exception
-    residual::Float64
-    rtol::Float64
+struct AnalysisNotConverged{T <: Real} <: Exception
+    residual::T
+    rtol::T
     iters::Int
     maxiter::Int
     detail::String
 end
+
+AnalysisNotConverged(residual::Real, rtol::Real, iters::Integer, maxiter::Integer,
+                     detail::AbstractString) =
+    AnalysisNotConverged{promote_type(typeof(residual), typeof(rtol))}(
+        residual, rtol, Int(iters), Int(maxiter), String(detail))
 
 function Base.showerror(io::IO, e::AnalysisNotConverged)
     print(io, "AnalysisNotConverged: reached relative residual ", e.residual, " after ", e.iters,
@@ -171,7 +186,7 @@ function _check_solve(info, M::Integer, ms::Tuple, rtol::Real, maxiter::Integer)
         "raise `damp` to regularise them." :
         "The sampling may not determine the mode grid ($n modes, $M points) — check the point set " *
         "for gaps, reduce `ms`, or raise `damp`."
-    throw(AnalysisNotConverged(Float64(info.normr), Float64(rtol), info.iters, maxiter,
+    throw(AnalysisNotConverged(info.normr, rtol, info.iters, maxiter,
                               "cond(A) ≈ $(Float32(info.condA)), istop = $(info.istop). " * advice))
 end
 
@@ -736,6 +751,19 @@ make_plan(::SB.AbstractFFTSpectralBackend, ::Type{T}, dims; nbatch::Int = 1, kwa
 make_plan(::SB.AbstractAutoSpectralBackend, ::Type{T}, dims; nbatch::Int = 1, kwargs...) where {T} =
     _have_fftw() ? fftw_plan(T, dims; nbatch = nbatch, kwargs...) :
     DirectSumPlan(T, dims; nbatch = nbatch)
+
+"""
+    plan_like(plan, prototype) -> plan′
+
+A plan of the same kind as `plan`, sized for arrays like `prototype`.
+
+Sizing from an *array* rather than from dimensions plus a backend tag is what lets one piece of code
+plan on host and device alike: a device plan has no spectral-backend tag to look up — `spectral_backend`
+deliberately throws on it — but it does have arrays, and `AbstractFFTs` dispatches on their type. Used
+where a cascade needs plans at resolutions not known when the transform was built.
+"""
+plan_like(plan::AbstractScatteringPlan, prototype::AbstractArray) =
+    make_plan(spectral_backend(plan), real(eltype(prototype)), size(prototype))
 
 """
     plan_analysis(plan) -> (; solve, maxiter, rtol, damp, eps, nufft_nthreads)

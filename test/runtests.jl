@@ -686,40 +686,41 @@ Test.@testset "Batched transforms reuse the plan and match per-signal results" b
     end
 end
 
-Test.@testset "Intermediate subsampling: exact at large oversampling, ≈ exact at small" begin
+Test.@testset "Periodized cascade: bit-exact at oversampling ≥ J, lossy below" begin
     N = 256
     J = 5
     signal = randn(N)
-    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
-    exact = st(signal)
+    build(ov) = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2,
+                                                                        oversampling=ov)
+    exact = build(J)(signal)
+    C = ScatteringTransforms.Coefficients
 
-    # Large oversampling ⇒ no decimation ⇒ identical to the exact transform.
-    sub_off = ScatteringTransforms.SubsampledScattering.SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=J)
-    c_off = sub_off(signal)
-    Test.@test ScatteringTransforms.Coefficients.first_order(c_off) ≈ ScatteringTransforms.Coefficients.first_order(exact)
-    Test.@test ScatteringTransforms.Coefficients.second_order(c_off) ≈ ScatteringTransforms.Coefficients.second_order(exact)
-    Test.@test ScatteringTransforms.Coefficients.zeroth_order(c_off) ≈ ScatteringTransforms.Coefficients.zeroth_order(exact)
+    # Nothing decimated ⇒ every alias block is the whole spectrum ⇒ the products are the same
+    # floating-point operations in the same order, so this is equality, not approximate equality.
+    c_off = build(J + 3)(signal)
+    Test.@test C.first_order(c_off) == C.first_order(exact)
+    Test.@test C.second_order(c_off) == C.second_order(exact)
+    Test.@test C.zeroth_order(c_off) == C.zeroth_order(exact)
 
-    # Aggressive subsampling ⇒ S1 identical (full res), S2 lossy by exactly the aliasing decimation
-    # introduces.
-    sub_on = ScatteringTransforms.SubsampledScattering.SubsampledScattering1D(N, J; Q=1, max_order=2, oversampling=1)
-    c_on = sub_on(signal)
-    Test.@test ScatteringTransforms.Coefficients.first_order(c_on) ≈ ScatteringTransforms.Coefficients.first_order(exact)
+    # S0 is the plain field mean and never involves a wavelet, so no decimation can move it.
+    Test.@test C.zeroth_order(build(0)(signal)) ≈ C.zeroth_order(exact)
 
     # What is asserted is where the loss goes to zero, not how big it is below that. A modulus is
     # nonlinear, so the envelope it produces has no compact spectrum and decimating it always aliases
-    # something; how much depends on the signal and has no per-draw bound (on white noise: 1.9% mean,
-    # 9.1% over 200 draws at `oversampling = 1`). What does hold for every draw is that retaining
-    # enough band is *exactly* lossless, and that below it the loss is real rather than the subsampled
-    # path quietly declining to decimate.
-    S2e = ScatteringTransforms.Coefficients.second_order(exact)
-    err(ov) = let s = ScatteringTransforms.SubsampledScattering.SubsampledScattering1D(
-                  N, J; Q=1, max_order=2, oversampling=ov)
-        sum(abs2, ScatteringTransforms.Coefficients.second_order(s(signal)) .- S2e) /
-            sum(abs2, S2e)
+    # something; how much depends on the signal and has no per-draw bound. What holds for every draw
+    # is that retaining enough band is exactly lossless, and that below it the loss is real rather
+    # than the cascade quietly declining to decimate.
+    S1e, S2e = C.first_order(exact), C.second_order(exact)
+    err(ov, get, ref) = let c = build(ov)(signal)
+        sum(abs2, get(c) .- ref) / sum(abs2, ref)
     end
-    Test.@test err(3) == 0
-    Test.@test err(0) > 0
+    Test.@test err(J, C.second_order, S2e) == 0
+    Test.@test err(0, C.second_order, S2e) > 0
+
+    # Order 1 is decimated too — the coefficient is the mean of |U₁| over the grid that wavelet's
+    # band needs, not over the full grid. Exact where nothing is decimated, and bounded below that.
+    Test.@test err(J, C.first_order, S1e) == 0
+    Test.@test 0 < err(0, C.first_order, S1e) < 1e-2
 end
 
 Test.@testset "Threaded batch (OhMyThreads) matches serial batch" begin
@@ -824,12 +825,23 @@ Test.@testset "1D localized field: mean equals averaged coefficient" begin
         Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf, p)), S2[j1, j2]; atol=1e-8)
     end
 
-    # Decimation: subsample=8 -> field length N/8, all finite. (The decimated mean is a
-    # finite-sample estimate of the full mean, not exact, so we don't assert equality here;
-    # the subsample=1 case above is the exact consistency check.)
+    # Decimation must not weaken that: φ_J is a genuine Gaussian low-pass, so the subsampled field
+    # carries the same DC and its mean is still the coefficient. Smoothing with the bank's
+    # `averaging` instead — an all-pass on the analytic complement — folds full-band energy onto DC
+    # and puts this 8% out at s=8.
     sf8 = ScatteringTransforms.ScatteringFields.scattering_field(st, signal; subsample=8)
     Test.@test size(sf8.data, 1) == N ÷ 8
     Test.@test all(isfinite, sf8.data)
+    for p in PG.order_range(tree, 1)
+        j = PG.path_indices(tree, p)[1]
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf8, p)),
+                            S1[j]; rtol=1e-12)
+    end
+    for p in PG.order_range(tree, 2)
+        idx = PG.path_indices(tree, p)
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf8, p)),
+                            S2[idx[1], idx[2]]; rtol=1e-12)
+    end
 end
 
 Test.@testset "2D localized field: mean equals averaged coefficient" begin
@@ -861,6 +873,145 @@ Test.@testset "2D localized field: mean equals averaged coefficient" begin
     sf2 = ScatteringTransforms.ScatteringFields.scattering_field(st, image; subsample=2)
     Test.@test size(sf2.data) == (Ny ÷ 2, Nx ÷ 2, PG.npaths(tree))
     Test.@test all(isfinite, sf2.data)
+    for p in PG.order_range(tree, 1)
+        j = PG.path_indices(tree, p)[1]
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf2, p)),
+                            S1[j]; rtol=1e-12)
+    end
+    for p in PG.order_range(tree, 2)
+        idx = PG.path_indices(tree, p)
+        Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf2, p)),
+                            S2[idx[1], idx[2]]; rtol=1e-12)
+    end
+end
+
+Test.@testset "Computed filter banks (cache=false) match stored ones everywhere" begin
+    # A computed bank evaluates each wavelet on demand into one shared scratch array instead of
+    # storing `J·L` of them. That has to be invisible in the result and safe under threading — the
+    # sharing is exactly what makes it a race if a task is handed someone else's scratch.
+    Random.seed!(41)
+    FB = SpectralBackends.FFTSpectralBackend()
+    CBk = ComputationalBackends
+    flat(c) = vcat(c.S0, vec(c.S1), vec(c.S2))
+
+    for (mk, x, run!, mkc) in (
+            ((α, ca) -> ScatteringTransforms.Scattering1D.ScatteringTransform1D(128, 4; Q=1,
+                            max_order=2, oversampling=α, spectral=FB, cache=ca),
+             randn(128), ScatteringTransforms.Scattering1D.scattering_transform!,
+             st -> ScatteringTransforms.batch_coeffs(st, Float64)),
+            ((α, ca) -> ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4,
+                            max_order=2, oversampling=α, spectral=FB, cache=ca),
+             randn(32, 32), ScatteringTransforms.Scattering2D.scattering_transform2d!,
+             st -> ScatteringTransforms.batch_coeffs(st, Float64)),
+            ((α, ca) -> ScatteringTransforms.Scattering3D.ScatteringTransform3D((16, 16, 16), 2;
+                            n_orient=4, max_order=2, oversampling=α, spectral=FB, cache=ca),
+             randn(16, 16, 16), ScatteringTransforms.Scattering3D.scattering_transform3d!,
+             st -> ScatteringTransforms.batch_coeffs(st, Float64)))
+        for α in (4, 1, 0)
+            stored, computed = mk(α, true), mk(α, false)
+            Test.@test ScatteringTransforms.FilterBanks.iscomputed(computed.filter_bank)
+            Test.@test !ScatteringTransforms.FilterBanks.iscomputed(stored.filter_bank)
+            # Same arithmetic in the same order, so equality rather than approximate equality.
+            Test.@test flat(computed(x)) == flat(stored(x))
+
+            # Each task gets its own bank, so its filter list must point at *that* bank's scratch.
+            ser, thr = mkc(computed), mkc(computed)
+            run!(ser, CBk.SerialBackend(), computed, x)
+            for _ in 1:6
+                run!(thr, CBk.ThreadedBackend(), computed, x)
+                Test.@test flat(thr) == flat(ser)
+            end
+        end
+    end
+
+    # A worker rebuilding from a spec must get a computed bank too, not silently a stored one.
+    st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2,
+             oversampling=1, spectral=FB, cache=false)
+    rebuilt = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
+    Test.@test ScatteringTransforms.FilterBanks.iscomputed(rebuilt.filter_bank)
+    x2 = randn(32, 32)
+    Test.@test flat(rebuilt(x2)) == flat(st(x2))
+
+    # And the batched cascade, whose filters carry a trailing singleton over the shared scratch.
+    Xb = randn(32, 32, 3)
+    Bb = ScatteringTransforms.scattering_batch(st, Xb)
+    for b in 1:3
+        Test.@test view(Bb, :, b) == ScatteringTransforms.Coefficients.flatten2d(st(view(Xb, :, :, b)))
+    end
+end
+
+Test.@testset "Complex input on every gridded surface" begin
+    # A modulus is real, so `S1`/`S2` of a complex field are real and must equal the real field's
+    # exactly when the imaginary part is zero. Only `S0 = ⟨x⟩` is complex, and the flat layout and
+    # the order-0 localized field have to be wide enough to carry it rather than throwing or
+    # silently dropping the imaginary part.
+    Random.seed!(31)
+    C = ScatteringTransforms.Coefficients
+    SF = ScatteringTransforms.ScatteringFields
+
+    for (st, x, flat) in (
+            (ScatteringTransforms.Scattering1D.ScatteringTransform1D(64, 3; Q=1, max_order=2),
+             randn(64), C.flatten1d),
+            (ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2),
+             randn(32, 32), C.flatten2d),
+            (ScatteringTransforms.Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient=4,
+                                                                     max_order=2),
+             randn(8, 8, 8), C.flatten2d))
+        cr, cc = st(x), st(complex(x))
+        Test.@test C.first_order(cc) == C.first_order(cr)
+        Test.@test C.second_order(cc) == C.second_order(cr)
+        Test.@test eltype(C.first_order(cc)) <: Real
+        Test.@test C.zeroth_order(cc) isa Complex
+
+        # A real field must not be widened just because complex input is supported.
+        Test.@test eltype(flat(cr)) <: Real
+        fc = flat(cc)
+        Test.@test eltype(fc) <: Complex
+        Test.@test fc[C.flat_row_s0()] ≈ C.zeroth_order(cc)
+        Test.@test real(fc) ≈ flat(cr)
+
+        # A genuinely complex field: the AD forward must agree with the in-place one.
+        z = complex.(x, randn(size(x)...))
+        Test.@test flat(ScatteringTransforms.ScatteringCore.scattering(st, z)) ≈ flat(st(z))
+    end
+
+    # Batched columns must match the per-slice transform, complex `S0` included.
+    st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2)
+    Z = randn(ComplexF64, 32, 32, 3)
+    B = ScatteringTransforms.scattering_batch(st2, Z)
+    Test.@test eltype(B) <: Complex
+    for b in 1:3
+        Test.@test view(B, :, b) ≈ C.flatten2d(st2(view(Z, :, :, b)))
+    end
+
+    # The localized field carries the complex order-0 field, and its mean is still `S0`.
+    z2 = randn(ComplexF64, 32, 32)
+    sf = SF.scattering_field(st2, z2; subsample=4)
+    Test.@test eltype(sf.data) <: Complex
+    root = first(ScatteringTransforms.PathGraph.order_range(st2.tree, 0))
+    Test.@test Statistics.mean(SF.path_field(sf, root)) ≈ ScatteringTransforms.Coefficients.zeroth_order(st2(z2))
+    Test.@test eltype(SF.scattering_field(st2, real(z2); subsample=4).data) <: Real
+end
+
+Test.@testset "Localized-field low-pass is a low-pass, not the tight-frame complement" begin
+    # The bank's `averaging` is `√(max(0, 1-Σ|ψ|²))`, and every ψ̂ is analytic, so it is identically
+    # 1 across the analytic complement. Subsampling a field smoothed with it aliases full-band
+    # energy onto DC, which is why the localized transform uses its own Gaussian φ_J.
+    N, J = 256, 4
+    fb = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=1)
+    neg = (N ÷ 2 + 2):N
+    Test.@test all(≈(1.0), fb.averaging[neg])
+
+    φ = ScatteringTransforms.Filters.gaussian_lowpass(Float64, (N,), J)
+    Test.@test φ[1] == 1.0
+    # Every frequency that folds onto DC under the default 2^(J-1) subsampling is negligible.
+    s = 1 << (J - 1)
+    Test.@test maximum(abs, φ[(N ÷ s) .* (1:(s - 1)) .+ 1]) < 1e-20
+    Test.@test all(<=(0), diff(φ[1:(N ÷ 2)]))             # monotone decreasing on positives
+
+    φ2 = ScatteringTransforms.Filters.gaussian_lowpass(Float32, (32, 32), 2)
+    Test.@test eltype(φ2) == Float32
+    Test.@test φ2[1, 1] == 1.0f0
 end
 
 Test.@testset "Reduced descriptors: sparsity, shape (anisotropy), normalize, log" begin
@@ -1014,6 +1165,40 @@ Test.@testset "Monogenic (Riesz) scattering: partition, tight frame, transforms"
         stf = ScatteringTransforms.Monogenic.MonogenicScattering(Float32, (32, 32), 2; Q=1, max_order=2)
         cf = stf(randn(Float32, 32, 32))
         Test.@test eltype(ScatteringTransforms.Coefficients.first_order(cf)) == Float32
+    end
+end
+
+Test.@testset "Monogenic periodized cascade converges to the undecimated one" begin
+    # The monogenic amplitude band-passes by `D+1` filters per wavelet, so it is the most
+    # transform-heavy cascade here and gains the most from producing each on its own grid. The
+    # Riesz-weighted band-pass `R_d ψ_j` has to be periodized as one filter: periodizing `R_d` and
+    # `ψ_j` separately and multiplying is a different function, and would show up as an error floor
+    # that never reaches zero.
+    Random.seed!(53)
+    FB = SpectralBackends.FFTSpectralBackend()
+    flat(c) = vcat(c.S0, vec(c.S1), vec(c.S2))
+
+    for (dims, J) in (((128,), 4), ((32, 32), 3), ((16, 16, 16), 2))
+        x = randn(dims...)
+        mk(α; cache=true) = ScatteringTransforms.Monogenic.MonogenicScattering(
+            Float64, dims, J; Q=1, max_order=2, spectral=FB, oversampling=α, cache=cache)
+        cref = mk(J)(x)
+        # Nothing decimated: the same operations in the same order, so equality.
+        Test.@test flat(mk(J + 2)(x)) == flat(cref)
+
+        e(α) = let c = mk(α)(x)
+            (maximum(abs, c.S1 .- cref.S1) / maximum(abs, cref.S1),
+             maximum(abs, c.S2 .- cref.S2) / maximum(abs, cref.S2))
+        end
+        e1, e0 = e(1), e(0)
+        Test.@test e1[1] <= e0[1] + 1e-12          # error falls monotonically with oversampling
+        Test.@test e1[2] <= e0[2] + 1e-12
+        Test.@test e0[2] > 0                        # and is real below it, not a silent no-op
+        # `S0` is the plain field mean, so no decimation can move it.
+        Test.@test mk(0)(x).S0 ≈ cref.S0
+
+        # A computed bank evaluates into shared scratch; the Riesz products must still be right.
+        Test.@test flat(mk(1; cache=false)(x)) == flat(mk(1)(x))
     end
 end
 

@@ -14,6 +14,7 @@ using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Coefficients: Coefficients
 using ..PathGraph: PathGraph
+using ..Cascade: Cascade
 using ..ScatteringFields: ScatteringFields
 
 export ScatteringTransform1D
@@ -35,13 +36,14 @@ GPU or static storage.
 - `buffer_input`: complex buffer for real→complex promotion, and multiply scratch
 - `buffer_signal_fft`: the input spectrum, read-only for the whole cascade
 - `buffer_conv`: inverse-transform output
-- `buffer_mod`: real modulus buffer for the localized-field path
-- `buffer_u1`, `buffer_u1_fft`: the current first-order modulus and its spectrum, reused across
-  that wavelet's children — one pair, not one per wavelet
+- `dims`: the signal's length, as a 1-tuple
+- `buffer_u1_fft`: the spectrum of the current first-order modulus, reused across that wavelet's
+  children. The modulus itself needs no buffer of its own — the cascade writes it straight into
+  `buffer_input`, which is what its transform reads.
 """
-struct ScatteringTransform1D{T, V<:AbstractVector{Complex{T}}, M<:AbstractVector{T},
+struct ScatteringTransform1D{T, V<:AbstractVector{Complex{T}},
                              P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
-                             FB<:FilterBanks.FilterBank1D, G<:AbstractVector}
+                             FB, G<:AbstractVector, PW}
     filter_bank::FB         # any FilterBank1D (CPU/GPU/static/…), kept as a type param
     tree::Tree              # admissible scattering paths (source of truth for second-order)
     groups::G               # (j1, children) from the tree, longest-first — the cascade's work list
@@ -50,9 +52,9 @@ struct ScatteringTransform1D{T, V<:AbstractVector{Complex{T}}, M<:AbstractVector
     buffer_input::V         # complex buffer for real→complex promotion of input
     buffer_signal_fft::V    # preserves signal FFT across the whole cascade
     buffer_conv::V          # convolution / inverse-transform output
-    buffer_mod::M           # real modulus buffer (localized-field path)
-    buffer_u1::M            # first-order modulus of the current j1
+    dims::NTuple{1,Int}
     buffer_u1_fft::V        # its spectrum, reused across that j1's children
+    pw::PW                  # periodized cascade workspace — see `Cascade`
 end
 
 """
@@ -64,29 +66,38 @@ positional, as for `zeros(T, …)`; omit it for `Float64`.
 function ScatteringTransform1D(::Type{T}, N::Int, J::Int;
                                Q::Int=1,
                                max_order::Int=2,
+                               cache::Bool=true,
+                               oversampling::Int=J,
                                spectral::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T}
-    filter_bank = FilterBanks.build_filter_bank1d(T, N, J; Q=Q)
+    filter_bank = FilterBanks.build_filter_bank1d(T, N, J, Val(cache); Q=Q)
     tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
-    groups = max_order >= 2 ? PathGraph.order2_groups(tree, length(filter_bank.wavelets)) :
-             [(j, Int[], Int[]) for j in 1:length(filter_bank.wavelets)]
+    nw = FilterBanks.nwavelets(filter_bank)
+    groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
+             [(j, Int[], Int[]) for j in 1:nw]
     plan = Plans.make_plan(spectral, T, (N,))
 
     dummy = zeros(Complex{T}, N)
     # Workspace is O(N), not O(nw·N): the cascade holds one first-order modulus and its spectrum at
     # a time, because it finishes every child of a `j1` before moving to the next.
+    # `buffer_conv` is `buffer_input` itself when the plan inverts in place.
+    input = similar(dummy)
+    conv = Plans.inplace_inverse(plan) ? input : similar(dummy)
+    pw = Cascade.build(filter_bank, groups, (N,), T, oversampling, Plans.spectral_backend(plan))
     return ScatteringTransform1D(filter_bank, tree, groups, max_order, plan,
-                                 similar(dummy), similar(dummy), similar(dummy),
-                                 Vector{T}(undef, N), Vector{T}(undef, N), similar(dummy))
+                                 input, similar(dummy), conv, (N,), similar(dummy), pw)
 end
 ScatteringTransform1D(N::Int, J::Int; kwargs...) = ScatteringTransform1D(Float64, N, J; kwargs...)
 
 # Shares filter bank / tree / groups; copies only the buffers and the plan's scratch.
-ScatteringCore.task_workspace(st::ScatteringTransform1D) =
-    ScatteringTransform1D(st.filter_bank, st.tree, st.groups, st.max_order,
-                          Plans.task_local_plan(st.plan),
-                          similar(st.buffer_input), similar(st.buffer_signal_fft),
-                          similar(st.buffer_conv), similar(st.buffer_mod),
-                          similar(st.buffer_u1), similar(st.buffer_u1_fft))
+function ScatteringCore.task_workspace(st::ScatteringTransform1D)
+    input = similar(st.buffer_input)
+    conv = st.buffer_conv === st.buffer_input ? input : similar(st.buffer_conv)
+    fb = FilterBanks.task_bank(st.filter_bank)
+    return ScatteringTransform1D(fb, st.tree, st.groups,
+                                 st.max_order, Plans.task_local_plan(st.plan),
+                                 input, similar(st.buffer_signal_fft), conv,
+                                 st.dims, similar(st.buffer_u1_fft), Cascade.task_copy(st.pw, fb))
+end
 
 """
     (st::ScatteringTransform1D)(signal) -> ScatteringCoefficients1D
@@ -95,8 +106,8 @@ Apply scattering transform to 1D signal.
 Returns type-stable ScatteringCoefficients1D with element type matching input.
 """
 function (st::ScatteringTransform1D)(signal::AbstractVector)
-    num_w = length(st.filter_bank.wavelets)
-    T = eltype(st.buffer_mod)
+    num_w = FilterBanks.nwavelets(st.filter_bank)
+    T = real(eltype(st.buffer_input))
     
     # Pre-allocate coefficient storage
     coeffs = Coefficients.ScatteringCoefficients1D(num_w, T; compute_S2=st.max_order >= 2)
@@ -154,22 +165,27 @@ child skip the modulus buffer entirely, reducing to a single fused `⟨|·|⟩`.
 
 `signal_fft` is read only, so the caller's preserved signal spectrum survives the call.
 """
-function cascade!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform1D,
-                  signal_fft::AbstractVector)
+cascade!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform1D,
+         signal_fft::AbstractVector) =
+    Cascade.cascade!(S1, S2, st.pw, st.filter_bank, st.groups, signal_fft)
+
+# The undecimated form, kept as the oracle the periodized cascade is pinned against.
+function _cascade_full!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform1D,
+                        signal_fft::AbstractVector)
     isempty(S2) || fill!(S2, zero(eltype(S2)))
-    wavelets = st.filter_bank.wavelets
+    fb = st.filter_bank
     @inbounds for (j1, children, _) in st.groups
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, signal_fft, wavelets[j1],
+        ScatteringCore.wavelet_convolve!(st.buffer_conv, signal_fft, FilterBanks.filter_at(fb, j1),
                                          st.plan, st.buffer_input)
         if isempty(children)
             S1[j1] = ScatteringCore.modulus_mean(st.buffer_conv)
             continue
         end
-        S1[j1] = ScatteringCore.modulus_mean!(st.buffer_u1, st.buffer_conv)
-        st.buffer_input .= complex.(st.buffer_u1)
+        # Modulus written straight into the transform's input, not via a real buffer and a widen.
+        S1[j1] = ScatteringCore.modulus_mean!(st.buffer_input, st.buffer_conv)
         Plans.forward_transform!(st.buffer_u1_fft, st.plan, st.buffer_input)
         for j2 in children
-            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_u1_fft, wavelets[j2],
+            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_u1_fft, FilterBanks.filter_at(fb, j2),
                                              st.plan, st.buffer_input)
             S2[j1, j2] = ScatteringCore.modulus_mean(st.buffer_conv)
         end
@@ -191,66 +207,28 @@ function _default_subsample(N::Int, J::Int)
     return ds
 end
 
-# Low-pass a real field `U` (length N) by φ_J and decimate by `ds` into `dst` (length N÷ds).
-# Reuses `buffer_input`/`buffer_conv`; does NOT touch `buffer_signal_fft` (the preserved x FFT).
-@inline function _lowpass_downsample!(dst, st::ScatteringTransform1D, U::AbstractVector, ds::Int)
-    φ = st.filter_bank.averaging
-    st.buffer_input .= complex.(U)
-    Plans.forward_transform!(st.buffer_conv, st.plan, st.buffer_input)     # U_fft -> buffer_conv
-    st.buffer_conv .*= φ
-    Plans.inverse_transform!(st.buffer_input, st.plan, st.buffer_conv)     # (U ⋆ φ) -> buffer_input
-    # Decimate by ds via a strided view + broadcast (CPU + GPU compatible).
-    @views dst .= real.(st.buffer_input[1:ds:(1 + (length(dst) - 1) * ds)])
-    return dst
-end
-
 function ScatteringFields.scattering_field(st::ScatteringTransform1D, signal::AbstractVector;
-        subsample::Int = _default_subsample(length(st.buffer_mod), st.filter_bank.J))
-    N = length(st.buffer_mod)
+        subsample::Int = _default_subsample(st.dims[1], st.filter_bank.J))
+    N = st.dims[1]
     N % subsample == 0 ||
         throw(ArgumentError("subsample factor $subsample must divide signal length $N"))
-    T = eltype(st.buffer_mod)
+    # Real unless the input is complex, in which case the order-0 field is too.
+    T = promote_type(real(eltype(st.buffer_input)), eltype(signal))
     M = N ÷ subsample
     npath = PathGraph.npaths(st.tree)
     data = zeros(T, M, npath)   # zero-filled: unsupported higher-order paths stay 0, not garbage
-    field = ScatteringFields.ScatteringField1D(st.tree, data, subsample)
+    field = ScatteringFields.ScatteringField1D(st.tree, data, subsample,
+                                               Cascade.field_workspace(st, subsample))
     return ScatteringFields.scattering_field!(field, st, signal)
 end
 
 function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringField1D,
         st::ScatteringTransform1D, signal::AbstractVector)
-    tree = st.tree
-    ds = field.subsample
-    data = field.data
-
-    # x FFT (preserved across passes in buffer_signal_fft)
     st.buffer_input .= complex.(signal)
     Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
-
-    # order 0 (root): (x ⋆ φ_J) ↓
-    copyto!(st.buffer_mod, signal)
-    root = first(PathGraph.order_range(tree, 0))
-    _lowpass_downsample!(view(data, :, root), st, st.buffer_mod, ds)
-
-    # Orders 1 and 2 in one grouped pass, as in `cascade!`: the first-order field of each `j1` is
-    # computed once, low-passed into its own column, then transformed once and reused by every child.
-    p1_first = first(PathGraph.order_range(tree, 1))
-    wavelets = st.filter_bank.wavelets
-    @inbounds for (j1, children, pathids) in st.groups
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_signal_fft, wavelets[j1],
-            st.plan, st.buffer_input)
-        ScatteringCore.apply_modulus!(st.buffer_u1, st.buffer_conv)
-        _lowpass_downsample!(view(data, :, p1_first + j1 - 1), st, st.buffer_u1, ds)
-        isempty(children) && continue
-        st.buffer_input .= complex.(st.buffer_u1)
-        Plans.forward_transform!(st.buffer_u1_fft, st.plan, st.buffer_input)
-        for (j2, p) in zip(children, pathids)
-            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_u1_fft, wavelets[j2],
-                st.plan, st.buffer_input)
-            ScatteringCore.apply_modulus!(st.buffer_mod, st.buffer_conv)
-            _lowpass_downsample!(view(data, :, p), st, st.buffer_mod, ds)
-        end
-    end
+    Cascade.field_cascade!(field.data, field.ws, st.filter_bank, st.groups, st.buffer_signal_fft,
+                           first(PathGraph.order_range(st.tree, 0)),
+                           first(PathGraph.order_range(st.tree, 1)))
     return field
 end
 
@@ -262,37 +240,7 @@ end
 # ============================================================================
 
 function ScatteringCore.scattering(st::ScatteringTransform1D, signal::AbstractVector)
-    plan = st.plan
-    fb = st.filter_bank
-    tree = st.tree
-    n = length(fb.wavelets)
-
-    Xf = Plans.forward_transform(plan, complex.(signal))
-    # First-order moduli |x ⋆ ψ_j| and their means S1[j].
-    U1 = map(ψ -> abs.(Plans.inverse_transform(plan, Xf .* ψ)), fb.wavelets)
-    S1 = map(u -> sum(u) / length(u), U1)
-    S0 = sum(signal) / length(signal)
-
-    if st.max_order >= 2 && length(tree.by_order) >= 3
-        U1f = map(u -> Plans.forward_transform(plan, complex.(u)), U1)
-        r2 = PathGraph.order_range(tree, 2)
-        s2vals = map(collect(r2)) do p
-            idx = PathGraph.path_indices(tree, p)
-            m = abs.(Plans.inverse_transform(plan, U1f[idx[1]] .* fb.wavelets[idx[2]]))
-            sum(m) / length(m)
-        end
-        # Route path-aligned values into the dense (j1,j2) S2 matrix. `pos` is plain-integer
-        # bookkeeping (outside the differentiable path); the comprehension just reads s2vals.
-        pos = zeros(Int, n, n)
-        for (k, p) in enumerate(r2)
-            idx = PathGraph.path_indices(tree, p)
-            pos[idx[1], idx[2]] = k
-        end
-        Tc = eltype(s2vals)
-        S2 = [pos[j1, j2] == 0 ? zero(Tc) : s2vals[pos[j1, j2]] for j1 in 1:n, j2 in 1:n]
-    else
-        S2 = Matrix{eltype(S1)}(undef, 0, 0)
-    end
+    S0, S1, S2 = Cascade.scattering_values(st, signal)
     return Coefficients.ScatteringCoefficients1D(S1, S2; S0=S0)
 end
 
