@@ -1,55 +1,12 @@
-# Plan construction from concurrent tasks. Every fast backend here plans through one process-global
-# FFTW planner, and the two spherical backends additionally pin FastTransforms' process-global OpenMP
-# thread count — so what is gated below is the guards over that shared state, not any transform's
-# numerics. A build racing another library's build faults inside the planner; a thread-count pin
-# restored per section instead of across their union un-pins OpenMP underneath a section still
-# running, which corrupts results and segfaults a spherical build.
+# Plan construction and transforms from concurrent tasks. Every fast backend here plans through one
+# process-global FFTW planner, which `Plans.PLANNER_LOCK` guards; FastTransforms' OpenMP thread count is
+# set and restored per call on the OS thread making it. A build racing another library's build faults
+# inside the planner.
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using NUFSHT: NUFSHT
 using OhMyThreads: OhMyThreads
 
 Test.@testset "Concurrent plan construction" begin
-    SC = ScatteringTransforms.SphericalCore
-
-    Test.@testset "the FastTransforms thread-count pin is reference counted" begin
-        # Stand-in accessors: the mechanism is what is under test, so it runs against a plain `Ref`
-        # rather than perturbing the real library mid-suite.
-        count = Ref(4)
-        getn() = count[]
-        setn!(n) = (count[] = Int(n))
-
-        SC.with_serial_ft(getn, setn!) do
-            Test.@test count[] == 1
-            SC.with_serial_ft(getn, setn!) do        # nested: no second read, no early restore
-                Test.@test count[] == 1
-            end
-            Test.@test count[] == 1
-        end
-        Test.@test count[] == 4
-
-        # Overlapping sections, sequenced deterministically: B enters and leaves entirely inside A's
-        # section, so B's exit must leave the pin in place and A must still observe it afterwards.
-        a_entered, b_done = Base.Event(), Base.Event()
-        ta = Threads.@spawn SC.with_serial_ft(getn, setn!) do
-            notify(a_entered)
-            wait(b_done)
-            return count[]
-        end
-        wait(a_entered)
-        SC.with_serial_ft(() -> nothing, getn, setn!)
-        after_b = count[]
-        notify(b_done)
-        Test.@test fetch(ta) == 1
-        Test.@test after_b == 1
-        Test.@test count[] == 4
-
-        # A throwing section releases its reference, so one failure cannot leave the process pinned.
-        Test.@test_throws ErrorException SC.with_serial_ft(getn, setn!) do
-            error("boom")
-        end
-        Test.@test count[] == 4
-    end
-
     Test.@testset "concurrent scattered-sphere builds match serial ones" begin
         lmax, J, M, ntask = 8, 2, 400, 4
         gr = (sqrt(5) - 1) / 2
@@ -73,8 +30,7 @@ Test.@testset "Concurrent plan construction" begin
             Test.@test concurrent[t].S1 ≈ serial[t].S1
             Test.@test concurrent[t].S2 ≈ serial[t].S2
         end
-        # And the pin is released rather than leaked: per-section restores leave this at 1 as soon as
-        # two sections overlap, silently single-threading FastTransforms for the rest of the process.
+        # And the calling thread's FastTransforms count is left as it was found.
         Test.@test ft_count() == before
     end
 

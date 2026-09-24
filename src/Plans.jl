@@ -661,8 +661,8 @@ inside spawned tasks — and a build racing a build of a *different* library was
 in `fftw_mkapiplan`.
 
 Only construction takes this lock; transforms are never serialised, so a plan per task still executes
-in parallel. FastTransforms additionally needs its OpenMP thread count pinned across construction
-*and* execution — see `SphericalCore.with_serial_ft`.
+in parallel. FastTransforms' OpenMP thread count is set per call by
+`FlowTransformBindings.with_fasttransforms_threads`.
 """
 const PLANNER_LOCK = ReentrantLock()
 

@@ -228,59 +228,6 @@ instead of silently re-resolving to whatever that process happens to have loaded
 """
 plan_nufft(::Any) = SB.AutoSpectralBackend()
 
-
-# ---------------------------------------------------------------------------
-# FastTransforms' OpenMP thread count.
-#
-# Both fast spherical backends drive FastTransforms, so its thread count is one process global for
-# the pair of them and the guard over it lives here rather than once per extension: two extensions
-# each reading "the previous value" and restoring it independently would race on one global, which is
-# the same defect as having no guard at all. The FFTW planner they also share is guarded by
-# `Plans.PLANNER_LOCK`, which spans the planar backends too.
-# ---------------------------------------------------------------------------
-
-# Depth, not a flag: `with_serial_ft` sections from different tasks overlap freely, and the count
-# must stay pinned across their union.
-const _FT_THREAD_LOCK = ReentrantLock()
-const _FT_THREAD_DEPTH = Ref(0)
-const _FT_THREAD_PREV = Ref(0)
-
-"""
-    with_serial_ft(f, ft_nthreads, ft_nthreads!)
-
-Run `f()` with FastTransforms pinned to a single thread, reading the current thread count with
-`ft_nthreads()` and setting it with `ft_nthreads!(n)` (each backend passes its own accessors, since
-the symbols live in its own dependency).
-
-The pin is a correctness requirement rather than a tuning choice. FastTransforms runs its butterfly
-and sphere transforms inside OpenMP parallel regions, and entering one from a non-root Julia task
-silently corrupts the result — and, during plan construction, segfaults. Pinned to one thread it
-takes its serial code path instead.
-
-Reference counted, because the thread count is a process global: the first section entered records
-the previous value and sets one, and only the last section out restores it. Setting and restoring per
-section would let one section's restore re-enable OpenMP underneath another section still running in
-a different task — exactly the corruption the pin exists to prevent — and would leak a "previous"
-value of 1 whenever two sections overlapped.
-"""
-function with_serial_ft(f, ft_nthreads, ft_nthreads!)
-    Base.@lock _FT_THREAD_LOCK begin
-        if _FT_THREAD_DEPTH[] == 0
-            _FT_THREAD_PREV[] = Int(ft_nthreads())
-            ft_nthreads!(1)
-        end
-        _FT_THREAD_DEPTH[] += 1
-    end
-    try
-        return f()
-    finally
-        Base.@lock _FT_THREAD_LOCK begin
-            _FT_THREAD_DEPTH[] -= 1
-            _FT_THREAD_DEPTH[] == 0 && ft_nthreads!(_FT_THREAD_PREV[])
-        end
-    end
-end
-
 # ---------------------------------------------------------------------------
 # Dyadic difference-of-Gaussians band-pass bank (pure math).
 # ---------------------------------------------------------------------------

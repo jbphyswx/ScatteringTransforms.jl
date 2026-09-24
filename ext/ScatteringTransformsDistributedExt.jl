@@ -13,6 +13,7 @@ ScatteringTransforms`) to enable.
 
 using Distributed: Distributed
 using ComputationalBackends: ComputationalBackends as CB
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ScatteringTransforms: ScatteringTransforms as ST
 
 # Partition 1:n into ≤ k contiguous column ranges.
@@ -29,6 +30,11 @@ end
 _chunk(spec, inner, slicer, X, cols) =
     ST.scattering_batch(inner, ST.rebuild_transform(spec), slicer(X, cols))
 
+# On a worker the processes carry the parallelism, so FastTransforms runs on one OpenMP thread there.
+_remote_chunk(spec, inner, slicer, X, cols) =
+    Base.ScopedValues.with(() -> _chunk(spec, inner, slicer, X, cols),
+                           FTB.FASTTRANSFORMS_THREADS => 1)
+
 # One chunk per worker, deliberately: `_chunk` rebuilds the transform — filter bank and
 # spectral plan — on the worker for every chunk it receives. Splitting finer would let `pmap`
 # rebalance around a straggler, but would pay that rebuild once per chunk instead of once per
@@ -42,7 +48,7 @@ function _distributed_batch(b::CB.AbstractDistributedBackend, st, X, slicer)
     # back to this process, paying a serialise and a full transform rebuild to do so.
     parts = Distributed.nworkers() == 1 ?
         [_chunk(spec, inner, slicer, X, cols) for cols in chunks] :
-        Distributed.pmap(cols -> _chunk(spec, inner, slicer, X, cols), chunks)
+        Distributed.pmap(cols -> _remote_chunk(spec, inner, slicer, X, cols), chunks)
     # Write the blocks into one preallocated output rather than growing through `reduce(hcat, …)`,
     # which reallocates and copies the whole result once per chunk.
     flen = size(first(parts), 1)

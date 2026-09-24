@@ -39,7 +39,11 @@ coeffs2d = st2d(image)
 """
 module ScatteringTransforms
 
-# Include core components (creates submodules). 
+# Loaded first, for its `__init__`: it selects the OpenMP runtime's thread-local mode before
+# FastTransforms loads that runtime; see `FlowTransformBindings.with_fasttransforms_threads`.
+using FlowTransformBindings: FlowTransformBindings
+
+# Include core components (creates submodules).
 include("Execution.jl")
 include("Plans.jl")
 include("Filters.jl")

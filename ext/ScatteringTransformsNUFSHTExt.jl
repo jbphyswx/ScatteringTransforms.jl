@@ -80,7 +80,7 @@ ST.SphericalCore.supports_batch(::NUSHTSphericalPlan) = true
 # from inside spawned tasks, one per batch chunk, and FFTW's planner is single-threaded.
 function ST.SphericalCore.batch_plan(p::NUSHTSphericalPlan, B::Integer)
     B == p.plan.B && return p
-    plan = Base.@lock ST.Plans.PLANNER_LOCK with_serial_ft() do
+    plan = Base.@lock ST.Plans.PLANNER_LOCK begin
         NUFSHT.make_plan(eltype(p.theta), p.theta, p.phi, p.lmax;
                          ntrans = Int(B), nufft = p.nufft, tol = p.plan.tol)
     end
@@ -106,7 +106,7 @@ ST.SphericalCore.plan_solver(p::NUSHTSphericalPlan) = (rtol = p.rtol, maxiter = 
 ST.Plans.spectral_backend(::NUSHTSphericalPlan) = SB.NUFSHTSpectralBackend()
 
 function ST.Plans.task_local_plan(p::NUSHTSphericalPlan)
-    plan = Base.@lock ST.Plans.PLANNER_LOCK with_serial_ft() do
+    plan = Base.@lock ST.Plans.PLANNER_LOCK begin
         # `ntrans` and the resolved backend must be carried over: rebuilding with the defaults would
         # give the task a single-field plan on whatever `Auto` happens to pick, silently changing both
         # the batch size the cascade feeds it and the transform driving it.
@@ -138,7 +138,7 @@ end
 NUFSHT.kernel_transfer(t::_FnTransfer, ℓ) = t.f(ℓ)
 
 function ST.SphericalCore.sphere_coeffs(plan::NUSHTSphericalPlan, field::AbstractVecOrMat)
-    return ST.SphericalCore.sphere_coeffs!(zero(plan.plan.C), plan, field)
+    return ST.SphericalCore.sphere_coeffs!(NUFSHT.allocate_coefficients(plan.plan), plan, field)
 end
 
 # Analysis is the band-limited least-squares solve; NUFSHT projects onto the valid `(l, m)` modes
@@ -148,32 +148,27 @@ end
 # transform costs the same setup either way, so a stack amortises it over `B` fields.
 function ST.SphericalCore.sphere_coeffs!(C, plan::NUSHTSphericalPlan, field::AbstractVecOrMat)
     fill!(C, zero(eltype(C)))
-    _, iters, rel = with_serial_ft() do
+    _, iters, rel, converged =
         NUFSHT.nusht_solve!(C, field, plan.plan; rtol = plan.rtol, maxiter = plan.maxiter)
-    end
-    # A solve that stops at `maxiter` has not merely fallen short of `rtol` — the iterate can have
-    # diverged, so `C` is unrelated to the field. The residual is the only thing that distinguishes
-    # the two, and it is discarded unless it is checked here.
-    rel <= plan.rtol || throw(ST.Plans.AnalysisNotConverged(
+    # A solve that stops short of `rtol` — at `maxiter`, or on LSMR's condition or termination tests
+    # — leaves coefficients the field does not determine.
+    converged || throw(ST.Plans.AnalysisNotConverged(
         Float64(rel), Float64(plan.rtol), iters, plan.maxiter,
         "ntrans = $(plan.plan.B). The sampling may not resolve the band limit — accurate analysis " *
         "needs roughly M ≳ (lmax+1)² well-distributed points — or `maxiter` may be too small."))
     return C
 end
 
-# The caller's own coefficient array — `sphere_coeffs!` clears it and solves into it — so it is
-# allocated here, unlike the wrapped plan's filter scratch, which the plan allocates on first use.
-# `F` gives the coefficient shape and array type without touching that scratch.
-ST.SphericalCore.sphere_coeffs_buffer(plan::NUSHTSphericalPlan) = zero(plan.plan.F)
+# The caller's own coefficient array, which `sphere_coeffs!` clears and solves into.
+ST.SphericalCore.sphere_coeffs_buffer(plan::NUSHTSphericalPlan) =
+    NUFSHT.allocate_coefficients(plan.plan)
 
 # Apply the per-degree multiplier `h(ℓ)` to a copy of the coefficients and synthesise at the points.
 # `nusht_synthesize!` is the wrapped plan's own filter-then-synthesise step: it copies into scratch it
 # owns and allocates on first use, so `C` survives for the next band and repeated bands allocate
 # nothing — which is exactly what a cascade filtering one field at many scales needs.
 ST.SphericalCore.sphere_apply!(out::AbstractVecOrMat, plan::NUSHTSphericalPlan, C, h) =
-    with_serial_ft() do
-        NUFSHT.nusht_synthesize!(out, C, _FnTransfer(h), plan.plan)
-    end
+    NUFSHT.nusht_synthesize!(out, C, _FnTransfer(h), plan.plan)
 
 # Unweighted sample mean over the (quasi-uniform) scattered points ≈ the spherical average. An
 # `(M, B)` stack averages each field separately, so a batch gets one mean per column.
@@ -185,18 +180,6 @@ ST.SphericalCore.sphere_mean(plan::NUSHTSphericalPlan, field::AbstractMatrix) =
 # Fast-path plan constructor (scattered-sphere seam declared in SphericalCore). The core
 # `spherical_scattering` / `spherical_monogenic_scattering` build this when `spectral` selects NUFSHT.
 # ---------------------------------------------------------------------------
-
-# `ft_set_num_threads` has no getter, but it forwards to OpenMP and `omp_get_max_threads` tracks it,
-# so the count can be restored rather than left mutated behind the caller's back. That symbol is
-# reached through `libfasttransforms`, which links OpenMP and re-exports it, rather than through
-# `libomp` by name: the bare name resolves on macOS but not on a stock Linux runner, whereas the JLL
-# gives a real path on every platform.
-_ft_nthreads() = ccall((:omp_get_max_threads, NUFSHT.FastTransforms.libfasttransforms), Cint, ())
-_ft_nthreads!(n) = NUFSHT.FastTransforms.ft_set_num_threads(n)
-
-# The pin itself is reference counted in core, shared with the structured backend, because the thread
-# count it guards is one process global for both — see `SphericalCore.with_serial_ft`.
-with_serial_ft(f) = ST.SphericalCore.with_serial_ft(f, _ft_nthreads, _ft_nthreads!)
 
 """
     nusht_spherical_plan(θ, φ, lmax, T; rtol, maxiter, ntrans = 1, spin = false)
@@ -230,7 +213,7 @@ function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_ph
     # which plans through the same libfftw3, so two builds racing fault inside the FFTW planner —
     # observed as a segfault in `fftw_mkapiplan` under `ft_plan_sph_synthesis` when independent point
     # sets were planned from concurrent tasks.
-    plan = Base.@lock ST.Plans.PLANNER_LOCK with_serial_ft() do
+    plan = Base.@lock ST.Plans.PLANNER_LOCK begin
         NUFSHT.make_plan(T, θ, φ, lmax; ntrans = ntrans, nufft = nb)
     end
     # NUFSHT's positional argument is the *field* element type, not the precision: a real one selects

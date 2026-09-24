@@ -22,6 +22,7 @@ again while `nthreads` tasks are already in flight.
 using OhMyThreads: OhMyThreads as OMT
 using LinearAlgebra: LinearAlgebra
 using ComputationalBackends: ComputationalBackends as CB
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ScatteringTransforms: ScatteringTransforms as ST
 
 """
@@ -43,6 +44,9 @@ function with_serial_blas(f)
         LinearAlgebra.BLAS.set_num_threads(prev)
     end
 end
+
+# The spherical farms: BLAS on one thread, and FastTransforms on one OpenMP thread inside the tasks.
+_spherical_farm(f) = Base.ScopedValues.with(() -> with_serial_blas(f), FTB.FASTTRANSFORMS_THREADS => 1)
 
 # ---------------------------------------------------------------------------
 # Batch axis
@@ -225,7 +229,7 @@ for (TT, WS, fun) in (
                                                  st::ST.SphericalCore.$TT{T},
                                                  X::AbstractArray) where {T}
         D = ndims(X)
-        with_serial_blas() do
+        _spherical_farm() do
             OMT.@tasks for b in 1:size(X, D)
                 # One task-local bundle, not four `@local` bindings: the workspace is built *from*
                 # the task's own transform, and separate bindings cannot refer to one another. The
@@ -272,7 +276,7 @@ function ST.scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
     # on from.
     plans = [ST.SphericalCore.task_local_batch_plan(st.plan, length(cols)) for cols in chunks]
     try
-        with_serial_blas() do
+        _spherical_farm() do
             OMT.@tasks for i in eachindex(chunks)
                 cols = chunks[i]
                 k = length(cols)

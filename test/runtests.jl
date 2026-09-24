@@ -34,7 +34,9 @@ Test.@testset "Explicit imports (no implicit / no stale)" begin
     # Checks the core module and every loaded backend extension (skipped if the weakdep
     # isn't loaded in the test environment).
     Test.@test (EI.check_no_implicit_imports(ScatteringTransforms); true)
-    Test.@test (EI.check_no_stale_explicit_imports(ScatteringTransforms); true)
+    # The core imports FlowTransformBindings only so its `__init__` runs before FastTransforms loads.
+    Test.@test (EI.check_no_stale_explicit_imports(ScatteringTransforms;
+                                                  ignore = (:FlowTransformBindings,)); true)
     for extname in (
         :ScatteringTransformsCairoMakieExt,
         :ScatteringTransformsDifferentiationInterfaceExt,

@@ -17,6 +17,7 @@ per transform.
 """
 
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
+using FlowTransformBindings: FlowTransformBindings as FTB
 using LinearAlgebra: LinearAlgebra
 using SpectralBackends: SpectralBackends as SB
 using ScatteringTransforms: ScatteringTransforms as ST
@@ -51,23 +52,13 @@ end
 # tasks. That lock is shared with the scattered-point backend because the planner they contend for is
 # one process global.
 
-# `ft_set_num_threads` has no getter, but it forwards to OpenMP and `omp_get_max_threads` tracks it,
-# so the count can be restored rather than left mutated behind the caller's back. That symbol is
-# reached through `libfasttransforms`, which links OpenMP and re-exports it, rather than through
-# `libomp` by name: the bare name resolves on macOS but not on a stock Linux runner, whereas the JLL
-# gives a real path on every platform.
-_ft_nthreads() = ccall((:omp_get_max_threads, FSH.FastTransforms.libfasttransforms), Cint, ())
-_ft_nthreads!(n) = FSH.FastTransforms.ft_set_num_threads(n)
-
-# The pin itself is reference counted in core, shared with the scattered-point backend, because the
-# thread count it guards is one process global for both — see `SphericalCore.with_serial_ft`.
-with_serial_ft(f) = ST.SphericalCore.with_serial_ft(f, _ft_nthreads, _ft_nthreads!)
-
+# Every FastTransforms call goes through `FTB.with_fasttransforms_threads`, which sets the OpenMP count
+# on the OS thread making the call and restores it after.
 function _warmed_cache(nθ::Int, nφ::Int)
     cache = FSH.SphPlanCache{Float64}()
     scratch = zeros(Float64, nθ, nφ)
     Base.@lock ST.Plans.PLANNER_LOCK begin
-        with_serial_ft() do
+        FTB.with_fasttransforms_threads() do
             FSH.sph_transform!(scratch; cache = cache)
             FSH.sph_evaluate!(scratch; cache = cache)
         end
@@ -121,7 +112,7 @@ end
 function ST.SphericalCore.sphere_coeffs!(C::AbstractMatrix, plan::SHTSphericalPlan,
                                          field::AbstractMatrix)
     copyto!(C, field)
-    with_serial_ft(() -> FSH.sph_transform!(C; cache = plan.cache))
+    FTB.with_fasttransforms_threads(() -> FSH.sph_transform!(C; cache = plan.cache))
     return C
 end
 
@@ -152,7 +143,7 @@ function ST.SphericalCore.sphere_apply!(out::AbstractMatrix, plan::SHTSphericalP
     C2 = plan.cbuf
     copyto!(C2, C)
     _apply_degree_multiplier!(C2, h)
-    with_serial_ft(() -> FSH.sph_evaluate!(C2; cache = plan.cache))
+    FTB.with_fasttransforms_threads(() -> FSH.sph_evaluate!(C2; cache = plan.cache))
     copyto!(out, C2)
     return out
 end
