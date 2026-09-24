@@ -188,8 +188,13 @@ ST.Plans.task_local_plan(p::NUFFTScatteringPlan{T}) where {T} =
 
 ST.Plans.batch_width(p::NUFFTScatteringPlan) = p.B
 
+# Destroying a guru plan destroys its FFTW plans, which may not overlap a plan build.
 ST.Plans.close_plan!(p::NUFFTScatteringPlan) =
-    (ST.Plans.nufft_guru_destroy!(p.guru1); ST.Plans.nufft_guru_destroy!(p.guru2); nothing)
+    Base.@lock ST.Plans.PLANNER_LOCK begin
+        ST.Plans.nufft_guru_destroy!(p.guru1)
+        ST.Plans.nufft_guru_destroy!(p.guru2)
+        nothing
+    end
 
 # Fast-path plan constructor filled into the core `ST.Plans.finufft_scattered_plan` declaration; the core
 # `scattered_planar_scattering` cascade builds it when `spectral` selects the FINUFFT backend.

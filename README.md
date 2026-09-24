@@ -25,7 +25,7 @@ Fast, generic wavelet scattering transforms in Julia.
   `AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`).
 - **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
   monogenic amplitude + continuous orientation/phase (`monogenic_components`); on S²,
-  `spherical_monogenic_scattering` (amplitude via the spin-0 Bochner identity) plus
+  `spherical_monogenic_scattering` (amplitude from the exact surface-gradient energy) plus
   `spherical_monogenic_components` for pointwise orientation/phase (spin-1 Riesz vector, dependency-free
   via the surface gradient, or NUFSHT's spin-weighted synthesis when loaded).
 - **Grid-support matrix**: Cartesian × spherical, on uniform/structured and nonuniform/scattered
@@ -100,9 +100,10 @@ power spectra (and first-order `S₁`) are the same.
 
 ## Visualizations
 
-### Filter bank — a tight frame
-1D Morlet filter bank in the frequency domain. The Littlewood–Paley sum `|φ|² + Σⱼ|ψⱼ|²` is
-flat at **1** (a tight frame ⇒ the transform is non-expansive — no frequency is amplified).
+### Filter bank and its Littlewood–Paley sum
+1D Morlet filter bank in the frequency domain. For a real field the Littlewood–Paley sum
+`A(ω) = |φ̂|² + ½Σⱼ(|ψ̂ⱼ(ω)|² + |ψ̂ⱼ(−ω)|²)` lies in `(0, 1]`, so the wavelet layer amplifies no
+frequency and is invertible (Andén & Mallat 2014).
 
 ![Morlet Filter Bank](docs/src/assets/filter_bank.png)
 
@@ -164,9 +165,9 @@ via the fast SHT in FastSphericalHarmonics) give matching multi-scale coefficien
 ![Spherical scattering](docs/src/assets/spherical_scattering.png)
 ![Structured spherical scattering](docs/src/assets/structured_spherical.png)
 
-The monogenic *amplitude* computes the spin-1 Riesz energy from spin-0 transforms via a Bochner
-identity (no spin-1 synthesis needed); pointwise orientation/phase (`spherical_monogenic_components`)
-synthesizes the actual spin-1 Riesz tangent vector on S².
+The monogenic *amplitude* takes the spin-1 Riesz energy `|∇_S g|²` from three scalar syntheses of
+`g`'s coefficients, exact at the band limit; pointwise orientation/phase
+(`spherical_monogenic_components`) synthesizes the spin-1 Riesz tangent vector on S².
 
 ![Spherical monogenic components](docs/src/assets/spherical_monogenic.png)
 

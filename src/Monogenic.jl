@@ -6,10 +6,8 @@ module Monogenic
 The monogenic signal is the natural higher-dimensional generalization of the analytic signal: it
 pairs an **isotropic** band-pass field with its **Riesz transform** components and recovers a
 local *amplitude*, *phase*, and *orientation* at every point (Felsberg & Sommer 2001; Unser et
-al. 2009). Where the oriented-Morlet scattering transform fixes a discrete set of orientations
-and takes the analytic modulus, monogenic scattering uses a single rotation-covariant
-nonlinearity — the **monogenic amplitude** — so orientation is recovered continuously rather than
-quantized.
+al. 2009). Its one rotation-covariant nonlinearity, the **monogenic amplitude**, recovers
+orientation continuously.
 
 For a real field `x`, an isotropic band-pass `ψ_j` (radial in frequency, real and zero-mean), and
 the Riesz multipliers `R_d(k) = -i k_d/|k|` (`d = 1…D`):
@@ -19,9 +17,8 @@ the Riesz multipliers `R_d(k) = -i k_d/|k|` (`d = 1…D`):
 - **monogenic amplitude** `A_j = √(m₀² + Σ_d m_d²)`   — the rotation-covariant envelope.
 
 `A_j` plays the role the analytic modulus `|x ⋆ ψ_λ|` plays in ordinary scattering, and the
-transform cascades it exactly as before (path graph = strictly increasing scale). The isotropic
-bank is a tight frame (`Σ_j |ψ̂_j|² + |φ̂|² ≡ 1`), and the Riesz multipliers satisfy the
-partition `Σ_d |R_d(k)|² = 1` off-DC, so no frequency is amplified.
+cascade runs over the same path graph (strictly increasing scale). The bank's Littlewood–Paley sum
+`|φ̂|² + Σ_j |ψ̂_j|² (1 + Σ_d |R_d|²)` is at most 1, so no frequency is amplified.
 """
 
 using ..Filters: Filters
@@ -64,9 +61,10 @@ end
 """
     riesz_multipliers(dims, ::Type{T}=Float64) -> NTuple{D, Array{Complex{T},D}}
 
-The `D` Riesz-transform frequency multipliers `R_d(k) = -i k_d/|k|` (with `R_d(0)=0`) over a grid
-of size `dims`. Scale-free (a ratio of frequencies), so one set serves every wavelet scale. They
-satisfy `Σ_d |R_d(k)|² = 1` off the DC bin.
+The `D` Riesz-transform frequency multipliers `R_d(k) = -i k_d/|k|` over a grid of size `dims`, with
+`R_d(0) = 0`. On an even axis `d` the Nyquist bin holds `k_d = ±½` at once, and there `R_d` is the
+mean of its two values, `0`, so a real field's Riesz components are real. Scale-free, so one set
+serves every wavelet scale; `Σ_d |R_d(k)|² = 1` off the DC bin and the Nyquist planes.
 """
 function riesz_multipliers(dims::NTuple{D,Int}, ::Type{T}=Float64) where {D,T}
     R = ntuple(_ -> Array{Complex{T},D}(undef, dims), D)
@@ -78,7 +76,8 @@ function riesz_multipliers(dims::NTuple{D,Int}, ::Type{T}=Float64) where {D,T}
         end
         kn = sqrt(kk)
         for d in 1:D
-            R[d][I] = kn == zero(T) ? zero(Complex{T}) : Complex{T}(zero(T), -ks[d] / kn)
+            nyq = iseven(dims[d]) && I[d] - 1 == dims[d] ÷ 2
+            R[d][I] = kn == zero(T) || nyq ? zero(Complex{T}) : Complex{T}(zero(T), -ks[d] / kn)
         end
     end
     return R
@@ -88,8 +87,7 @@ end
     MonogenicFilterBank{D,T,A,W,R,MV}
 
 Isotropic band-pass wavelets `wavelets` (one per scale/sub-octave), the `D` scale-free Riesz
-multipliers `riesz`, and the complementary low-pass `averaging`, forming a tight frame. Every
-container is a type parameter.
+multipliers `riesz`, and the Gaussian low-pass `averaging`. Every container is a type parameter.
 
 The wavelets and the low-pass are **real**: a radial band-pass is a real function of `|k|`. Only
 the Riesz multipliers `R_d(k) = -i k_d/|k|` are complex.
@@ -109,9 +107,12 @@ end
     build_monogenic_bank([T=Float64,] dims::NTuple{D,Int}, J; Q=1) -> MonogenicFilterBank
 
 Build a `D`-dimensional isotropic Morlet-style monogenic filter bank: `J` octaves × `Q`
-sub-octaves of radial band-pass wavelets (center frequency `ξ_j = ξ₀·2^{-j/Q}`, widths from the
-Lostanlen/Kymatio rule, reusing [`Filters.Morlet1D`](@ref) for the radial profile), the Riesz
-multipliers, and the tight-frame complementary low-pass.
+sub-octaves of radial band-pass wavelets whose radial profile is [`Filters.Morlet1D`](@ref)'s
+(center frequency `ξ_j = ξ₀·2^{-j/Q}`, width setting the crossing of adjacent wavelets at `r` of
+their peak), the Riesz multipliers, and [`Filters.gaussian_lowpass!`](@ref). The band-pass and its
+Riesz components carry `2|ψ̂_j|²` per frequency, so the wavelets are scaled by
+`c = lp_scale_1d(Q)/2`, which puts `2c² Σ_j g(|k|·2^{j/Q})²` (`g` the radial profile) at a maximum
+of 1 over the bank continued over every scale.
 """
 build_monogenic_bank(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
     build_monogenic_bank(Float64, dims, J; kwargs...)
@@ -128,11 +129,14 @@ function build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1) 
             push!(meta, FilterBanks.WaveletMeta{T}(j, q, 0, T(j + q / Q), m.center_freq, zero(T)))
         end
     end
-    ϕ = FilterBanks._tight_frame_lowpass!(wavelets)
+    c = _monogenic_scale(T, Q)
+    foreach(ψ -> ψ .*= c, wavelets)
     R = riesz_multipliers(dims, T)
     return MonogenicFilterBank{D,T,A,typeof(wavelets),typeof(R),typeof(meta)}(
-        wavelets, R, ϕ, meta, J, Q)
+        wavelets, R, Filters.gaussian_lowpass(T, dims, J), meta, J, Q)
 end
+
+_monogenic_scale(::Type{T}, Q::Int) where {T} = T(FilterBanks.lp_scale_1d(Q) / 2)
 
 """
     ComputedMonogenicFilterBank{D,T,A,R,MV}
@@ -185,19 +189,25 @@ function build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int, ::Val{fals
         push!(profiles, (m.center_freq, m.bandwidth))
         push!(meta, FilterBanks.WaveletMeta{T}(j, q, 0, T(j + q / Q), m.center_freq, zero(T)))
     end
-    scratch = Array{T,D}(undef, dims)
-    acc = zeros(T, dims)
-    for (ξ, σ) in profiles
-        _radial_bandpass!(scratch, ξ, σ)
-        @. acc += abs2(scratch)
-    end
-    mx = maximum(acc)
-    c = mx > zero(T) ? inv(sqrt(mx)) : one(T)
-    ϕ = Array{T,D}(undef, dims)
-    @. ϕ = sqrt(max(zero(T), one(T) - acc * c^2))
-    ϕ[firstindex(ϕ)] = one(T)
     R = riesz_multipliers(dims, T)
-    return ComputedMonogenicFilterBank(profiles, c, R, ϕ, scratch, meta, J, Q)
+    return ComputedMonogenicFilterBank(profiles, _monogenic_scale(T, Q), R,
+                                       Filters.gaussian_lowpass(T, dims, J),
+                                       Array{T,D}(undef, dims), meta, J, Q)
+end
+
+"""
+    littlewood_paley(fb::AnyMonogenicBank) -> A
+
+`A(k) = |φ̂(k)|² + Σ_j |ψ̂_j(k)|² (1 + Σ_d |R_d(k)|²)`, the energy the band-pass, Riesz and low-pass
+outputs of a real field carry per frequency.
+"""
+function FilterBanks.littlewood_paley(fb::AnyMonogenicBank)
+    S = zero(fb.averaging)
+    for j in 1:FilterBanks.nwavelets(fb)
+        S .+= abs2.(FilterBanks.filter_at(fb, j))
+    end
+    Rsum = sum(Rd -> abs2.(Rd), fb.riesz)
+    return abs2.(fb.averaging) .+ S .* (1 .+ Rsum)
 end
 
 """

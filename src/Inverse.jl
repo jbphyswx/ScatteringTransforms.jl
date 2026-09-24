@@ -4,24 +4,20 @@ module Inverse
     Inverse.jl — Reconstruction from scattering / wavelet representations
 
 The scattering transform has **no exact analytic inverse**: the modulus `|·|` discards the
-local phase of each wavelet coefficient. But three reconstruction levels exist, two of which are
-exact-or-iterative and need no autodiff (the third, gradient-descent synthesis from the
-scattering coefficients themselves, lives in the DifferentiationInterface extension):
+local phase of each wavelet coefficient. Two reconstructions need no autodiff (gradient-descent
+synthesis from the scattering coefficients lives in the DifferentiationInterface extension):
 
-1. **Exact linear wavelet-frame inverse** — from the *complex* (pre-modulus) wavelet
-   coefficients `x ⋆ ψ_λ` plus the low-pass `x ⋆ φ`. Because the bank is a tight frame
-   (`Σ_λ |ψ̂_λ|² + |φ̂|² ≡ 1`), the dual frame is the frame itself and reconstruction is the
-   conjugate-filter sum
-   `x̂ = Σ_λ (x ⋆ ψ_λ) ⋆ ψ_λ^* + (x ⋆ φ) ⋆ φ^*` — exact to machine precision.
-   [`wavelet_transform!`](@ref) / [`iwavelet!`](@ref).
+1. **Exact linear wavelet-frame inverse** from the *complex* (pre-modulus) wavelet coefficients
+   `W_λ = x ⋆ ψ_λ` and the low-pass `Y = x ⋆ φ`, by the canonical dual frame. For a real field
+   `x = Re F⁻¹[(φ̂·Ŷ + Σ_λ ψ̂_λ·Ŵ_λ) / A]`, with `A` the Littlewood–Paley sum
+   ([`FilterBanks.littlewood_paley`](@ref)). [`wavelet_transform!`](@ref) / [`iwavelet!`](@ref).
 
 2. **Phase retrieval** from first-order moduli `|x ⋆ ψ_λ|` (Waldspurger & Mallat 2015):
    alternating projections (Gerchberg–Saxton) — reconstruct via the exact inverse, re-impose the
    target magnitudes, repeat. Non-unique up to a global sign/phase. [`reconstruct_phase`](@ref).
 
-All routines here are AD-free. The `!` forms run entirely through the in-place plan primitives
-against a [`ReconstructionWorkspace`](@ref), which matters because phase retrieval calls them
-`iters` times: the allocating forms are convenience wrappers around them.
+The `!` forms run through the in-place plan primitives against a
+[`ReconstructionWorkspace`](@ref); the allocating forms wrap them.
 """
 
 using ..Plans: Plans
@@ -44,12 +40,9 @@ const GriddedScattering = Union{Scattering1D.ScatteringTransform1D,
     ReconstructionWorkspace(st)
 
 Scratch for the linear wavelet inverse and for phase retrieval: the complex wavelet coefficient
-fields (`nw` of them — that is the representation's own size), the low-pass field, and a spectrum
-accumulator.
-
-No conjugated filters are held. A Morlet's *Fourier* response is real — its analyticity is the
-half-plane support, not a complex value — so `conj(ψ̂_λ) = ψ̂_λ` and the dual frame filter is the
-filter itself. The bank is used directly.
+fields (`nw` of them), the low-pass field, a spectrum accumulator, and the bank's
+Littlewood–Paley sum `frame`. Every filter's Fourier response is real, so the dual filters are
+`ψ̂_λ/A` and `φ̂/A`.
 """
 struct ReconstructionWorkspace{CA, CV, RA}
     wavelet::CV            # (nw) complex coefficient fields
@@ -58,6 +51,7 @@ struct ReconstructionWorkspace{CA, CV, RA}
     Xrec::CA               # reconstruction accumulator
     buf::CA                # multiply / transform scratch
     field::RA              # real reconstructed field
+    frame::RA              # Littlewood–Paley sum `A`
 end
 
 function ReconstructionWorkspace(st::GriddedScattering)
@@ -65,10 +59,12 @@ function ReconstructionWorkspace(st::GriddedScattering)
     proto = fb.averaging
     T = eltype(proto)
     cplx() = similar(proto, Complex{T})
+    frame = similar(proto, T)
+    frame .= FilterBanks.littlewood_paley(fb)
     return ReconstructionWorkspace(
         [cplx() for _ in 1:FilterBanks.nwavelets(fb)], cplx(),
         cplx(), cplx(), cplx(),
-        similar(proto, T))
+        similar(proto, T), frame)
 end
 
 """
@@ -100,13 +96,10 @@ wavelet_transform(st::GriddedScattering, x::AbstractArray) =
     iwavelet(st, wt) -> x
     iwavelet!(ws, st, wavelet, lowpass) -> x
 
-Exact inverse of [`wavelet_transform!`](@ref) via the tight-frame conjugate-filter sum
-`x̂ = Σ_λ ψ̂_λ^* · (x̂·ψ̂_λ) + φ̂^* · (x̂·φ̂)`. Returns the reconstructed **real** field. With the
-tight-frame bank (`Σ|ψ̂_λ|²+|φ̂|² ≡ 1`) this satisfies `iwavelet(st, wavelet_transform(st, x)...) ≈ x`
-to machine precision.
-
-The accumulation is in place: the spectrum sum is built in one buffer rather than rebuilt per
-wavelet, which is what makes `iters` rounds of phase retrieval affordable.
+Inverse of [`wavelet_transform!`](@ref) for a real field by the canonical dual frame,
+`x = Re F⁻¹[(φ̂·Ŷ + Σ_λ ψ̂_λ·Ŵ_λ) / A]` with `A` the bank's Littlewood–Paley sum: the real part
+takes `C(k)` to `(C(k) + conj C(−k))/2`, which turns `C = (φ̂² + Σ_λ ψ̂_λ²)·x̂` into `A·x̂`. Returns
+the reconstructed **real** field; `iwavelet(st, wavelet_transform(st, x)) ≈ x` to rounding.
 """
 function iwavelet!(ws::ReconstructionWorkspace, st::GriddedScattering, wavelet, lowpass::AbstractArray)
     fb, plan = st.filter_bank, st.plan
@@ -118,6 +111,7 @@ function iwavelet!(ws::ReconstructionWorkspace, st::GriddedScattering, wavelet, 
         Plans.forward_transform!(ws.Xf, plan, ws.buf)
         ws.Xrec .+= ws.Xf .* FilterBanks.filter_at(fb, λ)
     end
+    ws.Xrec ./= ws.frame
     Plans.inverse_transform!(ws.buf, plan, ws.Xrec)
     ws.field .= real.(ws.buf)
     return ws.field

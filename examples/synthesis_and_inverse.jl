@@ -4,8 +4,8 @@
 Reconstruction from the scattering representation, the three levels the literature uses:
 
   1. **Exact linear wavelet-frame inverse** — `iwavelet ∘ wavelet_transform` recovers the field
-     to machine precision (the bank is a tight frame; no information is lost *before* the
-     modulus).
+     to machine precision through the canonical dual frame (the Littlewood–Paley sum is positive,
+     so no information is lost *before* the modulus).
   2. **Phase retrieval** — recover a field from the first-order moduli `|x ⋆ ψ_λ|` alone
      (Gerchberg–Saxton alternating projections); determined up to a global sign.
   3. **Gradient-descent synthesis** — from noise, descend `‖S(x̂) − S(x)‖²` so the *scattering

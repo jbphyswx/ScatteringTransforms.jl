@@ -29,10 +29,10 @@ where `p'` drops the last index `λ_k`. The package exposes two reductions of `U
   ```
   The spatial mean of `S_p x` equals `\bar S_p x`, so the two outputs are consistent and the tests
   enforce that exactly. Under `↓ s` this needs more of `φ_J` than `\hat\phi_J(0)=1` — see
-  [Low-passes: which output uses which, and why](@ref).
+  [The low-pass and decimation](@ref).
 
-The averaging (or `φ_J` low-pass) is what makes the descriptors invariant to translations; the
-localized field additionally inherits Mallat's stability to small diffeomorphisms.
+Averaging over the domain, or low-pass filtering by `φ_J`, makes the descriptors invariant to
+translations; the localized field is also stable to small diffeomorphisms (Mallat 2012).
 
 ## Admissible paths
 
@@ -52,40 +52,71 @@ In the Fourier domain, normalized frequency `ω ∈ [0, ½]`,
 \qquad \xi_j = \tfrac12 \, 2^{-j/Q},
 ```
 
-with the constant-`Q` bandwidth `σ_j = ξ_j (1-2^{-1/Q})/(1+2^{-1/Q})/\sqrt{2\ln(1/r)}`
-(Lostanlen/Kymatio), `Q` wavelets per octave. The second term enforces the zero-mean
-admissibility condition `\hat\psi_j(0)=0`. The filter is analytic (zero for `ω<0`).
+with the constant-`Q` bandwidth `σ_j = ξ_j (1-2^{-1/Q})/(1+2^{-1/Q})/\sqrt{2\ln(1/r)}`, which
+puts the crossing of adjacent wavelets at `r` of their peak, `Q` wavelets per octave. The second
+term enforces the zero-mean admissibility condition `\hat\psi_j(0)=0`. The filter is analytic (zero
+for `ω<0`).
 
 ### 2D oriented Morlet
 
-Oriented Morlet wavelets at scale `j` and orientation `θ = πℓ/L` (`ℓ = 0,…,L-1`), elliptical in
-the Fourier plane and analytic on the half-plane `k·\hat θ ≥ 0`.
+At scale `j` and orientation `θ = πℓ/L` (`ℓ = 0,…,L-1`), with angular wavenumber `k`,
+`k_∥ = k·\hat θ` and `k_⊥` the component across it:
 
-### Low-passes: which output uses which, and why
+```math
+\hat\psi(k) = e^{-((k_\parallel-k_0)^2\sigma_\parallel^2 + k_\perp^2\sigma_\perp^2)/2}
+            - \beta\, e^{-(k_\parallel^2\sigma_\parallel^2 + k_\perp^2\sigma_\perp^2)/2},
+\qquad \beta = e^{-(k_0\sigma_\parallel)^2/2},
+```
+
+for `k_∥ ≥ 0` and zero otherwise, with real-space widths `σ_∥ = 0.8·2^j`, `σ_⊥ = σ_∥ L/4` and
+`k_0 = 3π/(4·2^j)`. The envelope's angular standard deviation at `|k| = k_0` is `4/(L k_0σ_∥)`, a
+fixed fraction `0.68` of the orientation spacing `π/L`.
+
+### 3D oriented Morlet
+
+The same envelope about a unit direction `\hat n`, with `k_∥ = k·\hat n`, over `n_{orient}`
+directions spread on the sphere. With their spacing `Δθ = \sqrt{4π/n_{orient}}` in place of `π/L`,
+the 2D rule `σ_⊥ = σ_∥ π/(4Δθ)` gives `σ_⊥ = σ_∥\sqrt{π n_{orient}}/8`.
+
+### Littlewood–Paley normalization
+
+For a real field the wavelet layer `Wx = (x ⋆ φ_J,\ x ⋆ ψ_λ)_λ` satisfies
+
+```math
+\|Wx\|^2 = \frac1N \sum_k A(k)\,|\hat x(k)|^2,\qquad
+A(k) = |\hatφ_J(k)|^2 + \tfrac12 \sum_λ \big(|\hatψ_λ(k)|^2 + |\hatψ_λ(-k)|^2\big),
+```
+
+so `(1-α)\|x\|^2 ≤ \|Wx\|^2 ≤ \|x\|^2` when `1-α ≤ A ≤ 1` (Andén & Mallat 2014). Every wavelet is
+scaled by one constant `c` that puts the maximum of the wavelet part of `A` at 1 for the bank
+continued over every scale. That bank is self-similar, so its `A` is periodic in log-frequency (and
+in angle) and `c` depends on the wavelet design alone: `lp_scale_1d(Q)`, `lp_scale_2d(L)`,
+`lp_scale_3d(n_orient)`. A wavelet at scale `j` is then the same function in a bank of any depth
+`J`, and so is its coefficient.
+
+`littlewood_paley(fb)` returns `A` on the bank's grid. `\hatφ_J(0) = 1` and `\hatψ_λ(0) = 0` give
+`A(0) = 1`. `A` is smallest in the band between `φ_J` and the coarsest wavelet, and in 2D/3D at the
+corners of the frequency grid, past the finest wavelet.
+
+On an even axis the Nyquist bin holds `±½` at once. A wavelet's value there is the root mean square
+of its values at the two aliases, so `A` at that bin equals the continuous sum at `½`.
+
+### The low-pass and decimation
 
 The **coefficients** `\bar S_p x = ⟨U_p x⟩` contain no low-pass: the average is over the whole
-domain and the cascade multiplies wavelets only. Nor does decimation need one — the periodization
-identity below is exact for any spectrum. Two other filters exist, for two other jobs:
+domain. The **localized field** `S_p x = U_p x \star φ_J` is defined by its low-pass, the Gaussian
+`\hatφ_J(k) = e^{-|k|^2σ^2/2}` with `σ = σ_0 2^J`, `σ_0 = 0.8`
+([`ScatteringTransforms.Filters.gaussian_lowpass!`](@ref)), which is also every bank's `averaging`.
 
-- A bank's `averaging`, `\hatφ = \sqrt{\max(0,\,1-\sum_λ|\hatψ_λ|^2)}`, is the **tight-frame dual**:
-  it is what makes `\sum_λ|\hatψ_λ|^2+|\hatφ|^2 ≡ 1`, and hence what `iwavelet` inverts with. It is
-  not a low-pass — every `\hatψ_λ` is analytic, so the sum vanishes across the analytic complement
-  and `\hatφ ≡ 1` there.
-- The **localized field** `S_p x = U_p x \star φ_J` is *defined* by its low-pass; `φ_J` is the
-  operator, not an accuracy device, and the coefficient is its whole-domain-window limit.
-
-Subsampling that field by `s` then forces one condition. Since
+Subsampling that field by `s` forces one condition. Since
 
 ```math
 \langle S_p x\rangle = \tfrac1N \sum_m \big(\hat U_p\,\hat φ_J\big)[m N/s],
 ```
 
 `⟨S_p x⟩ = \bar S_p x` **iff `\hatφ_J` vanishes on the subsampling lattice** `\{mN/s : m ≠ 0\}`. The
-tight-frame dual is identically `1` on half of that lattice, so it fails the condition. The Gaussian
-`\hatφ_J(k) = e^{-|k|^2σ^2/2}` with `σ = σ_0 2^J` ([`ScatteringTransforms.Filters.gaussian_lowpass!`](@ref)) satisfies it
-with wide margin — the lattice starts at `|k| = 2π/s`, so at the default `s = 2^{J-1}` the largest
-surviving term is `e^{-(4πσ_0)^2/2}`, i.e. `10^{-22}` at `σ_0 = 0.8`. The lattice condition is what
-is required; the Gaussian family and `σ_0` are a choice with room to spare.
+lattice starts at `|k| = 2π/s`, so at the default `s = 2^{J-1}` the largest term is
+`e^{-(4πσ_0)^2/2}`, `10^{-22}` at `σ_0 = 0.8`.
 
 ## Reduced descriptors
 
@@ -104,10 +135,10 @@ There is **no exact analytic inverse** of the scattering transform — the modul
 local phase of each wavelet coefficient. Three reconstruction levels are available:
 
 1. **Exact linear wavelet-frame inverse** (`wavelet_transform` / `iwavelet`). The *complex*,
-   pre-modulus layer `x ⋆ ψ_λ` plus the low-pass `x ⋆ φ` is exactly invertible: because the bank
-   is a tight frame (`Σ_λ|\hatψ_λ|² + |\hatφ|² ≡ 1`), the dual frame is itself and
+   pre-modulus layer `W_λ = x ⋆ ψ_λ` with the low-pass `Y = x ⋆ φ_J` is invertible because
+   `A > 0`, and the canonical dual frame gives, for a real field,
    ```math
-   x = \sum_\lambda (x\star\psi_\lambda)\star\psi_\lambda^\ast + (x\star\phi)\star\phi^\ast ,
+   x = \mathrm{Re}\,\mathcal F^{-1}\Big[\big(\hatφ_J\,\hat Y + \textstyle\sum_λ \hatψ_λ\,\hat W_λ\big)\big/A\Big],
    ```
    recovered to machine precision (1D/2D/3D).
 2. **Phase retrieval** (`reconstruct_phase`) from the first-order moduli `|x ⋆ ψ_λ|` alone, via
@@ -124,17 +155,22 @@ local phase of each wavelet coefficient. Three reconstruction levels are availab
 
 `MonogenicScattering` replaces the oriented analytic modulus with the rotation-covariant
 **monogenic amplitude**. From an *isotropic* band-pass `ψ_j` (radial in frequency, real,
-zero-mean) and the Riesz multipliers `R_d(k) = -i\,k_d/|k|` (`Σ_d|R_d|²=1` off-DC):
+zero-mean) and the Riesz multipliers `R_d(k) = -i\,k_d/|k|` (`Σ_d|R_d|²=1` off the DC bin;
+`R_d = 0` on axis `d`'s Nyquist bin, the mean of its two aliases):
 
 ```math
 A_j = \sqrt{\,(x\star\psi_j)^2 + \textstyle\sum_d (x\star R_d\psi_j)^2\,},
 ```
 
-which also yields a local *phase* and continuous *orientation* (`monogenic_components`), recovered
-without quantizing into discrete orientation bins. On the sphere (`spherical_monogenic_scattering`,
-NUFSHT extension) the Riesz operator `R = ð∘(-Δ_S)^{-1/2}` is harmonic-diagonal; the Riesz energy
-`|U^R_j|² = |∇_S g_j|²` (with `g_j=(-Δ_S)^{-1/2}` of the band) is evaluated with **spin-0**
-transforms only, via the identity `|∇_S g|² = ½Δ_S(g²) − g\,Δ_S g`.
+which also yields a local *phase* and continuous *orientation* (`monogenic_components`). The
+band-pass and its Riesz components carry `|\hatψ_j|^2(1 + Σ_d|R_d|^2)` per frequency, so
+`A = |\hatφ_J|^2 + Σ_j |\hatψ_j|^2(1 + Σ_d|R_d|^2)` and the wavelets are scaled by
+`lp_scale_1d(Q)/2`. On the sphere (`spherical_monogenic_scattering`) the Riesz operator
+`R = ð∘(-Δ_S)^{-1/2}` is harmonic-diagonal, and the Riesz energy is `|U^R_j|² = |∇_S g_j|²` with
+`g_j = (-Δ_S)^{-1/2}` of the band. With the angular momentum `L = -i\,r×∇`, a real `g` has
+`|∇_S g|^2 = |L_+ g|^2 + (∂_φ g)^2`, and `L_+ Y_{ℓm} = \sqrt{(ℓ-m)(ℓ+m+1)}\,Y_{ℓ,m+1}` keeps the
+degree, so the energy is three scalar syntheses at the band limit, exact for band-limited `g`. The
+in-core direct plan takes the gradient from `∂_θ P̄_ℓ^m` and `∂_φ` evaluated at each point.
 
 ## Computation
 
@@ -147,9 +183,9 @@ autodiff-friendly counterpart used by synthesis.
 
 ## Applications
 
-Texture and field classification, audio timbre, turbulence intermittency, and submesoscale
-oceanography (sea-surface-height variability) — settings where higher-order, non-Gaussian
-structure beyond the power spectrum is informative.
+Texture and field classification, audio timbre, turbulence intermittency, and geophysical
+fields — settings where higher-order, non-Gaussian structure beyond the power spectrum is
+informative.
 
 ## References
 

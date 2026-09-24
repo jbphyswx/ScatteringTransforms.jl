@@ -111,7 +111,7 @@ Test.@testset "1D Morlet Wavelet Mathematical Properties" begin
     expected_center = 0.5 / (2.0^(j/Q))
     Test.@test isapprox(morlet.center_freq, expected_center, rtol=1e-10)
     
-    # Test 2: Bandwidth matches kymatio formula
+    # Test 2: Bandwidth, the width at which adjacent wavelets cross at r of their peak
     # sigma = xi * (1-2^(-1/Q))/(1+2^(-1/Q)) / sqrt(2*log(1/r))
     factor = 1.0 / (2.0^(1.0/Q))
     term1 = (1.0 - factor) / (1.0 + factor)
@@ -155,32 +155,116 @@ Test.@testset "1D Morlet Wavelet Mathematical Properties" begin
     end
 end
 
-Test.@testset "Filter bank is a tight frame (Littlewood-Paley ≡ 1)" begin
-    # |φ(ω)|² + Σⱼ|ψⱼ(ω)|² ≡ 1: non-expansive, no frequency amplified.
-    #
-    # The identity is exact by construction — `φ = √(1 − Σⱼ|ψⱼ|²)`, so the sum is that expression
-    # squared again — and it holds over the whole band, not just the positive half. Measured
-    # deviation is one ulp (2.220e-16 in Float64, 1.192e-07 in Float32, i.e. `eps(T)` in each), so
-    # the tolerance is a small multiple of `eps` rather than a round number that would let a bank
-    # drift a long way before failing.
-    for (N, J, Q) in ((1024, 6, 1), (512, 4, 2))
-        fb = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=Q)
-        lp = abs2.(fb.averaging) .+ sum(abs2.(ψ) for ψ in fb.wavelets)
-        Test.@test maximum(abs, lp .- 1) < 4 * eps(Float64)
+Test.@testset "Littlewood–Paley sum of every bank: A(0) = 1, 0 < A ≤ 1" begin
+    # For a real field `‖Wx‖² = (1/N) Σ_k A(k)|x̂(k)|²` with
+    # `A = |φ̂|² + ½ Σ_λ (|ψ̂_λ(k)|² + |ψ̂_λ(−k)|²)` (Andén & Mallat 2014): `A ≤ 1` bounds the transform
+    # by the identity, and `min A > 0` makes it invertible.
+    FBk = ScatteringTransforms.FilterBanks
+    Mono = ScatteringTransforms.Monogenic
+    for T in (Float64, Float32), cache in (true, false)
+        c = Val(cache)
+        banks = (FBk.build_filter_bank1d(T, 256, 5, c; Q = 1),
+                 FBk.build_filter_bank1d(T, 255, 4, c; Q = 2),
+                 FBk.build_filter_bank2d(T, (64, 64), 3, c; L = 8),
+                 FBk.build_filter_bank2d(T, (63, 64), 3, c; L = 4),
+                 FBk.build_filter_bank3d(T, (16, 16, 16), 2, c; n_orient = 6),
+                 Mono.build_monogenic_bank(T, (32, 32), 3, c; Q = 1),
+                 Mono.build_monogenic_bank(T, (33,), 4, c; Q = 2))
+        for fb in banks
+            A = FBk.littlewood_paley(fb)
+            Test.@test abs(A[1] - 1) <= 8 * eps(T)
+            Test.@test maximum(A) <= 1 + 8 * eps(T)
+            Test.@test minimum(A) > 0
+        end
     end
-    fb2 = ScatteringTransforms.FilterBanks.build_filter_bank2d((64, 64), 3; L=8)
-    lp2 = abs2.(fb2.averaging) .+ sum(abs2.(ψ) for ψ in fb2.wavelets)
-    Test.@test maximum(abs, lp2 .- 1) < 4 * eps(Float64)
+end
+
+Test.@testset "1D Littlewood–Paley sum from the Morlet formula, Nyquist bin included" begin
+    # Each bin carries the continuous sum at its frequency. On an even grid the Nyquist bin is
+    # `ω = ±½` at once, and the analytic wavelets reach it from `+½`.
+    FBk = ScatteringTransforms.FilterBanks
+    for N in (256, 255), Q in (1, 2)
+        J = 4
+        fb = FBk.build_filter_bank1d(N, J; Q = Q)
+        c = FBk.lp_scale_1d(Q)
+        function Acont(ω)
+            s = exp(-(2π * ω * 0.8 * 2.0^J)^2)                 # |φ̂|², σ = 0.8·2^J
+            for n in 0:(J * Q - 1)
+                ξ, f = 0.5 / 2.0^(n / Q), 2.0^(-1 / Q)
+                σ = ξ * (1 - f) / (1 + f) / sqrt(log(2.0))    # crossing at r = √½
+                g(w) = w < 0 ? 0.0 :
+                       exp(-((w - ξ) / σ)^2 / 2) - exp(-(ξ / σ)^2 / 2) * exp(-(w / σ)^2 / 2)
+                s += c^2 * (g(ω)^2 + g(-ω)^2) / 2
+            end
+            return s
+        end
+        fr = [k < (N + 1) ÷ 2 ? k / N : (k - N) / N for k in 0:(N - 1)]
+        Test.@test maximum(abs, FBk.littlewood_paley(fb) .- Acont.(fr)) < 1e-14
+    end
+end
+
+Test.@testset "A is the energy per frequency of the wavelet transform of a real field" begin
+    # Parseval: `Σ_λ ‖x⋆ψ_λ‖² + ‖x⋆φ‖² = (1/N) Σ_k A(k)|x̂(k)|²`; for the monogenic bank the band-pass
+    # and each Riesz component count separately.
+    FBk = ScatteringTransforms.FilterBanks
+    Mono = ScatteringTransforms.Monogenic
+    Random.seed!(7)
+    for (st, x) in ((ScatteringTransforms.Scattering1D.ScatteringTransform1D(128, 4; Q = 2), randn(128)),
+                    (ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 31), 3; L = 4),
+                     randn(32, 31)),
+                    (ScatteringTransforms.Scattering3D.ScatteringTransform3D((12, 12, 12), 2),
+                     randn(12, 12, 12)))
+        wt = ScatteringTransforms.Inverse.wavelet_transform(st, x)
+        E = sum(w -> sum(abs2, w), wt.wavelet) + sum(abs2, wt.lowpass)
+        A = FBk.littlewood_paley(st.filter_bank)
+        Test.@test E ≈ sum(A .* abs2.(FFTW.fft(x))) / length(x) rtol = 1e-12
+    end
+    for (dims, J) in (((64,), 4), ((32, 32), 3), ((12, 12, 12), 2))
+        st = Mono.MonogenicScattering(dims, J; Q = 1, max_order = 1)
+        x = randn(dims...)
+        E = sum(abs2, real.(FFTW.ifft(FFTW.fft(x) .* st.filter_bank.averaging)))
+        for j in 1:J
+            m = Mono.monogenic_components(st, x, j)
+            E += sum(abs2, m.bandpass) + sum(r -> sum(abs2, r), m.riesz)
+        end
+        A = FBk.littlewood_paley(st.filter_bank)
+        Test.@test E ≈ sum(A .* abs2.(FFTW.fft(x))) / length(x) rtol = 1e-12
+    end
+end
+
+Test.@testset "The Littlewood–Paley constant makes A ≤ 1 tight inside the band" begin
+    # Between its finest and coarsest wavelets a deep bank reaches the maximum of the bank continued
+    # over every scale, which the constant sets to 1. Tolerances are the grid's sampling of that
+    # maximum: ≥ 250 bins per octave in 1D, ≥ 10 per orientation period in 2D.
+    FBk = ScatteringTransforms.FilterBanks
+    for (fb, tol) in ((FBk.build_filter_bank1d(4096, 9; Q = 1), 1e-3),
+                      (FBk.build_filter_bank1d(4096, 8; Q = 2), 1e-3),
+                      (FBk.build_filter_bank2d((256, 256), 5; L = 8), 1e-2),
+                      (FBk.build_filter_bank2d((256, 256), 5; L = 4), 1e-2))
+        A = FBk.littlewood_paley(fb)
+        Test.@test 1 - tol < maximum(A[2:end]) <= 1
+    end
+end
+
+Test.@testset "S1 of a scale does not depend on how many scales the bank has" begin
+    # The constant depends on the wavelet design only, so wavelet `j` is the same function in a
+    # bank of any depth; undecimated, its coefficient is the same arithmetic.
+    Random.seed!(11)
+    C = ScatteringTransforms.Coefficients
+    x = randn(256)
+    S1(J) = C.first_order(ScatteringTransforms.Scattering1D.ScatteringTransform1D(256, J; Q = 1,
+                                                                                max_order = 1)(x))
+    Test.@test S1(4) == S1(6)[1:4]
+    x2 = randn(64, 64)
+    S12(J) = C.first_order(ScatteringTransforms.Scattering2D.ScatteringTransform2D((64, 64), J; L = 4,
+                                                                                 max_order = 1)(x2))
+    Test.@test S12(2) == S12(4)[1:8]
 end
 
 Test.@testset "Filter banks are real, and stored as such" begin
-    # A Morlet's Fourier response is real — analyticity is the half-plane support, not a complex
-    # value — so the bank is the same numbers in half the memory, and a wavelet multiply is
-    # complex×real. The bank is the largest single item in a transform, so this is not a detail.
-    #
-    # The narrower container is asserted alongside the tight-frame sum it has to keep satisfying,
-    # so a bank that reached a real element type by discarding information would fail here rather
-    # than pass on the type check alone.
+    # A Morlet's Fourier response is real (its analyticity is the half-plane support), so a
+    # wavelet multiply is complex×real. The Littlewood–Paley bound is asserted alongside, at the
+    # element type's precision.
     for T in (Float64, Float32)
         banks = (ScatteringTransforms.FilterBanks.build_filter_bank1d(T, 128, 4; Q=2),
                  ScatteringTransforms.FilterBanks.build_filter_bank2d(T, (32, 32), 3; L=4),
@@ -190,11 +274,12 @@ Test.@testset "Filter banks are real, and stored as such" begin
         for fb in banks
             Test.@test eltype(fb.averaging) == T
             Test.@test all(ψ -> eltype(ψ) == T, fb.wavelets)
-            lp = abs2.(fb.averaging) .+ sum(abs2.(ψ) for ψ in fb.wavelets)
-            Test.@test maximum(abs, lp .- 1) < 4 * eps(T)
+            A = ScatteringTransforms.FilterBanks.littlewood_paley(fb)
+            Test.@test eltype(A) == T
+            Test.@test abs(A[1] - 1) <= 8 * eps(T)
+            Test.@test maximum(A) <= 1 + 8 * eps(T)
         end
-        # The Riesz multipliers are genuinely complex (`R_d(k) = -i k_d/|k|`) and stay so — the
-        # saving comes from the wavelets being real, not from narrowing everything in sight.
+        # The Riesz multipliers `R_d(k) = -i k_d/|k|` are purely imaginary.
         mb = banks[end]
         Test.@test all(R -> eltype(R) == Complex{T}, mb.riesz)
         Test.@test maximum(R -> maximum(abs ∘ real, R), mb.riesz) == 0
@@ -461,6 +546,43 @@ Test.@testset "2D Filter Tests" begin
     Test.@test abs(resp[1, 1]) < 1e-10
 end
 
+Test.@testset "2D Morlet equals the FFT of its spatial form" begin
+    # Built in space: a Gabor with widths σ∥ along θ and σ⊥ = σ∥·L/4 across it, periodized over
+    # neighbouring images, minus a Gaussian scaled to zero mean, divided by the Gaussian's integral
+    # 2πσ∥σ⊥. Its DFT is the analytic envelope sampled on the grid; at j = 2 the frequency aliases
+    # sit e⁻⁵⁰ below it. Compared on k∥ ≥ 0, where the wavelet here is defined as analytic.
+    Ny, Nx = 64, 64
+    j = 2
+    for L in (4, 8), l in (0, 1, 3)
+        θ = π * l / L
+        m = ScatteringTransforms.Filters.Morlet2D((Ny, Nx), j, θ; L = L)
+        σpar, σperp, k0 = 0.8 * 2.0^j, 0.8 * 2.0^j * L / 4, 3π / (4 * 2.0^j)
+        g(k) = [sum(exp(-(((x + ex * Nx) * cos(θ) + (y + ey * Ny) * sin(θ))^2 / (2σpar^2)) -
+                        ((-(x + ex * Nx) * sin(θ) + (y + ey * Ny) * cos(θ))^2 / (2σperp^2)) +
+                        im * k * ((x + ex * Nx) * cos(θ) + (y + ey * Ny) * sin(θ)))
+                    for ex in -2:2, ey in -2:2) for y in 0:(Ny - 1), x in 0:(Nx - 1)]
+        gξ, g0 = g(k0), g(0.0)
+        ref = FFTW.fft((gξ .- (sum(gξ) / sum(g0)) .* g0) ./ (2π * σpar * σperp))
+        ψ = ScatteringTransforms.Filters.frequency_response(m)
+        kpar = [2π * (ScatteringTransforms.Filters._fftfreq(Nx, ix - 1) * cos(θ) +
+                      ScatteringTransforms.Filters._fftfreq(Ny, iy - 1) * sin(θ))
+                for iy in 1:Ny, ix in 1:Nx]
+        half = kpar .>= 0
+        Test.@test maximum(abs, ψ[half] .- ref[half]) < 1e-12
+    end
+end
+
+Test.@testset "2D wavelets resolve orientation (S1 of a sinusoid)" begin
+    # For a sinusoid on a grid wavevector, |x ⋆ ψ| is the constant |ψ̂(k)|·A/2, so S1 is |ψ̂(k)|
+    # up to the bank's scale. At j = 2 the wavelet at θ = 0 against the one at θ = π/4 gives
+    # ψ̂₀(k)/ψ̂₂(k) ≈ 43, the factor exp(((k₀ sin π/4)·σ⊥)²/2) doing most of it.
+    N, J, L = 64, 3, 8
+    st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((N, N), J; L = L, max_order = 1)
+    x = [cos(2π * 6 * (ix - 1) / N) for iy in 1:N, ix in 1:N]     # |k| = 6·2π/64 = k₀ at j = 2
+    S1 = reshape(ScatteringTransforms.Coefficients.first_order(st(x)), L, J)
+    Test.@test S1[1, 3] / S1[3, 3] > 10
+end
+
 Test.@testset "2D Wavelet Orientation and Scale Selectivity" begin
     Ny, Nx = 64, 64
     J = 3
@@ -584,7 +706,7 @@ Test.@testset "Spherical scattering (NUFSHT, smooth difference-of-Gaussians band
     Test.@test all(isfinite, res.S1)
 end
 
-Test.@testset "Spherical MONOGENIC scattering (Riesz amplitude via spin-0 Bochner identity)" begin
+Test.@testset "Spherical monogenic scattering (Riesz amplitude)" begin
     lmax = 12
     J = 3
     M = 1200                      # ≳ (lmax+1)² = 169 so the exact CG analysis is well-determined
@@ -827,10 +949,7 @@ Test.@testset "1D localized field: mean equals averaged coefficient" begin
         Test.@test isapprox(Statistics.mean(ScatteringTransforms.ScatteringFields.path_field(sf, p)), S2[j1, j2]; atol=1e-8)
     end
 
-    # Decimation must not weaken that: φ_J is a genuine Gaussian low-pass, so the subsampled field
-    # carries the same DC and its mean is still the coefficient. Smoothing with the bank's
-    # `averaging` instead — an all-pass on the analytic complement — folds full-band energy onto DC
-    # and puts this 8% out at s=8.
+    # Decimated, the mean is still the coefficient: φ_J vanishes on the subsampling lattice.
     sf8 = ScatteringTransforms.ScatteringFields.scattering_field(st, signal; subsample=8)
     Test.@test size(sf8.data, 1) == N ÷ 8
     Test.@test all(isfinite, sf8.data)
@@ -995,16 +1114,21 @@ Test.@testset "Complex input on every gridded surface" begin
     Test.@test eltype(SF.scattering_field(st2, real(z2); subsample=4).data) <: Real
 end
 
-Test.@testset "Localized-field low-pass is a low-pass, not the tight-frame complement" begin
-    # The bank's `averaging` is `√(max(0, 1-Σ|ψ|²))`, and every ψ̂ is analytic, so it is identically
-    # 1 across the analytic complement. Subsampling a field smoothed with it aliases full-band
-    # energy onto DC, which is why the localized transform uses its own Gaussian φ_J.
+Test.@testset "Every bank's averaging filter is the Gaussian φ_J" begin
+    FBk = ScatteringTransforms.FilterBanks
     N, J = 256, 4
-    fb = ScatteringTransforms.FilterBanks.build_filter_bank1d(N, J; Q=1)
-    neg = (N ÷ 2 + 2):N
-    Test.@test all(≈(1.0), fb.averaging[neg])
-
     φ = ScatteringTransforms.Filters.gaussian_lowpass(Float64, (N,), J)
+    for c in (Val(true), Val(false))
+        Test.@test FBk.build_filter_bank1d(Float64, N, J, c; Q = 2).averaging == φ
+        Test.@test FBk.build_filter_bank2d(Float64, (32, 48), 3, c; L = 4).averaging ==
+                   ScatteringTransforms.Filters.gaussian_lowpass(Float64, (32, 48), 3)
+        Test.@test FBk.build_filter_bank3d(Float64, (8, 8, 8), 2, c).averaging ==
+                   ScatteringTransforms.Filters.gaussian_lowpass(Float64, (8, 8, 8), 2)
+        Test.@test ScatteringTransforms.Monogenic.build_monogenic_bank(Float64, (16, 16), 3, c).averaging ==
+                   ScatteringTransforms.Filters.gaussian_lowpass(Float64, (16, 16), 3)
+    end
+    # φ̂(k) = exp(-k²σ²/2) at angular frequency k = 2πm/N, σ = 0.8·2^J.
+    Test.@test φ ≈ [exp(-(2π * (m < N ÷ 2 ? m : m - N) / N * 0.8 * 2^J)^2 / 2) for m in 0:(N - 1)] rtol = 1e-14
     Test.@test φ[1] == 1.0
     # Every frequency that folds onto DC under the default 2^(J-1) subsampling is negligible.
     s = 1 << (J - 1)
@@ -1113,46 +1237,46 @@ Test.@testset "Exact linear wavelet-frame inverse: iwavelet ∘ wavelet_transfor
     end
 end
 
-Test.@testset "Phase retrieval (Gerchberg–Saxton): reconstructed moduli match target" begin
-    # The first-order band-pass moduli |x⋆ψ_λ| carry no information about the low-pass (smooth)
-    # component, so reconstructing from the moduli alone leaves it an unconstrained null space — a
-    # genuine under-determinacy that capped accuracy at ~12% error and flaked against a 0.15 bar.
-    # Seeding the low-pass channel with the target's (a documented `reconstruct_phase` option) closes
-    # that null space, and GS then recovers the field to machine precision for ANY init (rel ≈ 1e-4
-    # across every seed tried, identically on Julia 1.11 and 1.12) — so the tight bar below holds for
-    # all seeds and the RNG seed is only for reproducible output, not to pass a threshold.
+Test.@testset "Phase retrieval (Gerchberg–Saxton): error reduction" begin
+    # Each round projects onto the fields with the target moduli and low-pass, then back onto the
+    # range of the wavelet layer by its least-squares inverse, so the distance `d` between the two
+    # sets never increases (Fienup 1982) and the true field is a fixed point.
     Random.seed!(123)
+    Inv = ScatteringTransforms.Inverse
     N, J = 128, 6
     x = randn(N)
-    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=2, max_order=1)
-    wt = ScatteringTransforms.Inverse.wavelet_transform(st, x)
+    st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q = 2, max_order = 1)
+    wt = Inv.wavelet_transform(st, x)
     moduli = [abs.(w) for w in wt.wavelet]
-    xhat = ScatteringTransforms.Inverse.reconstruct_phase(st, moduli; iters=400, init=randn(N),
-                                                          seed_lowpass=wt.lowpass)
-    wt2 = ScatteringTransforms.Inverse.wavelet_transform(st, xhat)
-    num = sqrt(sum(sum(abs2, abs.(w2) .- m) for (w2, m) in zip(wt2.wavelet, moduli)))
-    den = sqrt(sum(sum(abs2, m) for m in moduli))
-    Test.@test num / den < 0.01      # near-exact recovery once the low-pass null space is removed
+    lp = copy(wt.lowpass)
+    function d(xh)
+        w = Inv.wavelet_transform(st, xh)
+        return sqrt(sum(sum(abs2, abs.(a) .- m) for (a, m) in zip(w.wavelet, moduli)) +
+                    sum(abs2, w.lowpass .- lp))
+    end
+    Test.@test Inv.reconstruct_phase(st, moduli; iters = 5, init = x, seed_lowpass = lp) ≈ x rtol = 1e-12
+    x0 = randn(N)
+    ds = [d(k == 0 ? x0 : Inv.reconstruct_phase(st, moduli; iters = k, init = x0, seed_lowpass = lp))
+          for k in (0, 25, 100, 400)]
+    Test.@test all(ds[i + 1] <= ds[i] * (1 + 1e-12) for i in 1:3)
+    Test.@test ds[end] < ds[1]
 end
 
-Test.@testset "Monogenic (Riesz) scattering: partition, tight frame, transforms" begin
-    # Riesz multipliers partition unity off the DC bin: Σ_d |R_d(k)|² = 1, and vanish at DC.
-    for dims in ((32,), (16, 16), (8, 8, 8))
+Test.@testset "Monogenic (Riesz) scattering: multipliers, transforms" begin
+    # `Σ_d |R_d(k)|² = 1` off the DC bin, and `R_d = 0` on axis d's Nyquist bin, where the odd
+    # multiplier's two aliases `±i·½/|k|` average to zero.
+    for dims in ((32,), (16, 16), (8, 8, 8), (15, 16), (9, 9, 9))
         R = ScatteringTransforms.Monogenic.riesz_multipliers(dims, Float64)
         s = sum(abs2.(Rd) for Rd in R)
-        Test.@test s[1] == 0                              # DC
-        offdc = [s[i] for i in CartesianIndices(dims) if i != first(CartesianIndices(dims))]
-        Test.@test maximum(abs.(offdc .- 1)) < 1e-12
-    end
-
-    # Isotropic bank is a tight frame: Σ_j |ψ̂_j|² + |φ̂|² ≡ 1.
-    let
-        fb = ScatteringTransforms.Monogenic.build_monogenic_bank((32, 32), 3; Q=1)
-        s = abs2.(fb.averaging)
-        for ψ in fb.wavelets
-            s = s .+ abs2.(ψ)
+        nyq(I, d) = iseven(dims[d]) && I[d] - 1 == dims[d] ÷ 2
+        freq(I) = [(i - 1 < (n + 1) ÷ 2 ? i - 1 : i - 1 - n) / n for (i, n) in zip(Tuple(I), dims)]
+        ref = map(CartesianIndices(dims)) do I
+            k = freq(I)
+            iszero(k) ? 0.0 : sum(k[d]^2 for d in eachindex(k) if !nyq(I, d); init = 0.0) / sum(abs2, k)
         end
-        Test.@test maximum(abs.(s .- 1)) < 1e-12
+        Test.@test s[1] == 0                              # DC
+        Test.@test maximum(abs, s .- ref) < 1e-14
+        Test.@test all(R[d][I] == 0 for d in eachindex(dims) for I in CartesianIndices(dims) if nyq(I, d))
     end
 
     # 1D/2D/3D transforms run, finite, correct coefficient counts; Float32 preserved.

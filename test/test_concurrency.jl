@@ -6,6 +6,92 @@ using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using NUFSHT: NUFSHT
 using OhMyThreads: OhMyThreads
 
+# Tallies the plans `task_local_plan` and `batch_plan` build from a plan, and the `close_plan!` calls
+# they receive; every other call passes through to `inner`.
+struct LifecyclePlan{P, A} <: ScatteringTransforms.Plans.AbstractScatteringPlan
+    inner::P
+    built::A
+    closed::A
+end
+LifecyclePlan(inner) = LifecyclePlan(inner, Threads.Atomic{Int}(0), Threads.Atomic{Int}(0))
+_derived(p::LifecyclePlan, inner) =
+    (Threads.atomic_add!(p.built, 1); LifecyclePlan(inner, p.built, p.closed))
+
+ScatteringTransforms.Plans.forward_transform!(out, p::LifecyclePlan, x) =
+    ScatteringTransforms.Plans.forward_transform!(out, p.inner, x)
+ScatteringTransforms.Plans.inverse_transform!(out, p::LifecyclePlan, x) =
+    ScatteringTransforms.Plans.inverse_transform!(out, p.inner, x)
+ScatteringTransforms.Plans.batch_width(p::LifecyclePlan) =
+    ScatteringTransforms.Plans.batch_width(p.inner)
+ScatteringTransforms.Plans.task_local_plan(p::LifecyclePlan) =
+    _derived(p, ScatteringTransforms.Plans.task_local_plan(p.inner))
+ScatteringTransforms.Plans.close_plan!(p::LifecyclePlan) =
+    (Threads.atomic_add!(p.closed, 1); ScatteringTransforms.Plans.close_plan!(p.inner))
+ScatteringTransforms.SphericalCore.supports_batch(p::LifecyclePlan) =
+    ScatteringTransforms.SphericalCore.supports_batch(p.inner)
+ScatteringTransforms.SphericalCore.batch_plan(p::LifecyclePlan, B::Integer) =
+    ScatteringTransforms.Plans.batch_width(p) == B ? p :
+    _derived(p, ScatteringTransforms.SphericalCore.batch_plan(p.inner, B))
+ScatteringTransforms.SphericalCore.sphere_coeffs!(C, p::LifecyclePlan, f) =
+    ScatteringTransforms.SphericalCore.sphere_coeffs!(C, p.inner, f)
+ScatteringTransforms.SphericalCore.sphere_coeffs_buffer(p::LifecyclePlan) =
+    ScatteringTransforms.SphericalCore.sphere_coeffs_buffer(p.inner)
+ScatteringTransforms.SphericalCore.sphere_apply!(out, p::LifecyclePlan, C, h) =
+    ScatteringTransforms.SphericalCore.sphere_apply!(out, p.inner, C, h)
+ScatteringTransforms.SphericalCore.sphere_mean(p::LifecyclePlan, f) =
+    ScatteringTransforms.SphericalCore.sphere_mean(p.inner, f)
+ScatteringTransforms.SphericalCore.riesz_scratch(p::LifecyclePlan, f) =
+    ScatteringTransforms.SphericalCore.riesz_scratch(p.inner, f)
+ScatteringTransforms.SphericalCore.sphere_riesz_energy!(out, p::LifecyclePlan, C, h, scr) =
+    ScatteringTransforms.SphericalCore.sphere_riesz_energy!(out, p.inner, C, h, scr)
+
+# `st` with its plan wrapped in a `LifecyclePlan`, everything else shared.
+function with_lifecycle(st)
+    T = typeof(st)
+    args = ntuple(i -> fieldname(T, i) === :plan ? LifecyclePlan(st.plan) : getfield(st, i),
+                  fieldcount(T))
+    return T.name.wrapper(args...)
+end
+
+Test.@testset "Every plan a batch builds for itself is closed" begin
+    CBk = ComputationalBackends
+    M, ms, J = 300, (12, 12), 2
+    Random.seed!(17)
+    x, y = 2π .* rand(M), 2π .* rand(M)
+    X = randn(M, 4)
+    for (spectral, ntrans) in ((SpectralBackends.DirectSumSpectralBackend(), 1),
+                               (ScatteringTransforms.Plans.FINUFFTBackend(), 2))
+        st = ScatteringTransforms.scattered_planar_scattering(x, y, ms, J; L = 4,
+                 period = (2π, 2π), spectral = spectral, ntrans = ntrans)
+        stc = with_lifecycle(st)
+        serial = ntrans == 1 ? ScatteringTransforms.scattering_batch(st, X) :
+                 hcat(ScatteringTransforms.scattering_batch(st, X[:, 1:2]),
+                      ScatteringTransforms.scattering_batch(st, X[:, 3:4]))
+        Test.@test ScatteringTransforms.scattering_batch(CBk.ThreadedBackend(), stc, X) ≈ serial
+        Test.@test stc.plan.built[] >= 1
+        Test.@test stc.plan.closed[] == stc.plan.built[]
+        ScatteringTransforms.close_transform!(st)
+    end
+
+    lmax, Ms = 6, 200
+    θ = [acos(1 - 2 * (k - 0.5) / Ms) for k in 1:Ms]
+    φ = [2π * mod(k * (sqrt(5) - 1) / 2, 1) for k in 1:Ms]
+    F = [cos(2θ[k]) + 0.3b * sin(θ[k]) * cos(φ[k]) for k in 1:Ms, b in 1:3]
+    for spectral in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
+        for build in (ScatteringTransforms.spherical_scattering,
+                      ScatteringTransforms.spherical_monogenic_scattering)
+            st = build(θ, φ, lmax, J; spectral = spectral)
+            stc = with_lifecycle(st)
+            serial = ScatteringTransforms.scattering_batch(st, F)
+            for backend in (CBk.SerialBackend(), CBk.ThreadedBackend())
+                Test.@test ScatteringTransforms.scattering_batch(backend, stc, F) ≈ serial rtol = 1e-8
+            end
+            Test.@test stc.plan.closed[] == stc.plan.built[]
+            ScatteringTransforms.close_transform!(st)
+        end
+    end
+end
+
 Test.@testset "Concurrent plan construction" begin
     Test.@testset "concurrent scattered-sphere builds match serial ones" begin
         lmax, J, M, ntask = 8, 2, 400, 4
@@ -19,11 +105,18 @@ Test.@testset "Concurrent plan construction" begin
                                Cint, ()))
         before = ft_count()
 
-        serial = [ScatteringTransforms.spherical_scattering(θs[t], φs[t], lmax, J)(fields[t])
-                  for t in 1:ntask]
+        function transform_once(t)
+            st = ScatteringTransforms.spherical_scattering(θs[t], φs[t], lmax, J)
+            try
+                return st(fields[t])
+            finally
+                ScatteringTransforms.close_transform!(st)
+            end
+        end
+        serial = [transform_once(t) for t in 1:ntask]
         concurrent = Vector{Any}(undef, ntask)
         OhMyThreads.@tasks for t in 1:ntask
-            concurrent[t] = ScatteringTransforms.spherical_scattering(θs[t], φs[t], lmax, J)(fields[t])
+            concurrent[t] = transform_once(t)
         end
         for t in 1:ntask
             Test.@test concurrent[t].S0 ≈ serial[t].S0
@@ -47,9 +140,7 @@ Test.@testset "Concurrent plan construction" begin
         st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; max_order = 2)
         X = [cos(2 * θ[k]) + 0.4 * cos(3 * φ[k]) * sin(θ[k]) + 0.1 * b for k in 1:M, b in 1:B]
 
-        # The NUFSHT plan's own width, not `Plans.batch_width`: that falls back to 1 for any argument
-        # it has no method for, so it would report 1 here whatever the plan actually is.
-        Test.@test st.plan.plan.B == 1
+        Test.@test ScatteringTransforms.Plans.batch_width(st.plan) == st.plan.plan.B == 1
         serial = ScatteringTransforms.scattering_batch(ComputationalBackends.SerialBackend(), st, X)
         threaded = ScatteringTransforms.scattering_batch(ComputationalBackends.ThreadedBackend(), st, X)
         # A raced solve diverges rather than erroring, so the comparison is against the serial values,
@@ -58,8 +149,12 @@ Test.@testset "Concurrent plan construction" begin
         Test.@test threaded ≈ serial rtol = 1e-8
         # The plan handed to a task is never the shared one, whatever width is asked for.
         for k in (1, B)
-            Test.@test ScatteringTransforms.SphericalCore.task_local_batch_plan(st.plan, k) !== st.plan
+            p = ScatteringTransforms.SphericalCore.task_local_batch_plan(st.plan, k)
+            Test.@test p !== st.plan
+            Test.@test ScatteringTransforms.Plans.batch_width(p) == k
+            ScatteringTransforms.Plans.close_plan!(p)
         end
+        ScatteringTransforms.close_transform!(st)
     end
 
     Test.@testset "concurrent structured-sphere builds match serial ones" begin
@@ -87,13 +182,20 @@ Test.@testset "Concurrent plan construction" begin
         fields = [[g(xs[t][k], ys[t][k]) for k in 1:M] for t in 1:ntask]
         for spectral in (ScatteringTransforms.Plans.FINUFFTBackend(),
                          ScatteringTransforms.Plans.NonuniformFFTsBackend())
-            build(t) = ScatteringTransforms.scattered_planar_scattering(
-                xs[t], ys[t], (Ny, Nx), J; L = L, max_order = 2, period = (2π, 2π),
-                spectral = spectral)
-            serial = [build(t)(fields[t]) for t in 1:ntask]
+            function transform_once(t)
+                st = ScatteringTransforms.scattered_planar_scattering(
+                    xs[t], ys[t], (Ny, Nx), J; L = L, max_order = 2, period = (2π, 2π),
+                    spectral = spectral)
+                try
+                    return st(fields[t])
+                finally
+                    ScatteringTransforms.close_transform!(st)
+                end
+            end
+            serial = [transform_once(t) for t in 1:ntask]
             concurrent = Vector{Any}(undef, ntask)
             OhMyThreads.@tasks for t in 1:ntask
-                concurrent[t] = build(t)(fields[t])
+                concurrent[t] = transform_once(t)
             end
             for t in 1:ntask
                 Test.@test ScatteringTransforms.Coefficients.first_order(concurrent[t]) ≈

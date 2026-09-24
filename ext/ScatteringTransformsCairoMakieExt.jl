@@ -12,83 +12,83 @@ const _NAN_COLOR = (:gray, 0.18)
 # Implement plot_filter_bank for 1D Filter Banks
 function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBanks.FilterBank1D)
     MK = CairoMakie
+    FB = ScatteringTransforms.FilterBanks
     N = length(fb.averaging)
-    Nhalf = N ÷ 2
-    freq = collect(range(0.0, 0.5, length=Nhalf))
+    idx = 1:(N ÷ 2 + 1)            # bins 0 … ⌊N/2⌋, frequency (k-1)/N
+    freq = (idx .- 1) ./ N
     nwav = length(fb.wavelets)
-    lp = abs.(fb.averaging[1:Nhalf])
+    lp = abs.(fb.averaging[idx])
 
     # Saturated, white-visible, frequency-ordered colors (turbo, trimmed extremes).
     cols = [MK.cgrad(:turbo)[t] for t in range(0.06, 0.94, length=nwav)]
 
-    fig = MK.Figure(size=(1150, 410))
+    fig = MK.Figure(size=(1250, 410))
 
     # Panel (a): frequency tiling — wider; low-pass shaded, wavelets coloured by scale.
     ax_a = MK.Axis(fig[1, 1];
         title="(a) Morlet filter bank: frequency tiling",
         xlabel="normalized frequency (cycles/sample)",
         ylabel="filter magnitude  |ψ̂|, |φ̂|",
-        limits=((0.0, 0.5), (0.0, 1.08)))
-    MK.band!(ax_a, freq, zeros(Nhalf), lp; color=(:gray, 0.20))
+        limits=((0.0, 0.5), nothing))
+    MK.band!(ax_a, freq, zeros(length(idx)), lp; color=(:gray, 0.20))
     MK.lines!(ax_a, freq, lp; color=:black, linewidth=2.6, linestyle=:dash, label="low-pass φ")
     for (i, ψ) in enumerate(fb.wavelets)
         lbl = fb.Q > 1 ? "j=$(fb.meta[i].scale), q=$(fb.meta[i].q)" : "j=$(fb.meta[i].scale)"
-        MK.lines!(ax_a, freq, abs.(ψ[1:Nhalf]); color=cols[i], linewidth=2.4, label=lbl)
+        MK.lines!(ax_a, freq, abs.(ψ[idx]); color=cols[i], linewidth=2.4, label=lbl)
     end
-    MK.axislegend(ax_a; position=:rt, labelsize=9, nbanks=(fb.Q > 1 || nwav > 6) ? 2 : 1,
-                  framevisible=true)
+    MK.Legend(fig[1, 2], ax_a; labelsize=9, nbanks=(fb.Q > 1 || nwav > 6) ? 2 : 1,
+              framevisible=true)
 
-    # Panel (b): the tight frame — individual squared responses tile up to ≈ 1.
-    lp_sum = abs2.(fb.averaging[1:Nhalf]) .+ sum(abs2.(ψ[1:Nhalf]) for ψ in fb.wavelets)
-    ax_b = MK.Axis(fig[1, 2];
-        title="(b) Littlewood–Paley sum ≈ 1",
+    # Panel (b): each filter's share of the Littlewood–Paley sum of a real field, and the sum.
+    A = FB.littlewood_paley(fb)
+    ax_b = MK.Axis(fig[1, 3];
+        title="(b) Littlewood–Paley sum A(ω) ≤ 1",
         xlabel="normalized frequency",
-        ylabel="‖φ̂‖² + Σⱼ‖ψ̂ⱼ‖²",
-        limits=((0.0, 0.5), (0.0, 1.22)))
-    MK.lines!(ax_b, freq, abs2.(fb.averaging[1:Nhalf]); color=(:black, 0.35), linewidth=1.0)
+        ylabel="|φ̂|² + ½Σⱼ(|ψ̂ⱼ(ω)|² + |ψ̂ⱼ(−ω)|²)",
+        limits=((0.0, 0.5), (0.0, 1.12)))
+    MK.lines!(ax_b, freq, abs2.(fb.averaging[idx]); color=(:black, 0.35), linewidth=1.0)
     for (i, ψ) in enumerate(fb.wavelets)
-        MK.lines!(ax_b, freq, abs2.(ψ[1:Nhalf]); color=(cols[i], 0.55), linewidth=1.0)
+        p = abs2.(ψ)
+        MK.lines!(ax_b, freq, ((p .+ FB.negated(p)) ./ 2)[idx]; color=(cols[i], 0.55), linewidth=1.0)
     end
-    MK.lines!(ax_b, freq, lp_sum; color=:black, linewidth=2.6, label="total")
+    MK.lines!(ax_b, freq, A[idx]; color=:black, linewidth=2.6, label="A(ω)")
     MK.hlines!(ax_b, [1.0]; color=:red, linestyle=:dash, linewidth=1.5)
     MK.axislegend(ax_b; position=:rb, labelsize=9)
 
-    MK.colsize!(fig.layout, 1, MK.Relative(0.62))
+    MK.colsize!(fig.layout, 1, MK.Relative(0.55))
     return fig
 end
 
 # Implement plot_filter_bank for 2D Filter Banks
 function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBanks.FilterBank2D)
     Ny, Nx = size(fb.averaging)
-    
-    # Littlewood-Paley sum matrix
-    lp_sum = abs2.(fb.averaging) .+ sum(abs2.(ψ) for ψ in fb.wavelets)
-    
-    # Pick a sample wavelet response (e.g. j=1, θ=π/4)
-    # Wavelets are in fb.wavelets, let's pick one around the middle scale and orientation
+    # Zero frequency centred; the first array axis is fy, drawn vertically.
+    centred(A) = permutedims(circshift(A, (Ny ÷ 2, Nx ÷ 2)))
+    fx = ((0:(Nx - 1)) .- Nx ÷ 2) ./ Nx
+    fy = ((0:(Ny - 1)) .- Ny ÷ 2) ./ Ny
+
+    lp_sum = ScatteringTransforms.FilterBanks.littlewood_paley(fb)
     sample_idx = min(3, length(fb.wavelets))
     ψ_sample = fb.wavelets[sample_idx]
-    
+
     fig = CairoMakie.Figure(size=(1000, 420))
-    
-    # Panel (a): 2D energy sum
+
     ax_a = CairoMakie.Axis(fig[1, 1],
-        title="(a) 2D Littlewood-Paley Energy Sum",
-        xlabel="kx index",
-        ylabel="ky index",
+        title="(a) Littlewood–Paley sum A(k)",
+        xlabel="fx (cycles/sample)",
+        ylabel="fy (cycles/sample)",
         aspect=CairoMakie.AxisAspect(1)
     )
-    hm_a = CairoMakie.heatmap!(ax_a, lp_sum, colormap=:viridis)
-    CairoMakie.Colorbar(fig[1, 2], hm_a)
-    
-    # Panel (b): Sample Wavelet
+    hm_a = CairoMakie.heatmap!(ax_a, fx, fy, centred(lp_sum), colormap=:viridis, colorrange=(0, 1))
+    CairoMakie.Colorbar(fig[1, 2], hm_a, label="A")
+
     ax_b = CairoMakie.Axis(fig[1, 3],
-        title="(b) Sample Wavelet magnitude (j=$(fb.meta[sample_idx].scale), θ=$(round(fb.meta[sample_idx].theta, digits=2)))",
-        xlabel="kx index",
-        ylabel="ky index",
+        title="(b) |ψ̂| at j=$(fb.meta[sample_idx].scale), θ=$(round(fb.meta[sample_idx].theta, digits=2))",
+        xlabel="fx (cycles/sample)",
+        ylabel="fy (cycles/sample)",
         aspect=CairoMakie.AxisAspect(1)
     )
-    hm_b = CairoMakie.heatmap!(ax_b, abs.(ψ_sample), colormap=:plasma)
+    hm_b = CairoMakie.heatmap!(ax_b, fx, fy, centred(abs.(ψ_sample)), colormap=:plasma)
     CairoMakie.Colorbar(fig[1, 4], hm_b)
     
     return fig

@@ -126,6 +126,7 @@ ScatteringTransforms.flat_rows
 ScatteringTransforms.batch_workspace
 ScatteringTransforms.Batched.BatchWorkspace
 ScatteringTransforms.Batched.batch_cascade!
+ScatteringTransforms.close_transform!
 ```
 
 ## The periodized cascade
@@ -177,6 +178,11 @@ ScatteringTransforms.FilterBanks.filter_at
 ScatteringTransforms.FilterBanks.iscomputed
 ScatteringTransforms.FilterBanks.task_bank
 ScatteringTransforms.FilterBanks.batch_views
+ScatteringTransforms.FilterBanks.littlewood_paley
+ScatteringTransforms.FilterBanks.lp_scale_1d
+ScatteringTransforms.FilterBanks.lp_scale_2d
+ScatteringTransforms.FilterBanks.lp_scale_3d
+ScatteringTransforms.FilterBanks.negated
 ScatteringTransforms.Filters.Morlet1D
 ScatteringTransforms.Filters.Morlet2D
 ScatteringTransforms.Filters.Morlet3D
@@ -303,7 +309,11 @@ ScatteringTransforms.SphericalCore.spherical_scattering!
 ScatteringTransforms.SphericalCore.spherical_scattering_batch!
 ScatteringTransforms.SphericalCore.spherical_monogenic_scattering!
 ScatteringTransforms.SphericalCore.monogenic_amplitude!
+ScatteringTransforms.SphericalCore.sphere_riesz_energy!
+ScatteringTransforms.SphericalCore.riesz_scratch
+ScatteringTransforms.SphericalCore.sph_layout_riesz_energy!
 ScatteringTransforms.SphericalCore.task_local
+ScatteringTransforms.SphericalCore.close_task_local!
 ScatteringTransforms.SphericalCore.band_multiplier
 ScatteringTransforms.SphericalCore.dog_sigma2
 ScatteringTransforms.SphericalCore.structured_grid

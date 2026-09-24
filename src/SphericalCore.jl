@@ -18,11 +18,11 @@ The interface a backend `plan` must implement is just:
   * `sphere_mean(plan, field)`        — the spherical average of `field` (unweighted sample mean for
     scattered points; quadrature-weighted integral for a structured grid).
 
-Everything else — the dyadic difference-of-Gaussians band-pass bank, the S0/S1/S2 cascade (which
-analyses each field once and reuses its coefficients across bands), and the spin-0 Bochner monogenic
-amplitude — is pure, shared math built on those primitives. Pointwise
-monogenic orientation/phase (`spherical_monogenic_components`) additionally needs a spin-1 synthesis
-primitive, supplied by the NUFSHT extension.
+Everything else — the dyadic difference-of-Gaussians band-pass bank and the S0/S1/S2 cascade (which
+analyses each field once and reuses its coefficients across bands) — is shared math built on those
+primitives. The monogenic amplitude also needs [`sphere_riesz_energy!`](@ref), and pointwise
+monogenic orientation/phase (`spherical_monogenic_components`) a spin-1 synthesis, supplied by the
+NUFSHT extension.
 """
 
 export AbstractSphericalPlan, SphericalScattering, SphericalMonogenicScattering
@@ -94,6 +94,100 @@ Spherical average of `field` under the plan's sampling: an unweighted sample mea
 scattered points, the exact quadrature integral for a structured grid. Provided by each backend.
 """
 function sphere_mean end
+
+"""
+    sphere_riesz_energy!(out, plan, C, h, scratch) -> out
+
+`|∇_S g|²` at the plan's samples for `g = Σ_{ℓm} h(ℓ)·C_{ℓm}·Y_{ℓm}`, exact for coefficients of
+degree `≤ lmax`. `scratch` comes from [`riesz_scratch`](@ref). Does not mutate `C`.
+"""
+function sphere_riesz_energy! end
+
+"""
+    riesz_scratch(plan, field) -> scratch
+
+The scratch [`sphere_riesz_energy!`](@ref) needs for `plan` and fields shaped like `field`.
+"""
+function riesz_scratch end
+
+# Real `sph_mode` layout (FastSphericalHarmonics, NUFSHT): `(ℓ, m)` sits at row `ℓ - |m| + 1`, column
+# `2|m| + (m ≥ 0)`, over orthonormal real harmonics with `cos(mφ)` for `m > 0`, `sin(|m|φ)` for `m < 0`
+# and no Condon–Shortley phase.
+@inline _sph_slot(ℓ::Int, m::Int) = (ℓ - abs(m) + 1, 2abs(m) + (m >= 0))
+
+sph_layout_riesz_scratch(plan, field::AbstractArray, lmax::Int) =
+    (D = sphere_coeffs_buffer(plan), f = similar(field),
+     a = Vector{Complex{real(eltype(field))}}(undef, 2lmax + 1),
+     b = Vector{Complex{real(eltype(field))}}(undef, 2lmax + 1))
+
+"""
+    sph_layout_riesz_energy!(out, plan, C, h, lmax, scratch) -> out
+
+[`sphere_riesz_energy!`](@ref) for coefficients in the real `sph_mode` layout, by three scalar
+syntheses through `sphere_apply!`. With `L = -i r×∇`, a real `g` has `|∇_S g|² = |L₊g|² + (∂_φ g)²`,
+and both operators act within each degree: `L₊Y_{ℓm} = √((ℓ-m)(ℓ+m+1)) Y_{ℓ,m+1}` on the
+Condon–Shortley complex harmonics, and `∂_φ` maps `cos(mφ) ↦ -m sin(mφ)`, `sin(mφ) ↦ m cos(mφ)`.
+`L₊g = P + iQ` is synthesised as its real and imaginary parts.
+"""
+function sph_layout_riesz_energy!(out, plan, C, h, lmax::Int, scr)
+    D, f, a, b = scr.D, scr.f, scr.a, scr.b
+    T = real(eltype(f))
+    s2 = sqrt(T(2))
+    one_ = Returns(one(T))
+    # ∂_φ g.
+    fill!(D, zero(eltype(D)))
+    @inbounds for ℓ in 1:lmax
+        hl = T(h(ℓ))
+        for m in 1:ℓ
+            D[_sph_slot(ℓ, m)...] = m * hl * C[_sph_slot(ℓ, -m)...]
+            D[_sph_slot(ℓ, -m)...] = -m * hl * C[_sph_slot(ℓ, m)...]
+        end
+    end
+    sphere_apply!(f, plan, D, one_)
+    @. out = f^2
+    # Re and Im of L₊g.
+    for imagpart in (false, true)
+        fill!(D, zero(eltype(D)))
+        @inbounds for ℓ in 1:lmax
+            _raise!(a, b, C, T(h(ℓ)), ℓ, s2)
+            for m in 0:ℓ
+                sg = isodd(m) ? -one(T) : one(T)
+                bm, bn = b[ℓ + 1 + m], b[ℓ + 1 - m]
+                # Coefficients of the real fields (L₊g ± conj(L₊g))/2 and /2i.
+                v = imagpart ? (bm - sg * conj(bn)) / (2im) : (bm + sg * conj(bn)) / 2
+                if m == 0
+                    D[_sph_slot(ℓ, 0)...] = real(v)
+                else
+                    ap = sg * v
+                    D[_sph_slot(ℓ, m)...] = s2 * real(ap)
+                    D[_sph_slot(ℓ, -m)...] = -s2 * imag(ap)
+                end
+            end
+        end
+        sphere_apply!(f, plan, D, one_)
+        @. out += f^2
+    end
+    return out
+end
+
+# `b = L₊a` on degree `ℓ`, with `a` the Condon–Shortley coefficients of `hl·g`: from the real
+# coefficients, `a_m = (-1)^m (c_m - i c_{-m})/√2` and `a_{-m} = (c_m + i c_{-m})/√2` for `m > 0`.
+# Index `m + ℓ + 1` holds order `m`.
+@inline function _raise!(a, b, C, hl::T, ℓ::Int, s2::T) where {T}
+    @inbounds begin
+        a[ℓ + 1] = complex(hl * C[_sph_slot(ℓ, 0)...])
+        for m in 1:ℓ
+            ap = complex(hl * C[_sph_slot(ℓ, m)...], -hl * C[_sph_slot(ℓ, -m)...]) / s2
+            a[ℓ + 1 + m] = isodd(m) ? -ap : ap
+            a[ℓ + 1 - m] = conj(ap)
+        end
+        b[1] = zero(eltype(b))
+        for m in -ℓ:(ℓ - 1)
+            b[m + ℓ + 2] = sqrt(T((ℓ - m) * (ℓ + m + 1))) * a[m + ℓ + 1]
+        end
+    end
+    return b
+end
 
 """
     sphere_plan_at(plan, lmax) -> plan or nothing
@@ -182,29 +276,23 @@ A backend that returns a plan here lets [`spherical_scattering_batch!`](@ref) is
 cascade step for the whole stack instead of one per field. Returning `nothing` is not a defect; it
 means the per-field loop is the only path, and callers fall back to it.
 
-May return `plan` itself when it is already `B` wide, so a per-task caller wants
-[`task_local_batch_plan`](@ref).
+Returns `plan` itself when `Plans.batch_width(plan) == B`, and otherwise a plan the caller owns and
+closes with `Plans.close_plan!`. A per-task caller wants [`task_local_batch_plan`](@ref).
 """
 batch_plan(::Any, ::Integer) = nothing
 
 """
     task_local_batch_plan(plan, B) -> plan or nothing
 
-A `B`-wide plan safe to apply while `plan` is applied in another task.
+A `B`-wide plan safe to apply while `plan` is applied in another task, owned by the caller.
 
-A spherical plan carries the scratch its analysis solves through, and [`batch_plan`](@ref) may hand
-back `plan` itself at its own width — shared across tasks that corrupts the solve into a diverging
-residual instead of erroring. Widening to another width already builds a fresh plan, so only the
-same-width case copies.
+A spherical plan carries the scratch its analysis solves through, so a task sharing `plan` corrupts
+the solve into a diverging residual. At `plan`'s own width this is `Plans.task_local_plan(plan)`, and
+at any other width [`batch_plan`](@ref) builds a fresh one.
 """
 function task_local_batch_plan(plan, B::Integer)
     supports_batch(plan) || return nothing
-    # Widen a task-local copy rather than deciding afterwards whether `batch_plan` handed `plan` back.
-    # These plans are immutable structs, so `===` on one is a field-by-field comparison rather than an
-    # identity test — it cannot reliably tell a returned original from an equal-valued rebuild, and
-    # getting it wrong hands two tasks the same analysis scratch. Copying first makes that structural:
-    # a width that matches returns the copy, and any other width is built from it.
-    return batch_plan(Plans.task_local_plan(plan), B)
+    return Plans.batch_width(plan) == B ? Plans.task_local_plan(plan) : batch_plan(plan, B)
 end
 
 """
@@ -255,10 +343,6 @@ band_multiplier(σ²hi, σ²lo) = ℓ -> _bj(ℓ, σ²hi, σ²lo)
 
 # g = (−Δ_S)^{-1/2} of the band:  h(ℓ) = b_j(ℓ)/√(ℓ(ℓ+1)),  0 at ℓ=0.
 riesz_potential_multiplier(σ²hi, σ²lo) = ℓ -> ℓ == 0 ? 0.0 : _bj(ℓ, σ²hi, σ²lo) / sqrt(ℓ * (ℓ + 1))
-# Δ_S g = −ℓ(ℓ+1)·ĝ:  h(ℓ) = −√(ℓ(ℓ+1))·b_j(ℓ),  0 at ℓ=0.
-riesz_laplacian_multiplier(σ²hi, σ²lo) = ℓ -> ℓ == 0 ? 0.0 : -sqrt(ℓ * (ℓ + 1)) * _bj(ℓ, σ²hi, σ²lo)
-# Laplace–Beltrami:  Δ_S = ×(−ℓ(ℓ+1)).
-laplacian_multiplier() = ℓ -> -ℓ * (ℓ + 1)
 
 # ---------------------------------------------------------------------------
 # Transforms (backend-generic; the plan supplies sphere_filter! / sphere_mean).
@@ -316,6 +400,20 @@ function task_local(st::SphericalScattering)
             map(p -> p === st.plan ? plan : Plans.task_local_plan(p), st.bands)
     return SphericalScattering(st.lmax, st.J, st.max_order, plan, st.sigma2, bands)
 end
+
+"""
+    close_task_local!(stl, st) -> nothing
+
+`Plans.close_plan!` every plan [`task_local`](@ref)`(st)` built for `stl`; plans `stl` shares with
+`st` stay open.
+"""
+function close_task_local!(stl::SphericalScattering, st::SphericalScattering)
+    _close_unshared!(stl.plan, st.plan)
+    stl.bands === nothing || foreach(_close_unshared!, stl.bands, st.bands)
+    return nothing
+end
+
+_close_unshared!(p, shared) = (p === shared || Plans.close_plan!(p); nothing)
 
 """
     SphericalWorkspace{A,C}
@@ -466,7 +564,7 @@ end
 
 Spherical monogenic scattering: shares the dyadic difference-of-Gaussians bands of
 [`SphericalScattering`](@ref) but replaces the analytic modulus with the spherical monogenic
-amplitude `A_j = √(U⁰_j² + |∇_S g_j|²)` (spin-0 Bochner identity — see [`monogenic_amplitude!`](@ref)).
+amplitude `A_j = √(U⁰_j² + |∇_S g_j|²)` (see [`monogenic_amplitude!`](@ref)).
 """
 struct SphericalMonogenicScattering{T, P, V <: AbstractVector{T}}
     lmax::Int
@@ -480,31 +578,26 @@ task_local(st::SphericalMonogenicScattering) =
     SphericalMonogenicScattering(st.lmax, st.J, st.max_order, Plans.task_local_plan(st.plan),
                                  st.sigma2)
 
+close_task_local!(stl::SphericalMonogenicScattering, st::SphericalMonogenicScattering) =
+    _close_unshared!(stl.plan, st.plan)
+
 """
     monogenic_amplitude!(amp, st, C, j, w) -> amp
 
 Spherical monogenic amplitude at scale `j` of the field whose (already-computed) SH coefficients are
-`C`, written into `amp`. `w` is a NamedTuple of scratch fields `(g, lapg, g2, lapg2)`.
+`C`, written into `amp`. `w` holds the Riesz energy field `r2` and the plan's `riesz` scratch.
 
-Uses only spin-0 transforms via the Bochner/product identity: with `g_j = (−Δ_S)^{-1/2} U⁰_j`,
-
-    |U^R_j|² = |∇_S g_j|² = ½ Δ_S(g_j²) − g_j · Δ_S g_j,
-
-so `A_j = √(U⁰_j² + |∇_S g_j|²)`. The Riesz *vector* itself (needed for orientation/phase) requires
-spin-1 synthesis and is handled separately by `spherical_monogenic_components`.
+With `g_j = (−Δ_S)^{-1/2} U⁰_j` the spin-1 Riesz field has `|U^R_j| = |∇_S g_j|`, so
+`A_j = √(U⁰_j² + |∇_S g_j|²)`, the energy evaluated by [`sphere_riesz_energy!`](@ref). The Riesz
+*vector* (orientation/phase) is `spherical_monogenic_components`.
 """
-function monogenic_amplitude!(amp::AbstractArray, st::SphericalMonogenicScattering{T},
-                              C, j::Int, w) where {T}
+function monogenic_amplitude!(amp::AbstractArray, st::SphericalMonogenicScattering,
+                              C, j::Int, w)
     σ²hi = st.sigma2[j + 1]
     σ²lo = st.sigma2[j]
-    sphere_apply!(amp,    st.plan, C, band_multiplier(σ²hi, σ²lo))              # U⁰ (into amp)
-    sphere_apply!(w.g,    st.plan, C, riesz_potential_multiplier(σ²hi, σ²lo))   # g = (−Δ)^{-1/2}U⁰
-    sphere_apply!(w.lapg, st.plan, C, riesz_laplacian_multiplier(σ²hi, σ²lo))   # Δ_S g
-    @. w.g2 = w.g^2
-    sphere_coeffs!(w.Cg2, st.plan, w.g2)                                        # re-analyse g²
-    sphere_apply!(w.lapg2, st.plan, w.Cg2, laplacian_multiplier())             # Δ_S(g²)
-    # |∇_S g|² = ½ Δ_S(g²) − g Δ_S g  (clamp tiny negatives from finite-lmax error)
-    @. amp = sqrt(amp^2 + max(zero(T), T(0.5) * w.lapg2 - w.g * w.lapg))
+    sphere_apply!(amp, st.plan, C, band_multiplier(σ²hi, σ²lo))                         # U⁰
+    sphere_riesz_energy!(w.r2, st.plan, C, riesz_potential_multiplier(σ²hi, σ²lo), w.riesz)
+    @. amp = sqrt(amp^2 + w.r2)
     return amp
 end
 
@@ -512,8 +605,8 @@ end
     SphericalMonogenicWorkspace{A,C,S}
 
 Scratch for one spherical monogenic cascade: the current amplitude field `u1`, a second `amp` for
-the order-2 amplitudes, two coefficient containers, and `scratch` — the `(g, lapg, g2, lapg2)`
-fields the Bochner identity needs (see [`monogenic_amplitude!`](@ref)).
+the order-2 amplitudes, two coefficient containers, and `scratch` — the Riesz energy field and the
+plan's [`riesz_scratch`](@ref) (see [`monogenic_amplitude!`](@ref)).
 """
 struct SphericalMonogenicWorkspace{A, C, S}
     u1::A
@@ -526,8 +619,7 @@ end
 SphericalMonogenicWorkspace(st, field::AbstractArray) = SphericalMonogenicWorkspace(
     similar(field), similar(field),
     sphere_coeffs_buffer(st.plan), sphere_coeffs_buffer(st.plan),
-    (g = similar(field), lapg = similar(field), g2 = similar(field), lapg2 = similar(field),
-     Cg2 = sphere_coeffs_buffer(st.plan)))
+    (r2 = similar(field), riesz = riesz_scratch(st.plan, field)))
 
 """
     (st::SphericalMonogenicScattering)(field) -> (; S0, S1, S2)
@@ -964,37 +1056,63 @@ make_structured_plan(::SB.AbstractAutoSpectralBackend, lmax, ::Type{T}; kwargs..
     return (dn - up) / 2
 end
 
-function _riesz_gradient(plan::DirectSHTSphericalPlan{T}, gc::AbstractVector) where {T}
-    M, lmax = plan.M, plan.lmax
-    s2 = sqrt(T(2))
-    uθ = zeros(T, M)
-    uφ = zeros(T, M)
-    P0 = Matrix{T}(undef, lmax + 1, lmax + 1)
-    @inbounds for n in 1:M
-        θn, φn = plan.theta[n], plan.phi[n]
-        _assoc_legendre!(P0, cos(θn), lmax)
-        invs = one(T) / sin(θn)
-        aθ = zero(T)
-        aφ = zero(T)
-        col = 0
-        for ℓ in 0:lmax, m in -ℓ:ℓ
-            col += 1
-            am = abs(m)
-            dP = _dtheta_pbar(P0, ℓ, am)                             # ∂_θ P̄_ℓ^|m|
-            if m == 0
-                aθ += gc[col] * dP
-            elseif m > 0
-                aθ += gc[col] * s2 * dP * cos(m * φn)
-                aφ += gc[col] * s2 * P0[ℓ + 1, am + 1] * (m * sin(m * φn)) * invs
-            else
-                aθ += gc[col] * s2 * dP * sin(am * φn)
-                aφ -= gc[col] * s2 * P0[ℓ + 1, am + 1] * (am * cos(am * φn)) * invs
-            end
+riesz_scratch(plan::DirectSHTSphericalPlan{T}, ::AbstractArray) where {T} =
+    (gc = Vector{T}(undef, plan.K), P = Matrix{T}(undef, plan.lmax + 1, plan.lmax + 1),
+     cm = Vector{T}(undef, plan.lmax + 1), sm = Vector{T}(undef, plan.lmax + 1))
+
+# `scr.gc = h(ℓ)·C` in the design matrix's `(ℓ, m = -ℓ:ℓ)` column order.
+function _scaled_coeffs!(scr, plan::DirectSHTSphericalPlan{T}, C, h) where {T}
+    k = 1
+    @inbounds for l in 0:plan.lmax
+        hl = T(h(l))
+        for _ in -l:l
+            scr.gc[k] = hl * C[k]
+            k += 1
         end
-        uθ[n] = aθ
-        uφ[n] = aφ
     end
-    return uθ, uφ
+    return scr.gc
+end
+
+# Legendre table and `cos(mφ), sin(mφ)` of point `n` into `scr`; returns `1/sinθ`.
+function _prepare_point!(scr, plan::DirectSHTSphericalPlan{T}, n::Int) where {T}
+    _assoc_legendre!(scr.P, cos(plan.theta[n]), plan.lmax)
+    @inbounds for m in 0:plan.lmax
+        scr.sm[m + 1], scr.cm[m + 1] = sincos(m * plan.phi[n])
+    end
+    return one(T) / sin(plan.theta[n])
+end
+
+# `(∂_θ g, ∂_φ g / sinθ)` at the point `scr` was prepared for, `g` having coefficients `scr.gc`.
+function _gradient_at(plan::DirectSHTSphericalPlan{T}, scr, invs::T) where {T}
+    gc, P, cm, sm = scr.gc, scr.P, scr.cm, scr.sm
+    s2 = sqrt(T(2))
+    aθ = zero(T)
+    aφ = zero(T)
+    col = 0
+    @inbounds for ℓ in 0:plan.lmax, m in -ℓ:ℓ
+        col += 1
+        am = abs(m)
+        dP = _dtheta_pbar(P, ℓ, am)                                  # ∂_θ P̄_ℓ^|m|
+        if m == 0
+            aθ += gc[col] * dP
+        elseif m > 0
+            aθ += gc[col] * s2 * dP * cm[am + 1]
+            aφ += gc[col] * s2 * P[ℓ + 1, am + 1] * (m * sm[am + 1]) * invs
+        else
+            aθ += gc[col] * s2 * dP * sm[am + 1]
+            aφ -= gc[col] * s2 * P[ℓ + 1, am + 1] * (am * cm[am + 1]) * invs
+        end
+    end
+    return aθ, aφ
+end
+
+function sphere_riesz_energy!(out::AbstractArray, plan::DirectSHTSphericalPlan, C, h, scr)
+    _scaled_coeffs!(scr, plan, C, h)
+    @inbounds for n in 1:plan.M
+        aθ, aφ = _gradient_at(plan, scr, _prepare_point!(scr, plan, n))
+        out[n] = aθ^2 + aφ^2
+    end
+    return out
 end
 
 # Pointwise monogenic decomposition on the direct SHT plan (spin-0 band-pass + spin-1 Riesz gradient).
@@ -1005,9 +1123,13 @@ function direct_monogenic_components(st::SphericalMonogenicScattering{<:Any, <:D
     a = sphere_coeffs(plan, field)                                  # spin-0 SH coefficients
     U0 = similar(plan.theta)
     sphere_apply!(U0, plan, a, band_multiplier(σ²hi, σ²lo))         # band-pass U⁰ (real)
-    rp = riesz_potential_multiplier(σ²hi, σ²lo)
-    gc = [oftype(a[1], rp(plan.ldeg[k])) * a[k] for k in 1:plan.K]  # coeffs of g = (−Δ_S)^{-1/2} U⁰
-    uθ, uφ = _riesz_gradient(plan, gc)
+    # Coefficients of g = (−Δ_S)^{-1/2} U⁰, then its surface gradient at each point.
+    scr = riesz_scratch(plan, field)
+    _scaled_coeffs!(scr, plan, a, riesz_potential_multiplier(σ²hi, σ²lo))
+    uθ, uφ = similar(plan.theta), similar(plan.theta)
+    for n in 1:plan.M
+        uθ[n], uφ[n] = _gradient_at(plan, scr, _prepare_point!(scr, plan, n))
+    end
     # NUFSHT's spin-1 synthesis uses ð g = -(∂_θ + i/sinθ ∂_φ)g, so its Riesz vector is the negative of
     # the raw surface gradient; match that sign so the two backends give identical riesz/orientation.
     @. uθ = -uθ

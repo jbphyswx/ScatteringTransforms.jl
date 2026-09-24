@@ -106,6 +106,53 @@ Test.@testset "Spherical monogenic components: dependency-free direct SH backend
     Test.@test maximum(abs.(URc .- ref)) / maximum(abs.(ref)) < 1e-5
 end
 
+Test.@testset "Riesz energy |∇_S g|² equals the finite-difference gradient on every backend" begin
+    # `g` has content at the band limit `lmax`, and `g²` at twice it.
+    SC = ScatteringTransforms.SphericalCore
+    SBk = SpectralBackends
+    lmax = 10
+    modes = ((10, 3, 0.7 - 0.2im), (7, -2, 0.4 + 0.5im), (4, 0, 0.9 + 0im), (1, 1, 0.3 - 0.6im))
+    g(t, f) = sum(real(c * NUFSHT.sYlm(0, ℓ, m, t, f)) for (ℓ, m, c) in modes)
+    hd = 1.0e-6
+    grad2(t, f) = ((g(t + hd, f) - g(t - hd, f)) / (2hd))^2 +
+                  ((g(t, f + hd) - g(t, f - hd)) / (2hd) / sin(t))^2
+
+    M = 700
+    θs = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φs = [2π * mod(k * (sqrt(5) - 1) / 2, 1) for k in 1:M]
+    Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)
+    θg, φg = [t for t in Θ, _ in Φ], [f for _ in Θ, f in Φ]
+    cases = (("direct, scattered", SC.make_spherical_plan(SBk.DirectSumSpectralBackend(), θs, φs, lmax,
+                                                          Float64; rtol = 1e-12), θs, φs),
+             ("NUFSHT, scattered", SC.make_spherical_plan(SBk.NUFSHTSpectralBackend(), θs, φs, lmax,
+                                                          Float64; rtol = 1e-9), θs, φs),
+             ("direct, structured", SC.make_structured_plan(SBk.DirectSumSpectralBackend(), lmax,
+                                                            Float64; rtol = 1e-12), θg, φg),
+             ("FastSphericalHarmonics", SC.make_structured_plan(SBk.FSHTSpectralBackend(), lmax,
+                                                                Float64), θg, φg))
+    for (name, plan, θp, φp) in cases
+        field = g.(θp, φp)
+        ref = grad2.(θp, φp)
+        out = similar(field)
+        SC.sphere_riesz_energy!(out, plan, SC.sphere_coeffs(plan, field), Returns(1.0),
+                                SC.riesz_scratch(plan, field))
+        Test.@test maximum(abs, out .- ref) < 1e-7 * maximum(ref)
+        ScatteringTransforms.Plans.close_plan!(plan)
+    end
+
+    # The cascade's first order is the mean monogenic amplitude, which the spin-1 synthesis of
+    # `spherical_monogenic_components` computes independently.
+    J = 3
+    st = ScatteringTransforms.spherical_monogenic_scattering(θs, φs, lmax, J; rtol = 1e-9)
+    field = g.(θs, φs)
+    S1 = st(field).S1
+    for j in 1:J
+        amp = ScatteringTransforms.spherical_monogenic_components(st, field, j).amplitude
+        Test.@test S1[j] ≈ sum(amp) / M rtol = 1e-6
+    end
+    ScatteringTransforms.close_transform!(st)
+end
+
 Test.@testset "Riesz components equal the surface gradient (finite-difference ground truth)" begin
     # The comparison above is backend-against-backend, so it cannot pin a sign: it checks the complex
     # combination `u_θ + i·u_φ`, and a flip in both components against a flipped reference passes.

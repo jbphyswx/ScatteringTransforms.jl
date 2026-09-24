@@ -22,8 +22,8 @@ println("="^64)
 println("Monogenic (Riesz) scattering")
 println("="^64)
 
-# ── Riesz multipliers tile unity off the DC bin ───────────────────────────────
-R = ST.Monogenic.riesz_multipliers((32, 32), Float64)
+# ── Riesz multipliers tile unity off the DC bin (odd grid: no Nyquist bin) ────
+R = ST.Monogenic.riesz_multipliers((31, 31), Float64)
 partition = sum(abs2.(Rd) for Rd in R)
 println("\nRiesz partition Σ_d|R_d|² = 1 off-DC: ",
         maximum(abs.([partition[i] for i in CartesianIndices(partition) if i != CartesianIndex(1, 1)] .- 1)) < 1e-12)

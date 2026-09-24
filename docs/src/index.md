@@ -35,7 +35,9 @@ are the same.
   monogenic amplitude + continuous orientation/phase (`monogenic_components`); on S²,
   `spherical_monogenic_scattering` (amplitude) and `spherical_monogenic_components` (pointwise
   orientation/phase via the spin-1 Riesz vector).
-- **Tight-frame filter bank**: `|φ|² + Σⱼ|ψⱼ|² ≡ 1` (non-expansive).
+- **Littlewood–Paley normalized filter bank**: `0 < A ≤ 1` with
+  `A = |φ̂|² + ½Σ_λ(|ψ̂_λ(k)|² + |ψ̂_λ(−k)|²)`, so the wavelet layer is non-expansive and invertible;
+  a wavelet at scale `j` is the same function for every grid size and depth `J`.
 - **Pluggable spectral backend**: in-core direct-sum default; `using FFTW` → `O(N log N)`
   fast path (`spectral = AutoSpectralBackend() | DirectSumSpectralBackend() | FFTSpectralBackend()`).
 - **Scale**: `scattering_batch` (one plan reused), `ThreadedBackend` (OhMyThreads),
@@ -68,7 +70,7 @@ red   = ST.Reductions.normalized_coefficients(c)                # s1 = S1/S0, s2
 B     = ST.scattering_batch(st, randn(1024, 100))               # (coeffs × 100), one plan reused
 ```
 
-### Filter bank (tight frame)
+### Filter bank and its Littlewood–Paley sum
 ![Filter bank](assets/filter_bank.png)
 
 ### 1D and 2D scattering
@@ -123,7 +125,7 @@ path via `spectral = NUFFTSpectralBackend()`.
 On S², both **scattered points** (`spherical_scattering`; in-core direct SHT by default, NUFSHT fast
 path when loaded) and a **structured**
 Clenshaw–Curtis grid (`structured_spherical_scattering`, fast SHT) give matching coefficients; the
-monogenic Riesz energy is computed with spin-0 transforms via a Bochner identity, and
+monogenic Riesz energy `|∇_S g|²` is synthesised exactly from scalar transforms, and
 `spherical_monogenic_components` synthesizes the spin-1 Riesz vector for pointwise orientation/phase.
 
 ![Spherical scattering](assets/spherical_scattering.png)

@@ -27,8 +27,17 @@ end
 # conversion can capture more of the enclosing scope than the body textually uses, and `st` is in that
 # scope holding FFTW/FastTransforms plans — pointers into native memory that do not survive a
 # serialisation round trip. Capturing it corrupted the caller's transform in place.
-_chunk(spec, inner, slicer, X, cols) =
-    ST.scattering_batch(inner, ST.rebuild_transform(spec), slicer(X, cols))
+#
+# The rebuilt transform is closed on the way out: its plans own C library plans, whose destructor
+# takes a lock a GC finalizer cannot.
+function _chunk(spec, inner, slicer, X, cols)
+    st = ST.rebuild_transform(spec)
+    try
+        return ST.scattering_batch(inner, st, slicer(X, cols))
+    finally
+        ST.close_transform!(st)
+    end
+end
 
 # On a worker the processes carry the parallelism, so FastTransforms runs on one OpenMP thread there.
 _remote_chunk(spec, inner, slicer, X, cols) =

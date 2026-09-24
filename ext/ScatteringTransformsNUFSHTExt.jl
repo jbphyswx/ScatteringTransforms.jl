@@ -5,8 +5,8 @@ module ScatteringTransformsNUFSHTExt
 
 Provides the **scattered-sphere** backend for the shared spherical scattering core
 (`SphericalCore`): a scalar field sampled at arbitrary points `(θ, φ)` on S², analysed/synthesised
-via NUFSHT. The DoG band-pass bank, the S0/S1/S2 cascade, and the spin-0 Bochner monogenic amplitude
-all live in `SphericalCore`; this extension only supplies
+via NUFSHT. The DoG band-pass bank, the S0/S1/S2 cascade, and the monogenic amplitude all live in
+`SphericalCore`; this extension only supplies
 
   * a plan wrapper `NUSHTSphericalPlan` over `NUFSHT.NUSHTplan`;
   * `sphere_coeffs` (band-limited least-squares analysis) and `sphere_apply!` (per-degree multiply
@@ -91,12 +91,16 @@ function ST.SphericalCore.batch_plan(p::NUSHTSphericalPlan, B::Integer)
 end
 
 ST.SphericalCore.plan_nufft(p::NUSHTSphericalPlan) = p.nufft
+ST.Plans.batch_width(p::NUSHTSphericalPlan) = p.plan.B
 
-# `NUFSHT.close!` frees the FINUFFT plans a NUSHT plan owns and is idempotent, so the finalizer that
-# would otherwise free them from a GC context finds nothing left to do.
+# `NUFSHT.close!` frees the FINUFFT plans a NUSHT plan owns and is idempotent, which leaves the GC
+# finalizers nothing to free. Destroying a FINUFFT plan destroys its FFTW plans, which may not
+# overlap a plan build.
 function ST.Plans.close_plan!(p::NUSHTSphericalPlan)
-    NUFSHT.close!(p.plan)
-    p.spin === nothing || (NUFSHT.close!(p.spin[1]); NUFSHT.close!(p.spin[2]))
+    Base.@lock ST.Plans.PLANNER_LOCK begin
+        NUFSHT.close!(p.plan)
+        p.spin === nothing || (NUFSHT.close!(p.spin[1]); NUFSHT.close!(p.spin[2]))
+    end
     return nothing
 end
 ST.SphericalCore.plan_spin(p::NUSHTSphericalPlan) = p.spin
@@ -170,6 +174,12 @@ ST.SphericalCore.sphere_coeffs_buffer(plan::NUSHTSphericalPlan) =
 ST.SphericalCore.sphere_apply!(out::AbstractVecOrMat, plan::NUSHTSphericalPlan, C, h) =
     NUFSHT.nusht_synthesize!(out, C, _FnTransfer(h), plan.plan)
 
+# NUFSHT's scalar coefficients are in the real `sph_mode` layout.
+ST.SphericalCore.riesz_scratch(plan::NUSHTSphericalPlan, field::AbstractVector) =
+    ST.SphericalCore.sph_layout_riesz_scratch(plan, field, plan.lmax)
+ST.SphericalCore.sphere_riesz_energy!(out::AbstractVector, plan::NUSHTSphericalPlan, C, h, scr) =
+    ST.SphericalCore.sph_layout_riesz_energy!(out, plan, C, h, plan.lmax, scr)
+
 # Unweighted sample mean over the (quasi-uniform) scattered points ≈ the spherical average. An
 # `(M, B)` stack averages each field separately, so a batch gets one mean per column.
 ST.SphericalCore.sphere_mean(plan::NUSHTSphericalPlan, field::AbstractVector) = sum(field) / plan.M
@@ -230,8 +240,8 @@ end
 #   U^R_j = ð∘(−Δ_S)^{-1/2} U⁰_j,   coeffs = √(ℓ(ℓ+1))·(1/√(ℓ(ℓ+1)))·b_j(ℓ)·a_ℓm = b_j(ℓ)·a_ℓm  (ℓ≥1).
 # So the SAME coefficient array `sf = b_j(ℓ)·a` synthesised at spin-0 gives the band-pass field and at
 # spin-1 gives the complex tangent Riesz field `U = u_θ + i u_φ`. The scalar amplitude √(U⁰²+|U^R|²)
-# agrees (up to the SHT's accuracy) with the spin-0 Bochner identity used by the scattering cascade —
-# validated in the tests, which also check the spin-1 synthesis against the closed-form `sYlm`.
+# agrees (up to the SHT's accuracy) with the scattering cascade's `sphere_riesz_energy!` — validated
+# in the tests, which also check the spin-1 synthesis against the closed-form `sYlm`.
 # ---------------------------------------------------------------------------
 
 function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogenicScattering{<:Any, <:NUSHTSphericalPlan},

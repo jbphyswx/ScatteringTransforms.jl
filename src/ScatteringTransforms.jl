@@ -387,18 +387,37 @@ function scattering_batch!(out::AbstractMatrix, st::SphericalCore.SphericalScatt
     B = size(X)[end]
     _spherical_batches(st.plan, X) || return _spherical_batch_perfield!(out, st, X)
 
+    # `batch_plan` hands back `st.plan` at its own width and otherwise a plan this call owns.
     bp = SphericalCore.batch_plan(st.plan, B)
-    stb = SphericalCore.SphericalScattering(st.lmax, st.J, st.max_order, bp, st.sigma2)
-    ws = SphericalCore.SphericalWorkspace(stb, X)
-    S1 = zeros(T, st.J, B)
-    S2 = st.max_order >= 2 ? zeros(T, st.J, st.J, B) : Array{T, 3}(undef, 0, 0, 0)
-    r = SphericalCore.spherical_scattering_batch!(S1, S2, stb, ws, X)
-    empty2 = Matrix{T}(undef, 0, 0)
-    @inbounds for b in 1:B
-        S2b = isempty(r.S2) ? empty2 : view(r.S2, :, :, b)
-        _flatten_spherical!(view(out, :, b), r.S0[b], view(r.S1, :, b), S2b, st.J)
+    owned = Plans.batch_width(st.plan) != B
+    try
+        stb = SphericalCore.SphericalScattering(st.lmax, st.J, st.max_order, bp, st.sigma2)
+        ws = SphericalCore.SphericalWorkspace(stb, X)
+        S1 = zeros(T, st.J, B)
+        S2 = st.max_order >= 2 ? zeros(T, st.J, st.J, B) : Array{T, 3}(undef, 0, 0, 0)
+        r = SphericalCore.spherical_scattering_batch!(S1, S2, stb, ws, X)
+        empty2 = Matrix{T}(undef, 0, 0)
+        @inbounds for b in 1:B
+            S2b = isempty(r.S2) ? empty2 : view(r.S2, :, :, b)
+            _flatten_spherical!(view(out, :, b), r.S0[b], view(r.S1, :, b), S2b, st.J)
+        end
+    finally
+        owned && Plans.close_plan!(bp)
     end
     return out
+end
+
+"""
+    close_transform!(st) -> nothing
+
+`Plans.close_plan!` every spectral plan `st` owns. `st` must not be in use by any task, and is not
+usable after.
+"""
+close_transform!(st) = (Plans.close_plan!(st.plan); nothing)
+function close_transform!(st::SphericalCore.SphericalScattering)
+    Plans.close_plan!(st.plan)
+    st.bands === nothing || foreach(Plans.close_plan!, st.bands)
+    return nothing
 end
 
 # Serializable build spec for reconstructing a transform on a remote worker (FFTW/device plans are
@@ -622,8 +641,8 @@ Build a **monogenic** spherical scattering transform for a scalar field at scatt
 `(θ, φ)` on S². The nonlinearity is the spherical monogenic amplitude
 `A_j = √(U⁰_j² + |U^R_j|²)`, where `U⁰_j` is the difference-of-Gaussians band-pass and `U^R_j` is
 the spin-1 Riesz field `R = ð∘(−Δ_S)^{-1/2}`. The Riesz energy `|U^R_j|² = |∇_S g_j|²` (with
-`g_j = (−Δ_S)^{-1/2} U⁰_j`) is evaluated using only spin-0 spherical-harmonic transforms via the
-identity `|∇_S g|² = ½ Δ_S(g²) − g Δ_S g`, so no spin-weighted synthesis is required. `spectral`
+`g_j = (−Δ_S)^{-1/2} U⁰_j`) is synthesised exactly from `g_j`'s coefficients
+(`SphericalCore.sphere_riesz_energy!`). `spectral`
 selects the spherical-harmonic transform as in [`spherical_scattering`](@ref) (dependency-free
 direct SH transform by default, NUFSHT fast path when loaded).
 """

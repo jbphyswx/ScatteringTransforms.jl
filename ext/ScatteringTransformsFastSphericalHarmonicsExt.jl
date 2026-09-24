@@ -7,8 +7,8 @@ The **structured (uniform)** spherical backend for the shared spherical scatteri
 (`SphericalCore`), alongside the scattered-point NUFSHT backend. A scalar field is sampled on the
 Clenshaw–Curtis grid of `FastSphericalHarmonics`
 (`Nθ = lmax+1`, `Nφ = 2lmax+1`) and analysed/synthesised with the fast `sph_transform!` /
-`sph_evaluate!`. The DoG band-pass bank, S0/S1/S2 cascade, and the spin-0 Bochner monogenic amplitude
-are shared with `SphericalCore`; this extension only supplies the plan and the two interface methods.
+`sph_evaluate!`. The DoG band-pass bank, S0/S1/S2 cascade, and the monogenic amplitude are shared
+with `SphericalCore`; this extension supplies the plan and its interface methods.
 
 The spherical average (`sphere_mean`) is the exact quadrature integral, evaluated directly as a
 weighted sum over the grid. Reading it from the degree-0 harmonic coefficient instead would be
@@ -147,6 +147,12 @@ function ST.SphericalCore.sphere_apply!(out::AbstractMatrix, plan::SHTSphericalP
     copyto!(out, C2)
     return out
 end
+
+# The coefficients are in the real `sph_mode` layout.
+ST.SphericalCore.riesz_scratch(plan::SHTSphericalPlan, field::AbstractMatrix) =
+    ST.SphericalCore.sph_layout_riesz_scratch(plan, field, plan.lmax)
+ST.SphericalCore.sphere_riesz_energy!(out::AbstractMatrix, plan::SHTSphericalPlan, C, h, scr) =
+    ST.SphericalCore.sph_layout_riesz_energy!(out, plan, C, h, plan.lmax, scr)
 
 # ⟨f⟩ = (1/4π)∬ f sinθ dθ dφ. Longitude is uniform, so its integral is the plain row mean; colatitude
 # uses the Fejér weights, which integrate ∫₀^π g sinθ dθ exactly for band-limited `g` and sum to 2 —
