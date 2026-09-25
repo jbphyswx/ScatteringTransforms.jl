@@ -93,9 +93,8 @@ end
 ST.SphericalCore.plan_nufft(p::NUSHTSphericalPlan) = p.nufft
 ST.Plans.batch_width(p::NUSHTSphericalPlan) = p.plan.B
 
-# `NUFSHT.close!` frees the FINUFFT plans a NUSHT plan owns and is idempotent, which leaves the GC
-# finalizers nothing to free. Destroying a FINUFFT plan destroys its FFTW plans, which may not
-# overlap a plan build.
+# `NUFSHT.close!` frees the NUFFT plans a NUSHT plan owns and is idempotent. Destroying a FINUFFT plan
+# destroys its FFTW plans, which may not overlap a plan build.
 function ST.Plans.close_plan!(p::NUSHTSphericalPlan)
     Base.@lock ST.Plans.PLANNER_LOCK begin
         NUFSHT.close!(p.plan)
@@ -121,18 +120,18 @@ function ST.Plans.task_local_plan(p::NUSHTSphericalPlan)
                               _rebuild_spin(p))
 end
 
-# One spin plan per spin weight over the plan's own points, or `nothing` for a plan that carries none.
-# Serialised for the FFTW planner inside the NUFFT build, like every other plan build here; the spin
-# path drives no FastTransforms code, so it needs no OpenMP pin.
-_spin_plans(::Type{FE}, theta, phi, lmax::Int) where {FE} =
+# One spin plan per spin weight over the plan's own points, on the scalar plan's NUFFT library, or
+# `nothing` for a plan that carries none. Serialised for the FFTW planner inside the NUFFT build, like
+# every other plan build here; the spin path drives no FastTransforms code, so it needs no OpenMP pin.
+_spin_plans(::Type{FE}, theta, phi, lmax::Int, nufft) where {FE} =
     Base.@lock ST.Plans.PLANNER_LOCK begin
-        (NUFSHT.make_spin_plan(FE, theta, phi, lmax, 0),
-         NUFSHT.make_spin_plan(FE, theta, phi, lmax, 1))
+        (NUFSHT.make_spin_plan(FE, theta, phi, lmax, 0; nufft = nufft),
+         NUFSHT.make_spin_plan(FE, theta, phi, lmax, 1; nufft = nufft))
     end
 
 _rebuild_spin(p::NUSHTSphericalPlan) =
     p.spin === nothing ? nothing :
-    _spin_plans(Complex{eltype(p.theta)}, p.theta, p.phi, p.lmax)
+    _spin_plans(Complex{eltype(p.theta)}, p.theta, p.phi, p.lmax, p.nufft)
 
 # Generic per-degree spectral multiplier h(ℓ): NUFSHT's apply_transfer! dispatches on
 # `kernel_transfer(filter, ℓ)`, so any object with this method is a valid transfer.
@@ -228,7 +227,7 @@ function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_ph
     end
     # NUFSHT's positional argument is the *field* element type, not the precision: a real one selects
     # its folded real layout, and the spin field is complex.
-    sp = spin ? _spin_plans(Complex{T}, θ, φ, lmax) : nothing
+    sp = spin ? _spin_plans(Complex{T}, θ, φ, lmax, nb) : nothing
     return NUSHTSphericalPlan(plan, length(θ), lmax, θ, φ, T(rtol), maxiter, nb, sp)
 end
 
@@ -254,7 +253,7 @@ function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogen
     # against the two syntheses below. A plan built without them (a plain `spherical_scattering`, or one
     # rebuilt from a spec by an older caller) builds them here instead of refusing.
     p0, p1 = ST.SphericalCore.plan_spin(p) === nothing ?
-             _spin_plans(Complex{T}, p.theta, p.phi, lmax) : ST.SphericalCore.plan_spin(p)
+             _spin_plans(Complex{T}, p.theta, p.phi, lmax, p.nufft) : ST.SphericalCore.plan_spin(p)
     # Complex spin-0 coefficients of the field in NUFSHT's dense spin layout (exact CG inversion,
     # so the band-pass and Riesz fields below share one consistent set of coefficients).
     a = zeros(Complex{T}, lmax + 1, 2lmax + 1)

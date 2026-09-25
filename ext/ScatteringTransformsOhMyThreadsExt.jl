@@ -167,9 +167,9 @@ end
 # (nonuniform) or in a separate workspace object (spherical), so each task takes its own and the
 # shared plan, filter bank and point set stay read-only.
 #
-# The per-task plans own C library plans, whose destructor takes a lock a GC finalizer cannot. They
-# are built before the tasks start, one per column chunk, and closed on the way out, in `finally`
-# because a solve that refuses to converge is an exception a caller can catch and carry on from.
+# The per-task plans own C library plans. They are built before the tasks start, one per column chunk,
+# and closed on the way out, in `finally` because a solve that refuses to converge is an exception a
+# caller can catch and carry on from.
 # ---------------------------------------------------------------------------
 
 # Partition 1:n into ≤ k contiguous column ranges.

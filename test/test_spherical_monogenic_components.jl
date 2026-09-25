@@ -77,6 +77,19 @@ Test.@testset "Spherical monogenic components (spin-1 orientation/phase on S²)"
         tl = ScatteringTransforms.Plans.task_local_plan(st.plan)
         Test.@test SC.plan_spin(tl) !== nothing
         Test.@test SC.plan_spin(tl) !== SC.plan_spin(st.plan)
+
+        # The spin pair runs on the scalar plan's NUFFT library, in a task's copy and a widened plan too.
+        for lib in (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
+            sl = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J; nufft = lib)
+            copies = (ScatteringTransforms.Plans.task_local_plan(sl.plan), SC.batch_plan(sl.plan, 2))
+            for p in (sl.plan, copies...)
+                Test.@test p.nufft === lib
+                Test.@test FTB._backend(NUFSHT._nufft2(p.plan).plan) === lib
+                Test.@test all(q -> FTB._backend(NUFSHT._nufft2(q).plan) === lib, SC.plan_spin(p))
+            end
+            foreach(ScatteringTransforms.Plans.close_plan!, copies)
+            ScatteringTransforms.close_transform!(sl)
+        end
     end
 end
 

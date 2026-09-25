@@ -560,9 +560,8 @@ evaluates the filtered field back at the points. Apply it to a length-`M` vector
 dependency-free exact NUDFT (always available, `O(M·prod(ms))`);
 `FlowTransformBindings.NonuniformFFTsBackend()` and `FlowTransformBindings.FINUFFTBackend()` select a
 nonuniform-FFT library (`using NonuniformFFTs` / `using FINUFFT`);
-`SpectralBackends.NUFFTSpectralBackend` takes whichever of those is loaded; and
-`SpectralBackends.AutoSpectralBackend` (the default) picks a fast library if one is loaded, else the
-direct sum. `period` is the physical domain size per
+and `SpectralBackends.AutoSpectralBackend` (the default) takes NonuniformFFTs when it is loaded, FINUFFT
+when only it is, and the direct sum otherwise. `period` is the physical domain size per
 axis (the Fourier period); it defaults so a uniform `0:m-1` grid reproduces the gridded FFT transform
 exactly. `solve=false` uses the fast adjoint (type-1) — exact for adequately-sampled band-limited
 fields, approximate on gappy/irregular data; `solve=true` recovers the true band-limited coefficients

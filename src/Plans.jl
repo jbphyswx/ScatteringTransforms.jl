@@ -95,13 +95,9 @@ spectral_backend(plan::AbstractScatteringPlan) = throw(ArgumentError(
     close_plan!(plan) -> nothing
 
 Release the foreign-library resources `plan` owns, now rather than at collection. No-op by default,
-and safe to call more than once.
-
-Whoever *builds* a plan per task must call this when the task is done. These destructors take a lock
-— FINUFFT installs one to serialise its FFTW planner calls — and a lock cannot be taken from a GC
-finalizer, so leaving them to be collected aborts the process the moment one fires inside another
-task's transform. Closing eagerly leaves the finalizer nothing to do, since it checks whether the C
-plan is already gone.
+and safe to call more than once. Whoever *builds* a plan per task calls this when the task is done, so
+the memory of one task's plans is returned before the next batch builds its own; cuFINUFFT plans are
+released by this alone.
 """
 close_plan!(::Any) = nothing
 
@@ -681,9 +677,8 @@ function abstractffts_plan end
 # builder's throwing stub — and performs no lookup at all.
 _have_fftw() = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsFFTWExt) !== nothing
 
-# The NUFFT library `AutoSpectralBackend` and the generic `NUFFTSpectralBackend` take: the first loaded
-# of the two, in the order FlowTransformBindings' `benchmark/nufft_libraries.jl` measures faster per
-# execution; `nothing` when neither is.
+# The NUFFT library `AutoSpectralBackend` takes: NonuniformFFTs when it is loaded, FINUFFT when only it
+# is; `nothing` when neither is.
 function _nufft_library()
     for b in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
         FTB.is_available(b) && return b
@@ -745,8 +740,8 @@ function plan_analysis end
 Build the scattered/nonuniform planar plan selected by `spectral` over points `(x, y)` and a uniform
 mode grid of size `ms`. `SpectralBackends.DirectSumSpectralBackend` is the dependency-free exact
 NUDFT; `FlowTransformBindings.FINUFFTBackend()` and `FlowTransformBindings.NonuniformFFTsBackend()`
-select a nonuniform-FFT library; `SpectralBackends.NUFFTSpectralBackend` takes whichever is loaded, and
-`SpectralBackends.AutoSpectralBackend` falls back to the exact direct sum when neither is.
+select a nonuniform-FFT library; `SpectralBackends.AutoSpectralBackend` takes NonuniformFFTs when it is
+loaded and FINUFFT when only it is, and the exact direct sum when neither is.
 
 `nufft_nthreads` sets the library's own thread count (`0`, the default, takes `Threads.nthreads()`).
 The direct sum accepts it and ignores it, as it does `eps`, so a caller can pass one set of options
@@ -761,13 +756,10 @@ make_scattered_plan(spectral::SB.AbstractDirectSumSpectralBackend, x, y, ms, ::T
 make_scattered_plan(b::Union{FTB.FINUFFTBackend, FTB.NonuniformFFTsBackend}, x, y, ms, ::Type{T};
                     kwargs...) where {T} = nufft_scattered_plan(b, x, y, ms, T; kwargs...)
 
-function make_scattered_plan(::SB.AbstractNUFFTSpectralBackend, x, y, ms, ::Type{T}; kwargs...) where {T}
-    lib = _nufft_library()
-    lib === nothing && throw(ArgumentError(
-        "NUFFTSpectralBackend requires a nonuniform-FFT library. Run `using NonuniformFFTs` or " *
-        "`using FINUFFT`, or pass DirectSumSpectralBackend() for the exact O(M·prod(ms)) direct summation."))
-    return nufft_scattered_plan(lib, x, y, ms, T; kwargs...)
-end
+make_scattered_plan(t::SB.AbstractNUFFTSpectralBackend, x, y, ms, ::Type{T}; kwargs...) where {T} =
+    throw(ArgumentError(
+        "$(nameof(typeof(t))) names no NUFFT library; pass FlowTransformBindings.NonuniformFFTsBackend() " *
+        "(`using NonuniformFFTs`) or FlowTransformBindings.FINUFFTBackend() (`using FINUFFT`)."))
 
 function make_scattered_plan(::SB.AbstractAutoSpectralBackend, x, y, ms, ::Type{T}; kwargs...) where {T}
     lib = _nufft_library()

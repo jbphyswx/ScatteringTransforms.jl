@@ -21,9 +21,8 @@ Planar (Cartesian) and spherical scattering, on uniform/structured and nonunifor
 selected by the `spectral` keyword, which takes a
 [SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag. `DirectSumSpectralBackend`
 is the in-core default everywhere; the fast paths are `FFTSpectralBackend` (FFTW) on a grid,
-`NUFFTSpectralBackend` for scattered points (either library through
-[FlowTransformBindings.jl](https://github.com/jbphyswx/FlowTransformBindings.jl), whose
-`NonuniformFFTsBackend()` and `FINUFFTBackend()` name one), `NUFSHTSpectralBackend`
+[FlowTransformBindings.jl](https://github.com/jbphyswx/FlowTransformBindings.jl)'s
+`NonuniformFFTsBackend()` or `FINUFFTBackend()` for scattered points, `NUFSHTSpectralBackend`
 (NUFSHT) for the scattered sphere, and `FSHTSpectralBackend` (FastSphericalHarmonics) for the
 structured sphere. `AutoSpectralBackend` (the default) picks the fast path if its extension is
 loaded, else the direct sum — so nothing requires an external library. Naming a backend explicitly is

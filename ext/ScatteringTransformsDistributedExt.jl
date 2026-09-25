@@ -28,8 +28,7 @@ end
 # scope holding FFTW/FastTransforms plans — pointers into native memory that do not survive a
 # serialisation round trip. Capturing it corrupted the caller's transform in place.
 #
-# The rebuilt transform is closed on the way out: its plans own C library plans, whose destructor
-# takes a lock a GC finalizer cannot.
+# The rebuilt transform is closed on the way out, which frees the C library plans it owns.
 function _chunk(spec, inner, slicer, X, cols)
     st = ST.rebuild_transform(spec)
     try

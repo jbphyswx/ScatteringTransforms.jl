@@ -12,8 +12,8 @@ coefficients, mirroring the gridded `ScatteringTransform2D` cascade (same `build
 
 The spectral plan is chosen by `spectral`: the in-core `SB.DirectSumSpectralBackend` (exact
 direct-summation NUDFT, no dependencies) is the always-available default;
-`SB.NUFFTSpectralBackend` (or `SB.AutoSpectralBackend` once a NUFFT extension is loaded) selects the
-fast path. Both satisfy the same `AbstractScatteringPlan` interface, so the cascade is identical
+`FlowTransformBindings.NonuniformFFTsBackend()` or `FlowTransformBindings.FINUFFTBackend()` (or
+`SB.AutoSpectralBackend` once one of them is loaded) selects the fast path. Both satisfy the same `AbstractScatteringPlan` interface, so the cascade is identical
 either way.
 """
 
