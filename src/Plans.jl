@@ -22,6 +22,7 @@ Which transform a plan performs is selected by a `SpectralBackends` tag, not by 
 
 using LinearAlgebra: LinearAlgebra
 using SpectralBackends: SpectralBackends as SB
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 """
     AbstractScatteringPlan
@@ -89,31 +90,6 @@ device-resident FFT plan needs its device too) throw rather than report a host p
 spectral_backend(plan::AbstractScatteringPlan) = throw(ArgumentError(
     "no spectral backend tag is registered for $(typeof(plan)), so a transform using it cannot be " *
     "rebuilt from a serialisable spec — construct the transform on each worker explicitly."))
-
-"""
-    nufft_guru_make(points, type, ms, iflag, ntrans, eps, T; nthreads = 0) -> guru plan
-    nufft_guru_setpts!(guru, x, y) -> guru
-    nufft_guru_exec!(guru, input, output) -> output
-
-Creation, point assignment and execution of a FINUFFT guru plan, split so that a device binding is
-one method rather than a second copy of the scattered-planar plan.
-
-Creation dispatches on the point array, since that is what decides where the transform has to run;
-the other two dispatch on the returned plan, so each backend's handle carries its own execution. The
-host methods live in the FINUFFT extension, the CUDA ones in the cuFINUFFT extension — only the NUFFT
-is vendor-specific, because the cascade around it is broadcasts and reductions over whatever array
-type the points are.
-
-`nthreads` is the library's own thread count, baked into the plan, with `0` meaning "the library's
-default" (all cores). Measured on the scattered-planar shapes: the library's threading is worth
-2.2–3.3× at `M ≳ 2·10⁴` and breaks even at `M ~ 500`, so the default keeps it. A plan built per task
-defaults to one instead — see [`per_task_nthreads`](@ref). A device binding has no CPU threads to set
-and ignores it.
-"""
-function nufft_guru_make end
-function nufft_guru_setpts! end
-function nufft_guru_exec! end
-function nufft_guru_destroy! end
 
 """
     close_plan!(plan) -> nothing
@@ -567,14 +543,6 @@ function lsmr_solve_batched!(x, applyA!::FA, applyAt!::FT, b, u, t, v, w, h, hba
 end
 
 """
-    default_nufft_eps(::Type{T}) -> Float64
-
-The NUFFT tolerance a fast backend uses when the caller names none: `1e-6` for `Float32`, `1e-9`
-otherwise. One definition, because both fast backends must ask their library for the same accuracy.
-"""
-default_nufft_eps(::Type{T}) where {T} = real(float(T)) === Float32 ? 1.0e-6 : 1.0e-9
-
-"""
     default_solver_rtol(::Type{T}, spectral, eps) -> T
 
 Stopping tolerance for the scattered least-squares solve, chosen from the accuracy of the transform
@@ -592,7 +560,7 @@ asked for `1e-8`, two orders under its own `1e-6`.
 default_solver_rtol(::Type{T}, ::SB.AbstractDirectSumSpectralBackend, eps) where {T} =
     T(sqrt(Base.eps(real(float(T)))))
 default_solver_rtol(::Type{T}, ::SB.AbstractSpectralBackend, eps) where {T} =
-    T(max(10 * Float64(eps === nothing ? default_nufft_eps(T) : eps),
+    T(max(10 * Float64(eps === nothing ? FTB.default_tolerance(real(float(T))) : eps),
           sqrt(Base.eps(real(float(T))))))
 
 """
@@ -708,28 +676,20 @@ path is device-agnostic. `region` selects the transformed dimensions (e.g. `(1, 
 """
 function abstractffts_plan end
 
-# Which fast paths exist right now. Only `Auto*` and the "whichever NUFFT library is loaded"
-# resolution call these, because only they have a choice to make; an explicitly named backend
-# dispatches straight to its extension's plan builder — or to that builder's throwing stub — and
-# performs no lookup at all. `hasmethod` cannot substitute here: the stubs make it always true.
+# Whether the FFTW fast path exists right now. Only `Auto` calls this, because only it has a choice to
+# make; an explicitly named backend dispatches straight to its extension's plan builder — or to that
+# builder's throwing stub — and performs no lookup at all.
 _have_fftw() = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsFFTWExt) !== nothing
-_have_finufft() = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsFINUFFTExt) !== nothing
-_have_nonuniformffts() =
-    Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsNonuniformFFTsExt) !== nothing
 
-# ---------------------------------------------------------------------------
-# Spectral backend tags
-#
-# Uniform-grid transforms take `SpectralBackends` tags directly. The two NUFFT libraries need
-# distinguishing, which a single `NUFFTSpectralBackend` cannot do, so each gets its own tag under
-# the shared abstract supertype.
-# ---------------------------------------------------------------------------
-
-"FINUFFT fast path for scattered/nonuniform planar points; requires `using FINUFFT`."
-struct FINUFFTBackend <: SB.AbstractNUFFTSpectralBackend end
-
-"NonuniformFFTs.jl fast path for scattered/nonuniform planar points; requires `using NonuniformFFTs`."
-struct NonuniformFFTsBackend <: SB.AbstractNUFFTSpectralBackend end
+# The NUFFT library `AutoSpectralBackend` and the generic `NUFFTSpectralBackend` take: the first loaded
+# of the two, in the order FlowTransformBindings' `benchmark/nufft_libraries.jl` measures faster per
+# execution; `nothing` when neither is.
+function _nufft_library()
+    for b in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
+        FTB.is_available(b) && return b
+    end
+    return nothing
+end
 
 """
     make_plan(spectral, T, dims; nbatch=1, kwargs...) -> AbstractScatteringPlan
@@ -779,33 +739,18 @@ no tolerance to honour.
 function plan_analysis end
 
 """
-    finufft_scattered_plan(x, y, ms, T; period, solve, maxiter, rtol, eps, nufft_nthreads)
-    nonuniformffts_scattered_plan(x, y, ms, T; period, solve, maxiter, rtol, eps, nufft_nthreads)
-
-Fast-path scattered-planar plan constructors. The real methods live in the FINUFFT and
-NonuniformFFTs extensions; the definitions here are throwing stubs, so naming one of those backends
-explicitly costs a plain dispatch rather than a capability lookup.
-"""
-finufft_scattered_plan(args...; kwargs...) = throw(ArgumentError(
-    "FINUFFTBackend requires the FINUFFT extension. Run `using FINUFFT`."))
-
-"See [`finufft_scattered_plan`](@ref)."
-nonuniformffts_scattered_plan(args...; kwargs...) = throw(ArgumentError(
-    "NonuniformFFTsBackend requires the NonuniformFFTs extension. Run `using NonuniformFFTs`."))
-
-"""
     make_scattered_plan(spectral, x, y, ms, T; period, solve, maxiter, rtol, eps,
                         nufft_nthreads) -> AbstractScatteringPlan
 
 Build the scattered/nonuniform planar plan selected by `spectral` over points `(x, y)` and a uniform
 mode grid of size `ms`. `SpectralBackends.DirectSumSpectralBackend` is the dependency-free exact
-NUDFT; [`FINUFFTBackend`](@ref) and [`NonuniformFFTsBackend`](@ref) select a specific fast library;
-`SpectralBackends.NUFFTSpectralBackend` takes whichever fast library is loaded, and
+NUDFT; `FlowTransformBindings.FINUFFTBackend()` and `FlowTransformBindings.NonuniformFFTsBackend()`
+select a nonuniform-FFT library; `SpectralBackends.NUFFTSpectralBackend` takes whichever is loaded, and
 `SpectralBackends.AutoSpectralBackend` falls back to the exact direct sum when neither is.
 
-`nufft_nthreads` sets the fast library's own thread count (`0`, the default, leaves it to the
-library). The direct sum accepts it and ignores it, as it does `eps`, so a caller can pass one set of
-options without first knowing which backend it will get.
+`nufft_nthreads` sets the library's own thread count (`0`, the default, takes `Threads.nthreads()`).
+The direct sum accepts it and ignores it, as it does `eps`, so a caller can pass one set of options
+without first knowing which backend it will get.
 """
 make_scattered_plan(spectral::SB.AbstractDirectSumSpectralBackend, x, y, ms, ::Type{T};
                     period = nothing, solve::Bool = false, maxiter::Int = 100,
@@ -813,24 +758,21 @@ make_scattered_plan(spectral::SB.AbstractDirectSumSpectralBackend, x, y, ms, ::T
                     eps = nothing, ntrans::Int = 1, nufft_nthreads::Int = 0) where {T} =
     DirectNUFFTPlan(x, y, ms, T; period, solve, maxiter, rtol, damp, ntrans)
 
-make_scattered_plan(::FINUFFTBackend, x, y, ms, ::Type{T}; kwargs...) where {T} =
-    finufft_scattered_plan(x, y, ms, T; kwargs...)
-
-make_scattered_plan(::NonuniformFFTsBackend, x, y, ms, ::Type{T}; kwargs...) where {T} =
-    nonuniformffts_scattered_plan(x, y, ms, T; kwargs...)
+make_scattered_plan(b::Union{FTB.FINUFFTBackend, FTB.NonuniformFFTsBackend}, x, y, ms, ::Type{T};
+                    kwargs...) where {T} = nufft_scattered_plan(b, x, y, ms, T; kwargs...)
 
 function make_scattered_plan(::SB.AbstractNUFFTSpectralBackend, x, y, ms, ::Type{T}; kwargs...) where {T}
-    _have_finufft() && return finufft_scattered_plan(x, y, ms, T; kwargs...)
-    _have_nonuniformffts() && return nonuniformffts_scattered_plan(x, y, ms, T; kwargs...)
-    throw(ArgumentError("NUFFTSpectralBackend requires a fast NUFFT library. Run `using FINUFFT` " *
-                        "or `using NonuniformFFTs`, or pass DirectSumSpectralBackend() for the " *
-                        "exact O(M·prod(ms)) direct summation."))
+    lib = _nufft_library()
+    lib === nothing && throw(ArgumentError(
+        "NUFFTSpectralBackend requires a nonuniform-FFT library. Run `using NonuniformFFTs` or " *
+        "`using FINUFFT`, or pass DirectSumSpectralBackend() for the exact O(M·prod(ms)) direct summation."))
+    return nufft_scattered_plan(lib, x, y, ms, T; kwargs...)
 end
 
 function make_scattered_plan(::SB.AbstractAutoSpectralBackend, x, y, ms, ::Type{T}; kwargs...) where {T}
-    _have_finufft() && return finufft_scattered_plan(x, y, ms, T; kwargs...)
-    _have_nonuniformffts() && return nonuniformffts_scattered_plan(x, y, ms, T; kwargs...)
-    return DirectNUFFTPlan(x, y, ms, T; kwargs...)
+    lib = _nufft_library()
+    lib === nothing && return DirectNUFFTPlan(x, y, ms, T; kwargs...)
+    return nufft_scattered_plan(lib, x, y, ms, T; kwargs...)
 end
 
 # ---------------------------------------------------------------------------
@@ -1210,5 +1152,7 @@ function _lsmr_solve_nudft!(f::AbstractMatrix, plan::DirectNUFFTPlan{T},
     f .*= one(T) / plan.invN
     return f
 end
+
+include("NUFFTScattering.jl")
 
 end # module Plans

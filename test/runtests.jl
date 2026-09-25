@@ -18,6 +18,7 @@ using NUFSHT: NUFSHT
 # earlier test files silently exercise the in-core reference instead of a fast path.
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
+using FlowTransformBindings: FlowTransformBindings as FTB
 using Statistics: Statistics
 using Random: Random
 using DifferentiationInterface: DifferentiationInterface as DI  # loaded so its extension is present for the explicit-imports audit below

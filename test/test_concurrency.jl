@@ -60,7 +60,7 @@ Test.@testset "Every plan a batch builds for itself is closed" begin
     x, y = 2π .* rand(M), 2π .* rand(M)
     X = randn(M, 4)
     for (spectral, ntrans) in ((SpectralBackends.DirectSumSpectralBackend(), 1),
-                               (ScatteringTransforms.Plans.FINUFFTBackend(), 2))
+                               (FTB.FINUFFTBackend(), 2), (FTB.NonuniformFFTsBackend(), 2))
         st = ScatteringTransforms.scattered_planar_scattering(x, y, ms, J; L = 4,
                  period = (2π, 2π), spectral = spectral, ntrans = ntrans)
         stc = with_lifecycle(st)
@@ -180,8 +180,7 @@ Test.@testset "Concurrent plan construction" begin
         ys = [2π .* rand(M) for _ in 1:ntask]
         g(x, y) = 1.0 + 0.7cos(x) + 0.5sin(2y)
         fields = [[g(xs[t][k], ys[t][k]) for k in 1:M] for t in 1:ntask]
-        for spectral in (ScatteringTransforms.Plans.FINUFFTBackend(),
-                         ScatteringTransforms.Plans.NonuniformFFTsBackend())
+        for spectral in (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
             function transform_once(t)
                 st = ScatteringTransforms.scattered_planar_scattering(
                     xs[t], ys[t], (Ny, Nx), J; L = L, max_order = 2, period = (2π, 2π),

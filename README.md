@@ -32,8 +32,8 @@ Fast, generic wavelet scattering transforms in Julia.
   sampling — gridded `ScatteringTransform{1,2,3}D` (FFT), scattered-planar `scattered_planar_scattering`
   (exact direct NUDFT), structured-sphere `structured_spherical_scattering` (exact direct SHT), and
   scattered-sphere `spherical_scattering` (exact direct SHT). **Every cell has an in-core,
-  dependency-free default**; `using FINUFFT` / `using NUFSHT` / `using FastSphericalHarmonics` add
-  faster paths selected via the `spectral` keyword.
+  dependency-free default**; `using NonuniformFFTs` or `using FINUFFT` / `using NUFSHT` /
+  `using FastSphericalHarmonics` add faster paths selected via the `spectral` keyword.
 - **Pluggable spectral backend**: dependency-free direct-sum default; `using FFTW` switches on
   an `O(N log N)` fast path automatically
   (`spectral = AutoSpectralBackend() | DirectSumSpectralBackend() | FFTSpectralBackend()`).
@@ -153,7 +153,9 @@ grid by a nonuniform DFT (`scattered_planar_scattering`), where the ordinary Mor
 on a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` recovers the
 band-limited coefficients for irregular sampling by LSMR least squares — minimum-norm where the
 samples do not determine the modes, with `damp` for explicit Tikhonov regularisation. The default is
-an in-core exact direct NUDFT (no dependencies); `using FINUFFT` enables the faster NUFFT path.
+an in-core exact direct NUDFT (no dependencies); `using NonuniformFFTs` or `using FINUFFT` enables the
+nonuniform FFT, and with both loaded `spectral = FlowTransformBindings.NonuniformFFTsBackend()` or
+`FlowTransformBindings.FINUFFTBackend()` names one.
 
 ![Scattered planar scattering](docs/src/assets/scattered_planar.png)
 

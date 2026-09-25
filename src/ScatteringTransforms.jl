@@ -542,7 +542,7 @@ scattering_batch(b::CB.AbstractExecutionBackend, st, X) =
         "scattering_batch has no method for backend $(typeof(b)) on a $(typeof(st)).")))
 
 # Nonuniform / scattered planar scattering. Dependency-free by default (exact direct-summation NUDFT
-# in `Plans`); the FINUFFT extension supplies a faster spectral plan for the same cascade.
+# in `Plans`); a nonuniform FFT through FlowTransformBindings runs the same cascade faster.
 """
     scattered_planar_scattering(x, y, ms, J; L=8, max_order=2, T=Float64,
                                 spectral=SpectralBackends.AutoSpectralBackend(), period=nothing,
@@ -558,9 +558,8 @@ evaluates the filtered field back at the points. Apply it to a length-`M` vector
 
 `spectral` selects the transform: `SpectralBackends.DirectSumSpectralBackend` is the in-core,
 dependency-free exact NUDFT (always available, `O(M·prod(ms))`);
-[`Plans.FINUFFTBackend`](@ref ScatteringTransforms.Plans.FINUFFTBackend) and
-[`Plans.NonuniformFFTsBackend`](@ref ScatteringTransforms.Plans.NonuniformFFTsBackend) select a
-specific fast library (`using FINUFFT` / `using NonuniformFFTs`);
+`FlowTransformBindings.NonuniformFFTsBackend()` and `FlowTransformBindings.FINUFFTBackend()` select a
+nonuniform-FFT library (`using NonuniformFFTs` / `using FINUFFT`);
 `SpectralBackends.NUFFTSpectralBackend` takes whichever of those is loaded; and
 `SpectralBackends.AutoSpectralBackend` (the default) picks a fast library if one is loaded, else the
 direct sum. `period` is the physical domain size per

@@ -32,10 +32,11 @@ Run:  julia --project=benchmark -t<threads> benchmark/suite.jl [quick|full]
 using FFTW: FFTW
 using OhMyThreads: OhMyThreads
 using FastSphericalHarmonics: FastSphericalHarmonics
-# Loaded for their extensions, not called directly: without them the nonuniform surfaces resolve to
-# the in-core reference and the suite times that instead of the transform.
+# Loaded for their extensions: they give the nonuniform surfaces their fast paths.
 using FINUFFT: FINUFFT
+using NonuniformFFTs: NonuniformFFTs
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends as CB
 using SpectralBackends: SpectralBackends as SB
 using ScatteringTransforms: ScatteringTransforms as ST
@@ -260,9 +261,8 @@ function scattered_solve()
     # against a transform's `O(n log n)`, so the smallest grid is the hard case, not the afterthought.
     grids = TIER == "full" ? ((8, 8), (16, 16), (32, 32), (200, 200), (256, 256)) :
                              ((8, 8), (32, 32), (200, 200))
-    spec = ST.Plans.FINUFFTBackend()
-    for T in (TIER == "full" ? (Float64, Float32) : (Float64,))
-        println("\n", T, ":")
+    for spec in nufft_libraries(), T in (TIER == "full" ? (Float64, Float32) : (Float64,))
+        println("\n", nameof(typeof(spec)), " ", T, ":")
         for ms in grids
             n = prod(ms)
             # Well sampled: the regime where the solver's extra vector work is pure overhead, and the
@@ -289,11 +289,13 @@ function scattered_solve()
 
     # `M` at fixed `ms`: the point count enters the transform linearly and the solver's vector work
     # linearly too, so the ratio above should hold as `M` grows. This is where that is checked.
-    println("\nM sweep at 32^2, well sampled:")
-    for M in (TIER == "full" ? (100, 1_000, 10_000, 100_000, 1_000_000) : (100, 10_000, 1_000_000))
-        xs = [2π * mod(ga * k, 1.0) for k in 1:M]
-        ys = [2π * (k - 0.5) / M for k in 1:M]
-        solve_case(Float64, "M=$M", xs, ys, (32, 32), (2π, 2π), spec)
+    for spec in nufft_libraries()
+        println("\nM sweep at 32^2, well sampled, ", nameof(typeof(spec)), ":")
+        for M in (TIER == "full" ? (100, 1_000, 10_000, 100_000, 1_000_000) : (100, 10_000, 1_000_000))
+            xs = [2π * mod(ga * k, 1.0) for k in 1:M]
+            ys = [2π * (k - 0.5) / M for k in 1:M]
+            solve_case(Float64, "M=$M", xs, ys, (32, 32), (2π, 2π), spec)
+        end
     end
 
     # Threading and `ntrans` on the solve path, which is where a per-task plan or a per-column
@@ -304,16 +306,15 @@ function scattered_solve()
     xs = [2π * mod(ga * k, 1.0) for k in 1:M]
     ys = [2π * (k - 0.5) / M for k in 1:M]
     Xb = randn(M, B)
-    # Named explicitly and only when loaded: naming a backend whose extension is absent raises, and a
-    # missing library is a gap to report, not a reason to abandon the sweep.
-    _ext(:ScatteringTransformsFINUFFTExt) ?
-        solve_cascade(ST.Plans.FINUFFTBackend(), xs, ys, Xb, B) :
-        println("FINUFFT: not loaded")
-    _ext(:ScatteringTransformsNonuniformFFTsExt) ?
-        solve_cascade(ST.Plans.NonuniformFFTsBackend(), xs, ys, Xb, B) :
-        println("NonuniformFFTs: not loaded")
+    for spec in nufft_libraries()
+        solve_cascade(spec, xs, ys, Xb, B)
+    end
     return nothing
 end
+
+# The NUFFT libraries loaded here, each named explicitly: a library that is absent is reported as missing
+# by `loaded_fast_paths` and skipped.
+nufft_libraries() = filter(FTB.is_available, (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend()))
 
 function solve_cascade(spectral, xs, ys, Xb, B)
     sp = ST.scattered_planar_scattering(xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
@@ -379,8 +380,8 @@ _ext(name) = Base.get_extension(ST, name) !== nothing
 function loaded_fast_paths()
     have = String[]
     _ext(:ScatteringTransformsFFTWExt) && push!(have, "FFTW")
-    _ext(:ScatteringTransformsFINUFFTExt) && push!(have, "FINUFFT")
-    _ext(:ScatteringTransformsNonuniformFFTsExt) && push!(have, "NonuniformFFTs")
+    FTB.is_available(FTB.FINUFFTBackend()) && push!(have, "FINUFFT")
+    FTB.is_available(FTB.NonuniformFFTsBackend()) && push!(have, "NonuniformFFTs")
     _ext(:ScatteringTransformsFastSphericalHarmonicsExt) && push!(have, "FastSphericalHarmonics")
     _ext(:ScatteringTransformsNUFSHTExt) && push!(have, "NUFSHT")
     _ext(:ScatteringTransformsOhMyThreadsExt) && push!(have, "OhMyThreads")

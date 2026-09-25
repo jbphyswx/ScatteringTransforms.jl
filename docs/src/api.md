@@ -14,14 +14,16 @@ Planar (Cartesian) and spherical scattering, on uniform/structured and nonunifor
 
 | domain | uniform / structured | nonuniform / scattered |
 |---|---|---|
-| Cartesian | `ScatteringTransform{1,2,3}D` (FFT/direct sum; GPU via `GPUBackend`) | `scattered_planar_scattering` (exact direct NUDFT; FINUFFT fast path) |
+| Cartesian | `ScatteringTransform{1,2,3}D` (FFT/direct sum; GPU via `GPUBackend`) | `scattered_planar_scattering` (exact direct NUDFT; NonuniformFFTs or FINUFFT fast path) |
 | Sphere (S²) | `structured_spherical_scattering` (exact direct SHT; FastSphericalHarmonics fast path) | `spherical_scattering` (exact direct SHT; NUFSHT fast path) |
 
 **Every cell has an in-core, dependency-free default** (direct summation), with an optional fast path
 selected by the `spectral` keyword, which takes a
 [SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag. `DirectSumSpectralBackend`
 is the in-core default everywhere; the fast paths are `FFTSpectralBackend` (FFTW) on a grid,
-`NUFFTSpectralBackend` (FINUFFT or NonuniformFFTs) for scattered points, `NUFSHTSpectralBackend`
+`NUFFTSpectralBackend` for scattered points (either library through
+[FlowTransformBindings.jl](https://github.com/jbphyswx/FlowTransformBindings.jl), whose
+`NonuniformFFTsBackend()` and `FINUFFTBackend()` name one), `NUFSHTSpectralBackend`
 (NUFSHT) for the scattered sphere, and `FSHTSpectralBackend` (FastSphericalHarmonics) for the
 structured sphere. `AutoSpectralBackend` (the default) picks the fast path if its extension is
 loaded, else the direct sum — so nothing requires an external library. Naming a backend explicitly is
@@ -213,7 +215,8 @@ ScatteringTransforms.Plans.task_local_plan
 ScatteringTransforms.Plans.batch_width
 ScatteringTransforms.Plans.plan_points
 ScatteringTransforms.Plans.plan_analysis
-ScatteringTransforms.Plans.nufft_guru_make
+ScatteringTransforms.Plans.NUFFTScatteringPlan
+ScatteringTransforms.Plans.nufft_scattered_plan
 ScatteringTransforms.Plans.with_fft_nthreads
 ScatteringTransforms.Plans.per_task_nthreads
 ScatteringTransforms.Plans.close_plan!
@@ -241,7 +244,6 @@ ScatteringTransforms.Plans.lsmr_step
 ScatteringTransforms.Plans.LSMRState
 ScatteringTransforms.Plans.BatchedLSMRWork
 ScatteringTransforms.Plans.default_solver_rtol
-ScatteringTransforms.Plans.default_nufft_eps
 ScatteringTransforms.Plans.warn_underdetermined
 ```
 
@@ -253,10 +255,6 @@ without its package loaded raises with the `using` line to run.
 ```@docs
 ScatteringTransforms.Plans.fftw_plan
 ScatteringTransforms.Plans.abstractffts_plan
-ScatteringTransforms.Plans.finufft_scattered_plan
-ScatteringTransforms.Plans.nonuniformffts_scattered_plan
-ScatteringTransforms.Plans.FINUFFTBackend
-ScatteringTransforms.Plans.NonuniformFFTsBackend
 ```
 
 ## Execution backends

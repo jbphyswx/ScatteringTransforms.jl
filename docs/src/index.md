@@ -21,8 +21,8 @@ are the same.
 - **Grid-support matrix**: Cartesian × spherical, on uniform/structured and nonuniform/scattered
   sampling — gridded `ScatteringTransform{1,2,3}D` (FFT), scattered-planar `scattered_planar_scattering`
   (exact direct NUDFT), structured-sphere `structured_spherical_scattering` (fast SHT), scattered-sphere
-  `spherical_scattering` (exact direct SHT). Every cell has an in-core, dependency-free default; FINUFFT
-  / NUFSHT are optional fast paths selected via the `spectral` keyword.
+  `spherical_scattering` (exact direct SHT). Every cell has an in-core, dependency-free default;
+  NonuniformFFTs or FINUFFT, and NUFSHT, are optional fast paths selected via the `spectral` keyword.
 - **Two outputs**: globally-averaged coefficients `st(x)` and the localized (Mallat) field
   `scattering_field(st, x) = (|U_p x| ⋆ φ_J)↓` (their spatial means agree by construction).
 - **Correct path structure**: second order over strictly coarser scales, all orientation pairs.
@@ -116,8 +116,9 @@ orientation (not quantized into bins).
 ### Nonuniform / scattered planar grids
 Off-lattice / gappy planar data is scattered onto a uniform Fourier mode grid by a nonuniform DFT
 (`scattered_planar_scattering`); on a uniform grid it reproduces the gridded FFT transform exactly. The
-default is an in-core exact direct NUDFT (no dependencies); `using FINUFFT` enables the faster NUFFT
-path via `spectral = NUFFTSpectralBackend()`.
+default is an in-core exact direct NUDFT (no dependencies); `using NonuniformFFTs` or `using FINUFFT`
+enables the nonuniform FFT, and with both loaded `spectral = FlowTransformBindings.NonuniformFFTsBackend()`
+or `FlowTransformBindings.FINUFFTBackend()` names one.
 
 ![Scattered planar scattering](assets/scattered_planar.png)
 

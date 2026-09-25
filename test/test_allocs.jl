@@ -114,19 +114,15 @@ Test.@testset "Allocation discipline" begin
         # per path would allocate an array header on every call, so the views are built once with the
         # transform; this asserts they stay there.
         #
-        # `nufft_nthreads = 1` is what makes zero reachable, and it is a property of the library, not
-        # of this cascade: FINUFFT executes its internal FFT through the same libfftw3 FFTW.jl has
-        # installed a Julia-task thread callback into, so a multi-threaded FINUFFT plan spawns a task
-        # per thread on every transform (measured: 276 tasks, 139104 B for `B = 4`). Single-threaded it
-        # takes libfftw3's serial path and the cascade's own allocation — which is what is under test —
-        # is exactly zero.
+        # FINUFFT runs its FFT through the libfftw3 that FFTW.jl gives a Julia-task thread callback, so
+        # a plan above one thread spawns tasks on every execution. At `nufft_nthreads = 1` the library
+        # allocates nothing and the measurement is the cascade's own.
         SP = ScatteringTransforms.ScatteredPlanar
         M, ms = 500, (16, 16)
         px, py = rand(M), rand(M)
         function batched_alloc(B)
             stb = SP.build(Float64, px, py, ms, 3; L = 4, max_order = 2,
-                           spectral = ScatteringTransforms.Plans.FINUFFTBackend(), ntrans = B,
-                           nufft_nthreads = 1)
+                           spectral = FTB.FINUFFTBackend(), ntrans = B, nufft_nthreads = 1)
             # Asserted, not assumed: a plan that quietly came back single-field would make the
             # measurement below time the per-field cascade and agree for the wrong reason.
             Test.@test ScatteringTransforms.Plans.batch_width(stb.plan) == B
@@ -150,16 +146,15 @@ Test.@testset "Allocation discipline" begin
         # is what keeps it there: a buffer that slipped back into the solver would be invisible in the
         # coefficients and cost `2 · maxiter` allocations per transform.
         #
-        # NonuniformFFTs is deliberately not gated here. Its own `exec_type1!`/`exec_type2!` allocate
-        # 880 B per execution — a `Threads.@threads` region in its deconvolution step, which builds
-        # task scaffolding on every call even at one thread — so a solve over it allocates the
-        # library's per-transform cost times the iteration count, which this package cannot reach.
+        # NonuniformFFTs is not gated here: its `exec_type1!`/`exec_type2!` open a `Threads.@threads`
+        # region on every execution, even at one thread, so a solve over it allocates in proportion to
+        # its iteration count inside the library.
         Msc, mssc = 500, (16, 16)
         Random.seed!(31)
         pxs, pys = 2π .* rand(Msc), 2π .* rand(Msc)
         bs = randn(Msc)
         Xs = zeros(ComplexF64, mssc)
-        for spec in (SpectralBackends.DirectSumSpectralBackend(), P.FINUFFTBackend())
+        for spec in (SpectralBackends.DirectSumSpectralBackend(), FTB.FINUFFTBackend())
             plan = P.make_scattered_plan(spec, pxs, pys, mssc, Float64; period = (2π, 2π),
                                          solve = true, maxiter = 20, nufft_nthreads = 1)
             # Asserted so a plan that came back with `solve = false` cannot pass this by measuring a
@@ -170,7 +165,7 @@ Test.@testset "Allocation discipline" begin
         # Batched: the per-column recurrence runs host-side over `B` states, reducing into mirrors
         # that are preallocated on the plan. Widening the batch must not allocate either.
         Bsc = 4
-        pb = P.make_scattered_plan(P.FINUFFTBackend(), pxs, pys, mssc, Float64; period = (2π, 2π),
+        pb = P.make_scattered_plan(FTB.FINUFFTBackend(), pxs, pys, mssc, Float64; period = (2π, 2π),
                                    solve = true, maxiter = 20, ntrans = Bsc, nufft_nthreads = 1)
         Test.@test P.batch_width(pb) == Bsc
         Test.@test _alloc(P.forward_transform!, zeros(ComplexF64, mssc..., Bsc), pb,

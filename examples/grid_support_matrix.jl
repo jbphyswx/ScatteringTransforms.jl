@@ -33,7 +33,7 @@ sca = ST.scattered_planar_scattering(n1, n2, (Ny, Nx), J; L=L, max_order=2, peri
 relerr = maximum(abs.(ST.Coefficients.flatten2d(sca(vec(f))) .- ST.Coefficients.flatten2d(grid(f)))) /
          maximum(abs.(ST.Coefficients.flatten2d(grid(f))))
 println("   uniform-grid parity vs gridded FFT: rel-err = ", relerr)
-println("   (irregular data: pass solve=true for the exact band-limited CG inversion)")
+println("   (irregular data: pass solve=true for the band-limited least-squares inversion)")
 
 # ---------------------------------------------------------------------------
 # Sphere: structured (fast SHT) and scattered (NUFSHT).

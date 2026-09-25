@@ -119,8 +119,8 @@ Test.@testset "LSMR least-squares solver" begin
                    sqrt(eps(Float64))
         Test.@test P.default_solver_rtol(Float32, SBk.DirectSumSpectralBackend(), nothing) ≈
                    sqrt(eps(Float32))
-        Test.@test P.default_solver_rtol(Float64, P.FINUFFTBackend(), 1.0e-9) ≈ 1.49011612e-8 rtol = 1e-6
-        Test.@test P.default_solver_rtol(Float32, P.FINUFFTBackend(), nothing) >= 1.0f-5
+        Test.@test P.default_solver_rtol(Float64, FTB.FINUFFTBackend(), 1.0e-9) ≈ 1.49011612e-8 rtol = 1e-6
+        Test.@test P.default_solver_rtol(Float32, FTB.FINUFFTBackend(), nothing) >= 1.0f-5
     end
 
     Test.@testset "the guard refuses only an unusable answer" begin
