@@ -71,26 +71,17 @@ Base.show(io::IO, p::NUSHTSphericalPlan) =
     print(io, "NUSHTSphericalPlan(lmax=", p.lmax, ", M=", p.M, ", ntrans=", p.plan.B,
           ", nufft=", nameof(typeof(p.nufft)), ", spin=", p.spin !== nothing, ")")
 
-# A `NUSHTplan` is working state, not a lookup table: every transform writes through its coefficient,
-# field and phase buffers, so tasks cannot share one. The points and band limit are retained on this
-# wrapper precisely so a task can build its own.
-#
-# Construction goes through FFTW's planner, which FFTW documents as callable from only one thread at
-# a time (of its API, only `fftw_execute` is thread safe), so the rebuild is serialised. It happens
-# once per task, not once per field.
-# NUFSHT transforms `ntrans` co-located fields per call, so a batched sibling is just a rebuild at a
-# different width. The rebuild costs ~0.5 ms against ~175 ms for a B = 32 cascade, so it is paid
-# per batch call rather than cached: caching would key on `B`, which the caller varies freely.
+# Every transform writes through a `NUSHTplan`'s coefficient, field and phase buffers, so each task
+# builds its own, once, from the points and band limit this wrapper retains. NUFSHT and
+# FlowTransformBindings build their plans under FFTW.jl's planner lock, so a build may run from any
+# task. NUFSHT transforms `ntrans` co-located fields per call, so a batched sibling is a rebuild at the
+# width of the batch call.
 ST.SphericalCore.supports_batch(::NUSHTSphericalPlan) = true
 
-# Serialised on `Plans.PLANNER_LOCK` like every other plan build here: this one is called
-# from inside spawned tasks, one per batch chunk, and FFTW's planner is single-threaded.
 function ST.SphericalCore.batch_plan(p::NUSHTSphericalPlan, B::Integer)
     B == p.plan.B && return p
-    plan = Base.@lock ST.Plans.PLANNER_LOCK begin
-        NUFSHT.make_plan(eltype(p.theta), p.theta, p.phi, p.lmax;
-                         ntrans = Int(B), nufft = p.nufft, tol = p.plan.tol)
-    end
+    plan = NUFSHT.make_plan(eltype(p.theta), p.theta, p.phi, p.lmax;
+                            ntrans = Int(B), nufft = p.nufft, tol = p.plan.tol)
     # The spin pair is rebuilt, not shared: it holds the buffers its synthesis writes through, and a
     # widened plan exists precisely so one task can use it while another uses the original.
     return NUSHTSphericalPlan(plan, p.M, p.lmax, p.theta, p.phi, p.rtol, p.maxiter, p.nufft,
@@ -100,13 +91,10 @@ end
 ST.SphericalCore.plan_nufft(p::NUSHTSphericalPlan) = p.nufft
 ST.Plans.batch_width(p::NUSHTSphericalPlan) = p.plan.B
 
-# `NUFSHT.close!` frees the NUFFT plans a NUSHT plan owns and is idempotent. Destroying a FINUFFT plan
-# destroys its FFTW plans, which may not overlap a plan build.
+# `NUFSHT.close!` frees the NUFFT plans a NUSHT plan owns and is idempotent.
 function ST.Plans.close_plan!(p::NUSHTSphericalPlan)
-    Base.@lock ST.Plans.PLANNER_LOCK begin
-        NUFSHT.close!(p.plan)
-        p.spin === nothing || (NUFSHT.close!(p.spin[1]); NUFSHT.close!(p.spin[2]))
-    end
+    NUFSHT.close!(p.plan)
+    p.spin === nothing || (NUFSHT.close!(p.spin[1]); NUFSHT.close!(p.spin[2]))
     return nothing
 end
 ST.SphericalCore.plan_spin(p::NUSHTSphericalPlan) = p.spin
@@ -116,25 +104,20 @@ ST.SphericalCore.plan_solver(p::NUSHTSphericalPlan) = (rtol = p.rtol, maxiter = 
 ST.Plans.spectral_backend(::NUSHTSphericalPlan) = SB.NUFSHTSpectralBackend()
 
 function ST.Plans.task_local_plan(p::NUSHTSphericalPlan)
-    plan = Base.@lock ST.Plans.PLANNER_LOCK begin
-        # `ntrans` and the resolved backend must be carried over: rebuilding with the defaults would
-        # give the task a single-field plan on whatever `Auto` happens to pick, silently changing both
-        # the batch size the cascade feeds it and the transform driving it.
-        NUFSHT.make_plan(eltype(p.theta), p.theta, p.phi, p.lmax;
-                         ntrans = p.plan.B, nufft = p.nufft, tol = p.plan.tol)
-    end
+    # `ntrans` and the resolved backend are carried over, so the task's plan takes the batch the
+    # cascade feeds it and runs the transform the original runs.
+    plan = NUFSHT.make_plan(eltype(p.theta), p.theta, p.phi, p.lmax;
+                            ntrans = p.plan.B, nufft = p.nufft, tol = p.plan.tol)
     return NUSHTSphericalPlan(plan, p.M, p.lmax, p.theta, p.phi, p.rtol, p.maxiter, p.nufft,
                               _rebuild_spin(p))
 end
 
 # One spin plan per spin weight over the plan's own points, on the scalar plan's NUFFT library, or
-# `nothing` for a plan that carries none. Serialised for the FFTW planner inside the NUFFT build, like
-# every other plan build here; the spin path drives no FastTransforms code, so it needs no OpenMP pin.
+# `nothing` for a plan that carries none. The spin path drives no FastTransforms code, so it needs no
+# OpenMP pin.
 _spin_plans(::Type{FE}, theta, phi, lmax::Int, nufft) where {FE} =
-    Base.@lock ST.Plans.PLANNER_LOCK begin
-        (NUFSHT.make_spin_plan(FE, theta, phi, lmax, 0; nufft = nufft),
-         NUFSHT.make_spin_plan(FE, theta, phi, lmax, 1; nufft = nufft))
-    end
+    (NUFSHT.make_spin_plan(FE, theta, phi, lmax, 0; nufft = nufft),
+     NUFSHT.make_spin_plan(FE, theta, phi, lmax, 1; nufft = nufft))
 
 _rebuild_spin(p::NUSHTSphericalPlan) =
     p.spin === nothing ? nothing :
@@ -225,13 +208,7 @@ function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_ph
     # Resolved against the *field* element type, which is what selects the folded real layout — the
     # same `T` the plan is then built with below.
     nb = NUFSHT._resolve_nufft(nufft, T)
-    # The whole build is serialised, not just the sphere plans: `make_plan` also builds the NUFFT,
-    # which plans through the same libfftw3, so two builds racing fault inside the FFTW planner —
-    # observed as a segfault in `fftw_mkapiplan` under `ft_plan_sph_synthesis` when independent point
-    # sets were planned from concurrent tasks.
-    plan = Base.@lock ST.Plans.PLANNER_LOCK begin
-        NUFSHT.make_plan(T, θ, φ, lmax; ntrans = ntrans, nufft = nb)
-    end
+    plan = NUFSHT.make_plan(T, θ, φ, lmax; ntrans = ntrans, nufft = nb)
     # NUFSHT's positional argument is the *field* element type, not the precision: a real one selects
     # its folded real layout, and the spin field is complex.
     sp = spin ? _spin_plans(Complex{T}, θ, φ, lmax, nb) : nothing

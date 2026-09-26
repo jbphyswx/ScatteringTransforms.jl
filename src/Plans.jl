@@ -604,48 +604,28 @@ A plan equivalent to `plan` that is safe to use concurrently with it. Stateless 
 `AbstractFFTs`) return themselves; plans carrying mutable scratch return a copy that shares their
 read-only tables and owns fresh scratch. Called once per task by the parallel backends.
 
-Three obligations follow from *where* this is called. A method that **builds** rather than shares must
-do so under [`PLANNER_LOCK`](@ref), because it runs inside a spawned task by construction; it must
-take its thread count from [`per_task_nthreads`](@ref), since the caller has already claimed the cores;
-and whoever built it must [`close_plan!`](@ref) it when the task ends.
+Two obligations follow from *where* this is called. A method that **builds** rather than shares takes
+its thread count from [`per_task_nthreads`](@ref), since the caller has already claimed the cores; and
+whoever built it must [`close_plan!`](@ref) it when the task ends.
 """
 task_local_plan(plan::AbstractScatteringPlan) = plan
 
 """
-    PLANNER_LOCK
-
-Serialises plan construction across every backend in the package.
-
-FFTW documents `fftw_execute` as its only thread-safe entry point, so two plan builds running at once
-fault inside the planner. One lock covers them all rather than one per backend, because the planner
-is shared far more widely than any single backend: FFTW.jl, FINUFFT, NonuniformFFTs and
-FastTransforms all plan through the same libfftw3, so a lock private to one of them excludes nothing.
-Concurrent construction is routine — [`task_local_plan`](@ref) and `SphericalCore.batch_plan` build
-inside spawned tasks — and a build racing a build of a *different* library was observed as a segfault
-in `fftw_mkapiplan`.
-
-Only construction takes this lock; transforms are never serialised, so a plan per task still executes
-in parallel. FastTransforms' OpenMP thread count is set per call by
-`FlowTransformBindings.with_fasttransforms_threads`.
-"""
-const PLANNER_LOCK = ReentrantLock()
-
-"""
     with_fft_nthreads(f, n) -> f()
 
-Run `f` with the FFT library's global thread count set to `n`, restoring it afterwards.
+Run `f`, which builds plans, holding FFTW.jl's planner lock with FFTW's planner thread count set to `n`
+and restored after: `FFTW.set_num_threads(f, n)`, the FFTW extension's method.
 
-FFTW's thread count is process-global and is raised as a side effect of loading unrelated packages,
-so a plan built without pinning it inherits whatever was last set — and a plan built for more threads
-than it needs spawns (and allocates) a task per thread on *every* execution. Plan builders wrap
-construction in this so a plan's threading is a property of the plan, not of load order.
+FFTW's planner state is process-global and unsafe to use from two threads at once, and FFTW.jl,
+FINUFFT, NonuniformFFTs and FastTransforms all plan on that one libfftw3, all serialised by that one
+lock. The count is read into a plan when it is built, and a plan built for more threads than it needs
+spawns (and allocates) a task per thread on every execution, so plan builders name the count here.
+The extensions that plan through `AbstractFFTs` or FastSphericalHarmonics reach FFTW.jl only through
+this.
 
-Because the count is one global, callers hold [`PLANNER_LOCK`](@ref) across this: two builds pinning
-it concurrently would each restore the other's value.
-
-The default is a no-op: only the FFTW extension has a global count to set. It takes `args...` so the
-extension's fixed-arity method is strictly more specific and *adds* a method rather than overwriting
-this one — overwriting is an error during precompilation.
+A no-op without FFTW loaded. It takes `args...` so the extension's fixed-arity method is strictly more
+specific and adds a method rather than overwriting this one — overwriting is an error during
+precompilation.
 """
 with_fft_nthreads(f, args...) = f()
 

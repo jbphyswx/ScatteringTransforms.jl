@@ -65,9 +65,7 @@ function ST.Plans.fftw_plan(::Type{T}, dims::NTuple{D, Int}; nbatch::Int = 1,
     # axis. `batched` says which, so a chunk size of 1 plans `(dims…, 1)` rather than `dims`.
     scratch = zeros(Complex{T}, (batched || nbatch > 1) ? (dims..., nbatch) : dims)
     region = 1:D
-    # Serialised on the package-wide planner lock, which also makes the thread-count pin below safe:
-    # that count is a process global, so two unserialised builds would restore each other's value.
-    return Base.@lock ST.Plans.PLANNER_LOCK ST.Plans.with_fft_nthreads(fft_nthreads) do
+    return FFTW.set_num_threads(fft_nthreads) do
         fwd = FFTW.plan_fft(scratch, region; flags = planning)
         inv = FFTW.plan_ifft(scratch, region; flags = planning)
         invp = FFTW.plan_ifft!(scratch, region; flags = planning)
@@ -76,26 +74,11 @@ function ST.Plans.fftw_plan(::Type{T}, dims::NTuple{D, Int}; nbatch::Int = 1,
     end
 end
 
-# FFTW reads its global planner thread count when a plan is built and bakes it in, so the count only
-# has to hold for the duration of construction — but pinning it is not optional. FFTW.jl runs a
-# multi-threaded plan's parallel loop on Julia tasks, so a plan built while the count is above one
-# spawns a task per thread on *every* execution: measured at ~4 KiB per transform, which a cascade
-# pays once per wavelet and once per path. Lowering the count afterwards does not undo it, because the
-# count belongs to the plan, not to the process.
-#
-# So the pin is unconditional, including for `n == 1`. The count is one process global shared with
-# every other libfftw3 client, and loading FastSphericalHarmonics raises it from 1 to 4 on its own, so
-# "it is probably already 1" is never a safe assumption. Callers hold `Plans.PLANNER_LOCK` across
-# this: two builds pinning one global concurrently would each restore the other's value.
-function ST.Plans.with_fft_nthreads(f, n::Integer)
-    prev = FFTW.get_num_threads()
-    try
-        FFTW.set_num_threads(n)
-        return f()
-    finally
-        FFTW.set_num_threads(prev)
-    end
-end
+# FFTW reads its planner thread count when a plan is built and bakes it in, and FFTW.jl runs a
+# multi-threaded plan's parallel loop on Julia tasks, so a plan built above one thread spawns a task
+# per thread on every execution. The count is one process global that loading FastSphericalHarmonics
+# raises from 1 to 4, so every plan names its own, `n == 1` included.
+ST.Plans.with_fft_nthreads(f, n::Integer) = FFTW.set_num_threads(f, n)
 ST.Plans.fftw_plan(::Type{T}, N::Int; kwargs...) where {T} = ST.Plans.fftw_plan(T, (N,); kwargs...)
 
 # FFTW plans are stateless under the new-array `mul!` execution path, so tasks share one plan.

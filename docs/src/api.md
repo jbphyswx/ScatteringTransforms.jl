@@ -219,7 +219,6 @@ ScatteringTransforms.Plans.nufft_scattered_plan
 ScatteringTransforms.Plans.with_fft_nthreads
 ScatteringTransforms.Plans.per_task_nthreads
 ScatteringTransforms.Plans.close_plan!
-ScatteringTransforms.Plans.PLANNER_LOCK
 ScatteringTransforms.ScatteringCore.wavelet_convolve
 ScatteringTransforms.ScatteringCore.wavelet_convolve!
 ScatteringTransforms.ScatteringCore.apply_modulus

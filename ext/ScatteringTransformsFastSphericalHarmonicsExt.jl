@@ -46,18 +46,16 @@ end
 # plans on every single call, and the cascade calls them once per field plus once per band. Owning
 # the cache on our plan builds them once instead.
 #
-# Their construction goes through FFTW's planner, which is documented as callable from only one
-# thread at a time (only `fftw_execute` is thread safe), so every cache is populated under
-# `Plans.PLANNER_LOCK` — including the per-task copies below, which are built inside spawned
-# tasks. That lock is shared with the scattered-point backend because the planner they contend for is
-# one process global.
+# FastTransforms builds those plans on the libfftw3 FFTW.jl loads, whose planner is process-global, so
+# every cache is populated under FFTW.jl's planner lock at one planner thread, `Plans.with_fft_nthreads`
+# — including the per-task copies below, which are built inside spawned tasks.
 
 # Every FastTransforms call goes through `FTB.with_fasttransforms_threads`, which sets the OpenMP count
 # on the OS thread making the call and restores it after.
 function _warmed_cache(nθ::Int, nφ::Int)
     cache = FSH.SphPlanCache{Float64}()
     scratch = zeros(Float64, nθ, nφ)
-    Base.@lock ST.Plans.PLANNER_LOCK begin
+    ST.Plans.with_fft_nthreads(1) do
         FTB.with_fasttransforms_threads() do
             FSH.sph_transform!(scratch; cache = cache)
             FSH.sph_evaluate!(scratch; cache = cache)

@@ -1,7 +1,7 @@
 # Plan construction and transforms from concurrent tasks. Every fast backend here plans through one
-# process-global FFTW planner, which `Plans.PLANNER_LOCK` guards; FastTransforms' OpenMP thread count is
-# set and restored per call on the OS thread making it. A build racing another library's build faults
-# inside the planner.
+# process-global FFTW planner, which FFTW.jl's planner lock guards; FastTransforms' OpenMP thread count
+# is set and restored per call on the OS thread making it. A build racing another library's build
+# faults inside the planner.
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using NUFSHT: NUFSHT
 using OhMyThreads: OhMyThreads

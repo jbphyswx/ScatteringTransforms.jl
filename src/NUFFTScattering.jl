@@ -88,10 +88,8 @@ function _nufft_plan_at(backend, ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::T
                         rtol::T, B::Int, nthreads::Int, damp::T) where {T}
     n2 = ms[2] + iseven(ms[2])
     kw = (; ntrans = B, tol = eps, order = FTB.FFTModes(), nthreads = nthreads > 0 ? nthreads : Threads.nthreads())
-    cplan, rplan = Base.@lock PLANNER_LOCK begin
-        (FTB.plan_nufft(backend, Complex{T}, (sx, sy), ms; kw...),
-         FTB.plan_nufft(backend, T, (sx, sy), (ms[1], n2); kw...))
-    end
+    cplan = FTB.plan_nufft(backend, Complex{T}, (sx, sy), ms; kw...)
+    rplan = FTB.plan_nufft(backend, T, (sx, sy), (ms[1], n2); kw...)
     m1h = ms[1] ÷ 2 + 1
     rpts() = B == 1 ? similar(sx, T, M) : similar(sx, T, M, B)
     half() = B == 1 ? similar(sx, Complex{T}, m1h, n2) : similar(sx, Complex{T}, m1h, n2, B)
@@ -143,12 +141,7 @@ task_local_plan(p::NUFFTScatteringPlan{T, B}) where {T, B} =
     _nufft_plan_at(p.backend, p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol, B,
                    per_task_nthreads(p.nthreads), p.damp)
 
-close_plan!(p::NUFFTScatteringPlan) =
-    Base.@lock PLANNER_LOCK begin
-        FTB.close!(p.cplan)
-        FTB.close!(p.rplan)
-        nothing
-    end
+close_plan!(p::NUFFTScatteringPlan) = (FTB.close!(p.cplan); FTB.close!(p.rplan); nothing)
 
 # ---------------------------------------------------------------------------
 # Reaching the transform without a copy. The cascade's buffers are `similar` to the plan's points, so
