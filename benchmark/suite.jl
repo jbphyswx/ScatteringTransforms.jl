@@ -158,9 +158,9 @@ end
 # `solve = true` replaces one adjoint application with an iterative solve, so its cost is two separate
 # numbers and they fail differently. How many iterations the geometry needs is a property of the
 # points. What one iteration costs *over* the two transforms inside it is a property of the solver:
-# LSMR carries `2M + 9·prod(ms)` flops of vector work per iteration on top of a type-2 and a type-1,
-# and that fraction is largest on small grids, where the transform has the least work to hide it
-# behind. Both are measured rather than counted, because the vector work is bandwidth bound where the
+# LSMR does vector work over the points and over the modes each iteration on top of a type-2 and a
+# type-1, and that fraction is largest on small grids, where the transform has the least work to hide
+# it behind. Both are measured rather than counted, because the vector work is bandwidth bound where the
 # FFT is cache blocked, and because `M` and `ms` are independent: the caller may hand over more modes
 # than samples, and the regime decides everything.
 #
@@ -172,20 +172,16 @@ end
 # synthesis `1/prod(ms)`, so the adjoint must carry the same scalar — a mismatched pair is not a
 # scaled problem, it is a different one, and LSMR then runs to `maxiter` on an operator whose exact
 # solution it should reach in a single step. With both scaled the factor cancels from every stopping
-# test (`normA` falls by it exactly as `normx` rises, `normar` and `normr` together), so the count is
-# the solve path's own.
+# test, each a ratio of the recurrence's own norms, so the count is the solve path's own.
 function solve_probe(::Type{T}, base, b, ms, M, tol, maxiter) where {T}
-    x = zeros(Complex{T}, ms)
     s = T(base.invN)
-    info = ST.Plans.lsmr_solve!(x,
-                                (dst, src) -> ST.Plans.inverse_transform!(dst, base, src),
-                                (dst, src) -> (ST.Plans.forward_transform!(dst, base, src);
-                                               dst .*= s),
-                                Complex{T}.(b), zeros(Complex{T}, M), zeros(Complex{T}, M),
-                                zeros(Complex{T}, ms), zeros(Complex{T}, ms), zeros(Complex{T}, ms),
-                                zeros(Complex{T}, ms);
-                                atol = tol, btol = tol, conlim = inv(eps(T)), maxiter = maxiter)
-    return (info.iters, info.istop)
+    op = FTB.FunctionOperator((dst, src) -> ST.Plans.inverse_transform!(dst, base, src),
+                              (dst, src) -> (ST.Plans.forward_transform!(dst, base, src); dst .*= s),
+                              zeros(Complex{T}, ms..., 1), zeros(Complex{T}, M, 1))
+    ws = FTB.LSMRWorkspace(op)
+    info = FTB.lsmr!(zeros(Complex{T}, ms..., 1), op, Complex{T}.(b), ws; atol = tol, btol = tol,
+                     rtol = 0, conlim = inv(eps(T)), maxiter = maxiter)
+    return (info.iterations, ws.status[1])
 end
 
 function solve_case(::Type{T}, label, xs, ys, ms, period, spec) where {T}
@@ -204,7 +200,7 @@ function solve_case(::Type{T}, label, xs, ys, ms, period, spec) where {T}
                                  ST.Plans.forward_transform!(X, base, b)))
 
     rtol = ST.Plans.default_solver_rtol(T, spec, nothing)
-    iters, istop = solve_probe(T, base, b, ms, M, rtol, 100)
+    iters, stop = solve_probe(T, base, b, ms, M, rtol, 100)
 
     # A solve the package refuses is a result, not a crash: at `conlim = 1/eps(T)` an operator whose
     # smallest singular direction carries nothing this precision can represent is rejected rather than
@@ -245,8 +241,8 @@ function solve_case(::Type{T}, label, xs, ys, ms, period, spec) where {T}
     end
     ST.Plans.close_plan!(base); ST.Plans.close_plan!(solved)
 
-    Printf.@printf("%-24s M=%-8d n=%-7d iters %3d (istop %d)  pair %7.3f ms  solve %8.3f ms  %6s  iter %s\n",
-                   label, M, prod(ms), iters, istop, t_pair * 1e3,
+    Printf.@printf("%-24s M=%-8d n=%-7d iters %3d (%s)  pair %7.3f ms  solve %8.3f ms  %6s  iter %s\n",
+                   label, M, prod(ms), iters, string(stop), t_pair * 1e3,
                    isnan(t_solve) ? NaN : t_solve * 1e3,
                    isnan(t_solve) ? "refused" :
                        Printf.@sprintf("%.2fx", t_solve / (max(iters, 1) * t_pair)),

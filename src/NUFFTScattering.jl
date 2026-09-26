@@ -20,9 +20,9 @@ Scattered-planar plan over FlowTransformBindings NUFFT plans on fixed points: a 
 synthesis and for complex samples, and a real plan for real samples and the real solve. `B` is the
 number of co-located fields each execution transforms.
 """
-struct NUFFTScatteringPlan{T, B, L, PC, PR, CV <: AbstractArray{Complex{T}}, MM <: AbstractArray{Complex{T}},
-                           HX <: AbstractArray{Complex{T}}, PT <: AbstractArray{T}, RV <: AbstractVector{T},
-                           IV <: AbstractVector{Int}, RS, BW} <: AbstractScatteringPlan
+struct NUFFTScatteringPlan{T, B, L, PC, PR, CV <: AbstractArray{Complex{T}}, HX <: AbstractArray{Complex{T}},
+                           PT <: AbstractArray{T}, RV <: AbstractVector{T}, IV <: AbstractVector{Int},
+                           DC <: AbstractArray{Complex{T}}, RS, CS} <: AbstractScatteringPlan
     backend::L
     cplan::PC
     rplan::PR
@@ -38,15 +38,14 @@ struct NUFFTScatteringPlan{T, B, L, PC, PR, CV <: AbstractArray{Complex{T}}, MM 
     eps::T
     nthreads::Int
     hx::HX                  # the real plan's half spectrum, (ms[1] ÷ 2 + 1, n₂[, B])
-    dc::HX                  # (1, n₂[, B]) scratch for the DC-row projection
-    rsolve::RS              # `(u, t, v, w, h, hbar)` over the half, or `nothing` unless this plan solves
-    csolve::Base.RefValue{Union{Nothing, Tuple{CV, MM, MM, MM, MM}}}   # full-grid solve, built on first use
+    dc::DC                  # (1, n₂, B) scratch for the conjugate-symmetric rows
+    rsolve::RS              # the half-grid solve's operator and `FTB.LSMRWorkspace`, or `nothing`
+    csolve::Base.RefValue{Union{Nothing, CS}}   # the full-grid solve's, built on first use
     rbuf::Base.RefValue{Union{Nothing, PT}}
     cbuf::Base.RefValue{Union{Nothing, CV}}
     col::IV                 # (ms[2]) column of the half holding each `fftfreq(ms[2])` frequency
     negcol::IV              # (ms[2]) column holding its negative
     negcol_half::IV         # (n₂) column holding the negative of each column's frequency
-    ls_batch::BW
 end
 
 batch_width(::NUFFTScatteringPlan{T, B}) where {T, B} = B
@@ -91,38 +90,50 @@ function _nufft_plan_at(backend, ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::T
     cplan = FTB.plan_nufft(backend, Complex{T}, (sx, sy), ms; kw...)
     rplan = FTB.plan_nufft(backend, T, (sx, sy), (ms[1], n2); kw...)
     m1h = ms[1] ÷ 2 + 1
-    rpts() = B == 1 ? similar(sx, T, M) : similar(sx, T, M, B)
     half() = B == 1 ? similar(sx, Complex{T}, m1h, n2) : similar(sx, Complex{T}, m1h, n2, B)
     f2 = [_fft_frequency(j, ms[2]) for j in 1:ms[2]]
     col = _like_ints(sx, [_fft_index(f, n2) for f in f2])
     negcol = _like_ints(sx, [_fft_index(-f, n2) for f in f2])
     negcol_half = _like_ints(sx, [_fft_index(-_fft_frequency(k, n2), n2) for k in 1:n2])
-    batch = if solve && B > 1
-        nrm_p = similar(sx, T, 1, B)
-        nrm_m = similar(sx, T, 1, 1, B)
-        coef() = similar(sx, T, 1, 1, B)
-        host() = Vector{T}(undef, B)
-        BatchedLSMRWork(nrm_p, reshape(nrm_p, 1, 1, B), nrm_m, reshape(nrm_m, 1, B),
-                        coef(), coef(), coef(), host(), host(), host(), host(), host(),
-                        [lsmr_init(zero(T), zero(T)) for _ in 1:B])
-    else
-        nothing
-    end
     hx = half()
-    dc = B == 1 ? similar(sx, Complex{T}, 1, n2) : similar(sx, Complex{T}, 1, n2, B)
-    rsolve = solve ? (rpts(), rpts(), half(), half(), half(), half()) : nothing
-    # Types of the buffers built on first use, from zero-length arrays `similar` to the points, so a
-    # device plan's types follow its points.
+    dc = similar(sx, Complex{T}, 1, n2, B)
+    rsolve = solve ? _solver(_HalfSolve(FTB.NUFFTOperator(rplan), ms, dc, negcol_half)) : nothing
+    # Types of what is built on first use: buffers from zero-length arrays `similar` to the points, so a
+    # device plan's types follow its points, and the full-grid solver as inferred.
     PTT = typeof(B == 1 ? similar(sx, T, 0) : similar(sx, T, 0, 0))
     CVT = typeof(B == 1 ? similar(sx, Complex{T}, 0) : similar(sx, Complex{T}, 0, 0))
-    MMT = typeof(B == 1 ? similar(sx, Complex{T}, 0, 0) : similar(sx, Complex{T}, 0, 0, 0))
-    return NUFFTScatteringPlan{T, B, typeof(backend), typeof(cplan), typeof(rplan), CVT, MMT, typeof(hx),
-                               PTT, typeof(sx), typeof(col), typeof(rsolve), typeof(batch)}(
+    CST = Base.promote_op(_complex_solver, typeof(cplan))
+    return NUFFTScatteringPlan{T, B, typeof(backend), typeof(cplan), typeof(rplan), CVT, typeof(hx), PTT,
+                               typeof(sx), typeof(col), typeof(dc), typeof(rsolve), CST}(
         backend, cplan, rplan, ms, M, one(T) / prod(ms), solve, maxiter, rtol, damp, sx, sy, eps, nthreads,
-        hx, dc, rsolve,
-        Base.RefValue{Union{Nothing, Tuple{CVT, MMT, MMT, MMT, MMT}}}(nothing),
+        hx, dc, rsolve, Base.RefValue{Union{Nothing, CST}}(nothing),
         Base.RefValue{Union{Nothing, PTT}}(nothing), Base.RefValue{Union{Nothing, CVT}}(nothing),
-        col, negcol, negcol_half, batch)
+        col, negcol, negcol_half)
+end
+
+# An operator and the workspace of its solve.
+_solver(op) = (op, FTB.LSMRWorkspace(op))
+_complex_solver(cplan) = _solver(FTB.NUFFTOperator(cplan))
+
+# The half-grid solve's operator: the real plan's type 2 over the half spectrum, with type 1 projected
+# onto the subspace the solve runs in (`_project_half!`). The projection acts within rows, so it is
+# orthogonal in the half's inner product, which weights each row `k₁ > 0` by two.
+struct _HalfSolve{O, D, I}
+    op::O
+    ms::NTuple{2, Int}
+    dc::D
+    negcol_half::I
+end
+
+FTB.lsmr_ncolumns(s::_HalfSolve) = FTB.lsmr_ncolumns(s.op)
+FTB.lsmr_allocate_domain(s::_HalfSolve) = FTB.lsmr_allocate_domain(s.op)
+FTB.lsmr_allocate_range(s::_HalfSolve) = FTB.lsmr_allocate_range(s.op)
+FTB.lsmr_domain_norm2!(out, s::_HalfSolve, v, n) = FTB.lsmr_domain_norm2!(out, s.op, v, n)
+FTB.lsmr_forward!(u, s::_HalfSolve, v, c, n) = FTB.lsmr_forward!(u, s.op, v, c, n)
+
+function FTB.lsmr_adjoint!(v, s::_HalfSolve, u, c, n)
+    FTB.lsmr_adjoint!(v, s.op, u, c, n)
+    return _project_half!(v, s.ms, s.dc, s.negcol_half)
 end
 
 Base.show(io::IO, p::NUFFTScatteringPlan{T, B}) where {T, B} =
@@ -149,10 +160,10 @@ close_plan!(p::NUFFTScatteringPlan) = (FTB.close!(p.cplan); FTB.close!(p.rplan);
 # buffer made on its first use.
 # ---------------------------------------------------------------------------
 
-@inline _real_in(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV, MM, HX, PT}, x::AbstractArray{<:Real}) where {T, B, L, PC, PR, CV, MM, HX, PT} =
+@inline _real_in(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV, HX, PT}, x::AbstractArray{<:Real}) where {T, B, L, PC, PR, CV, HX, PT} =
     x isa PT ? x : copyto!(_rbuf(p), x)
 
-@noinline function _rbuf(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV, MM, HX, PT}) where {T, B, L, PC, PR, CV, MM, HX, PT}
+@noinline function _rbuf(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV, HX, PT}) where {T, B, L, PC, PR, CV, HX, PT}
     buf = p.rbuf[]
     buf === nothing && (buf = B == 1 ? similar(p.sx, T, p.M) : similar(p.sx, T, p.M, B); p.rbuf[] = buf)
     return buf::PT
@@ -214,9 +225,10 @@ end
 # both `(0, k₂)` and `(0, -k₂)`, so it is replaced by its conjugate-symmetric part, whose complement the
 # real synthesis maps to zero. On an even axis the Nyquist frequency is split evenly between `±m/2`,
 # which keeps its cosine: the row `k₁ = m₁/2` is made conjugate-symmetric in the same way, and the
-# columns `±m₂/2` are replaced by their mean.
-function _project_half!(H::AbstractArray, p::NUFFTScatteringPlan)
-    m1, m2 = p.ms
+# columns `±m₂/2` are replaced by their mean. `dc` is `(1, n₂, B)` scratch and `negcol_half` the column
+# of each column's negative frequency.
+function _project_half!(H::AbstractArray, ms::NTuple{2, Int}, dc::AbstractArray, negcol_half::AbstractVector)
+    m1, m2 = ms
     tail = ntuple(_ -> Colon(), ndims(H) - 2)
     if iseven(m2)
         n2 = m2 + 1
@@ -225,25 +237,17 @@ function _project_half!(H::AbstractArray, p::NUFFTScatteringPlan)
         a .= (a .+ b) ./ 2
         b .= a
     end
-    _symmetric_row!(H, 1, p, tail)
-    iseven(m1) && _symmetric_row!(H, m1 ÷ 2 + 1, p, tail)
+    _symmetric_row!(H, 1, dc, negcol_half, tail)
+    iseven(m1) && _symmetric_row!(H, m1 ÷ 2 + 1, dc, negcol_half, tail)
     return H
 end
 
 # Row `r` of the half replaced by its conjugate-symmetric part `(h[r, k₂] + conj(h[r, -k₂]))/2`.
-function _symmetric_row!(H::AbstractArray, r::Int, p::NUFFTScatteringPlan, tail)
+function _symmetric_row!(H::AbstractArray, r::Int, dc::AbstractArray, negcol_half::AbstractVector, tail)
     row = view(H, r:r, :, tail...)
-    p.dc .= (row .+ conj.(view(H, r:r, p.negcol_half, tail...))) ./ 2
-    row .= p.dc
+    dc .= (row .+ conj.(view(H, r:r, negcol_half, tail...))) ./ 2
+    row .= dc
     return H
-end
-
-# The adjoint of the real Type-2 in the real inner product LSMR works in: FlowTransformBindings' Type-1
-# with each row `k₁ > 0` counted for itself and its conjugate.
-function _real_adjoint!(dst::AbstractArray, p::NUFFTScatteringPlan, src::AbstractArray)
-    FTB.nufft_type1!(dst, p.rplan, src)
-    view(dst, 2:size(dst, 1), ntuple(_ -> Colon(), ndims(dst) - 1)...) .*= 2
-    return _project_half!(dst, p)
 end
 
 # ---------------------------------------------------------------------------
@@ -283,46 +287,31 @@ end
     return rs
 end
 
-@noinline function _csolve(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV, MM}) where {T, B, L, PC, PR, CV, MM}
+@noinline function _csolve(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV, HX, PT, RV, IV, DC, RS, CS}) where {T, B, L, PC, PR, CV, HX, PT, RV, IV, DC, RS, CS}
     got = p.csolve[]
     got === nothing || return got
-    pts() = B == 1 ? similar(p.sx, Complex{T}, p.M) : similar(p.sx, Complex{T}, p.M, B)
-    modes() = B == 1 ? similar(p.sx, Complex{T}, p.ms) : similar(p.sx, Complex{T}, (p.ms..., B))
-    made = (pts(), modes(), modes(), modes(), modes())
+    made = _complex_solver(p.cplan)
     p.csolve[] = made
-    return made::Tuple{CV, MM, MM, MM, MM}
+    return made::CS
 end
 
 # `A f̃ = x` is solved and scaled by `N` afterwards, which keeps intermediates at the field's own
-# magnitude.
-function _lsmr_solve_real!(f::AbstractArray, plan::NUFFTScatteringPlan{T, B}, b::AbstractArray) where {T, B}
-    u, t, v, w, h, hbar = _rsolve(plan)
-    applyA!(dst, src) = FTB.nufft_type2!(dst, plan.rplan, src)
-    applyAt!(dst, src) = _real_adjoint!(dst, plan, src)
-    info = B == 1 ?
-        lsmr_solve!(plan.hx, applyA!, applyAt!, b, u, t, v, w, h, hbar;
-                    damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
-                    conlim = inv(Base.eps(T)), maxiter = plan.maxiter) :
-        lsmr_solve_batched!(plan.hx, applyA!, applyAt!, b, u, t, v, w, h, hbar, plan.ls_batch;
-                            damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
-                            conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
-    _check_solve(info, plan.M, size(plan.hx)[1:2], plan.rtol, plan.maxiter)
+# magnitude. At `cond(A) = 1/eps` the smallest singular direction carries nothing the precision can
+# represent, so that is `conlim`.
+function _lsmr_solve_real!(f::AbstractArray, plan::NUFFTScatteringPlan{T}, b::AbstractArray) where {T}
+    op, ws = _rsolve(plan)
+    FTB.lsmr!(plan.hx, op, b, ws; atol = plan.rtol, btol = plan.rtol, rtol = 0, damp = plan.damp,
+              conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
+    _check_solve(ws, plan.M, size(plan.hx)[1:2], plan.rtol, plan.maxiter)
     plan.hx .*= one(T) / plan.invN
     return _expand_solution!(f, plan, plan.hx)
 end
 
-function _lsmr_solve_complex!(f::AbstractArray, plan::NUFFTScatteringPlan{T, B}, x_pts::AbstractArray) where {T, B}
-    t, v, w, h, hbar = _csolve(plan)
-    applyA!(dst, src) = FTB.nufft_type2!(dst, plan.cplan, src)
-    applyAt!(dst, src) = FTB.nufft_type1!(dst, plan.cplan, src)
-    info = B == 1 ?
-        lsmr_solve!(f, applyA!, applyAt!, x_pts, _cbuf(plan), t, v, w, h, hbar;
-                    damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
-                    conlim = inv(Base.eps(T)), maxiter = plan.maxiter) :
-        lsmr_solve_batched!(f, applyA!, applyAt!, x_pts, _cbuf(plan), t, v, w, h, hbar, plan.ls_batch;
-                            damp = plan.damp, atol = plan.rtol, btol = plan.rtol,
-                            conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
-    _check_solve(info, plan.M, plan.ms, plan.rtol, plan.maxiter)
+function _lsmr_solve_complex!(f::AbstractArray, plan::NUFFTScatteringPlan{T}, x_pts::AbstractArray) where {T}
+    op, ws = _csolve(plan)
+    FTB.lsmr!(f, op, x_pts, ws; atol = plan.rtol, btol = plan.rtol, rtol = 0, damp = plan.damp,
+              conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
+    _check_solve(ws, plan.M, plan.ms, plan.rtol, plan.maxiter)
     f .*= one(T) / plan.invN
     return f
 end

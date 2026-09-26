@@ -300,8 +300,8 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
                 L = 4, max_order = 2, period = (2π, 2π), solve = true, spectral = spec,
                 ntrans = B2, conv...)
             Test.@test ScatteringTransforms.Plans.batch_width(batched.plan) == B2
-            # Asserted, not assumed: without the per-column bookkeeping the batched path is not running.
-            Test.@test batched.plan.ls_batch !== nothing
+            # The solve's workspace carries one column per field of the batch.
+            Test.@test length(batched.plan.rsolve[2].status) == B2
             Test.@test ScatteringTransforms.scattering_batch(
                 ComputationalBackends.SerialBackend(), batched, X) ≈ serial rtol = 1e-8
             # A per-task rebuild must keep the width, or a threaded batch silently leaves the batched

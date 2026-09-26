@@ -231,16 +231,10 @@ ScatteringTransforms.ScatteringCore.task_workspace
 
 ### Scattered least-squares solve
 
-`solve = true` on a scattered planar transform inverts the nonuniform transform by LSMR rather than
-applying its adjoint. These are the solver and the defaults that configure it.
+`solve = true` on a scattered planar transform fits the mode grid to the samples by least squares with
+`FlowTransformBindings.lsmr!`. These are the defaults that configure it.
 
 ```@docs
-ScatteringTransforms.Plans.lsmr_solve!
-ScatteringTransforms.Plans.lsmr_solve_batched!
-ScatteringTransforms.Plans.lsmr_init
-ScatteringTransforms.Plans.lsmr_step
-ScatteringTransforms.Plans.LSMRState
-ScatteringTransforms.Plans.BatchedLSMRWork
 ScatteringTransforms.Plans.default_solver_rtol
 ScatteringTransforms.Plans.warn_underdetermined
 ```

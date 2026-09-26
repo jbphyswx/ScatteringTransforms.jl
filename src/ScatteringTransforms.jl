@@ -569,10 +569,10 @@ by least squares (slower, needed for irregular sampling). `weights` (length `M`,
 the quadrature for the spatial mean; the default is the uniform sample mean. `eps` is the NUFFT
 tolerance (ignored by the exact direct sum).
 
-The solve is LSMR ([`Plans.lsmr_solve!`](@ref ScatteringTransforms.Plans.lsmr_solve!)), which costs
-one type-2 and one type-1 per iteration and keeps both `‖b - Af‖` and `‖A†(b - Af)‖` monotone, so
-stopping at `maxiter` returns the best iterate reached rather than a diverged one. `rtol` defaults to
-the accuracy of the transform underneath it — `sqrt(eps(T))` for the exact direct sum, `~10·eps` for a
+The solve is LSMR (`FlowTransformBindings.lsmr!`), which costs one type-2 and one type-1 per iteration
+and keeps both `‖b - Af‖` and `‖A†(b - Af)‖` monotone, so stopping at `maxiter` returns the best
+iterate reached. It stops on the tests of Fong & Saunders, `‖b - Af‖ ≤ rtol ‖b‖` or
+`‖A†(b - Af)‖ ≤ rtol ‖A‖ ‖b - Af‖`, and `rtol` defaults to the accuracy of the transform underneath it — `sqrt(eps(T))` for the exact direct sum, `~10·eps` for a
 fast library, whose type-1 and type-2 are adjoints only to their own tolerance
 ([`Plans.default_solver_rtol`](@ref ScatteringTransforms.Plans.default_solver_rtol)). `damp` is a
 Tikhonov `λ` minimising `‖Af - b‖² + λ²‖f‖²`, `0` by default; with `prod(ms) > M` the problem is
