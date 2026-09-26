@@ -172,6 +172,22 @@ Test.@testset "Allocation discipline" begin
                           randn(Msc, Bsc)) == 0
     end
 
+    Test.@testset "the spherical least-squares analysis reuses its plan's workspace" begin
+        # The cascade analyses a field, then each first-order field, through `sphere_coeffs!`, and every
+        # analysis is an iterative solve. The solve's workspace is the plan's, built with it. NUFSHT is
+        # run on one thread and FINUFFT, the configuration whose solve allocates nothing, so what remains
+        # is ST's own.
+        SC = ScatteringTransforms.SphericalCore
+        ext = Base.get_extension(ScatteringTransforms, :ScatteringTransformsNUFSHTExt)
+        lmax, Ms = 6, 200
+        θ = acos.([1 - 2 * (i - 0.5) / Ms for i in 1:Ms])
+        φ = [mod(π * (3 - sqrt(5)) * i, 2π) for i in 1:Ms]
+        np = NUFSHT.make_plan(Float64, θ, φ, lmax; nufft = FTB.FINUFFTBackend(), nthreads = 1)
+        sp = ext.NUSHTSphericalPlan(np, Ms, lmax, θ, φ, 1e-8, 500, FTB.FINUFFTBackend())
+        C = SC.sphere_coeffs_buffer(sp)
+        Test.@test _alloc(SC.sphere_coeffs!, C, sp, randn(Ms)) == 0
+    end
+
     Test.@testset "st(x) allocates only its coefficient container (size-independent)" begin
         # The non-mutating callable is documented to allocate coefficient storage once; that cost
         # depends on the number of wavelets, not the signal length.

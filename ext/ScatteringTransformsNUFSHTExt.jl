@@ -39,9 +39,10 @@ plan built by the monogenic constructors — the spin-weighted plan pair
 `spherical_monogenic_components` synthesises with. Analysis is a band-limited least-squares solve, not `nusht_type1!`:
 on scattered points the adjoint mis-scales the coefficients degree-dependently, so the exact inversion
 is needed for correct absolute magnitudes. Accurate inversion needs the sampling to resolve the band
-limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed points.
+limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed points. `ws` and `spin_ws` are the solves' LSMR
+workspaces, one per plan, so an analysis allocates none.
 """
-struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, NB, SP} <: ST.SphericalCore.AbstractSphericalPlan
+struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, NB, SP, W, SW} <: ST.SphericalCore.AbstractSphericalPlan
     plan::P
     M::Int
     lmax::Int
@@ -51,11 +52,17 @@ struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, NB, SP} <: ST.Spherical
     maxiter::Int
     nufft::NB        # the *resolved* NUFFT backend driving `plan`, never an `Auto` request
     spin::SP         # (spin-0, spin-1) plan pair for `spherical_monogenic_components`, or `nothing`
+    ws::W
+    spin_ws::SW      # the spin-0 solve's workspace, or `nothing` alongside `spin`
 end
 
-NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, nufft, spin = nothing) =
-    NUSHTSphericalPlan{typeof(plan), typeof(theta), typeof(rtol), typeof(nufft), typeof(spin)}(
-        plan, M, lmax, theta, phi, rtol, maxiter, nufft, spin)
+function NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, nufft, spin = nothing)
+    ws = NUFSHT.LSMRWorkspace(plan)
+    sws = spin === nothing ? nothing : NUFSHT.LSMRWorkspace(spin[1])
+    return NUSHTSphericalPlan{typeof(plan), typeof(theta), typeof(rtol), typeof(nufft), typeof(spin),
+                              typeof(ws), typeof(sws)}(plan, M, lmax, theta, phi, rtol, maxiter, nufft,
+                                                       spin, ws, sws)
+end
 
 # The NUFFT backend and batch size are shown because they dominate this plan's speed and are
 # otherwise invisible: an unresolved request falls back to direct summation when no fast NUFFT
@@ -152,7 +159,7 @@ end
 function ST.SphericalCore.sphere_coeffs!(C, plan::NUSHTSphericalPlan, field::AbstractVecOrMat)
     fill!(C, zero(eltype(C)))
     _, iters, rel, converged =
-        NUFSHT.nusht_solve!(C, field, plan.plan; rtol = plan.rtol, maxiter = plan.maxiter)
+        NUFSHT.nusht_solve!(C, field, plan.plan; ws = plan.ws, rtol = plan.rtol, maxiter = plan.maxiter)
     # A solve that stops short of `rtol` — at `maxiter`, or on LSMR's condition or termination tests
     # — leaves coefficients the field does not determine.
     converged || throw(ST.Plans.AnalysisNotConverged(
@@ -254,10 +261,11 @@ function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogen
     # rebuilt from a spec by an older caller) builds them here instead of refusing.
     p0, p1 = ST.SphericalCore.plan_spin(p) === nothing ?
              _spin_plans(Complex{T}, p.theta, p.phi, lmax, p.nufft) : ST.SphericalCore.plan_spin(p)
+    ws0 = p.spin_ws === nothing ? NUFSHT.LSMRWorkspace(p0) : p.spin_ws
     # Complex spin-0 coefficients of the field in NUFSHT's dense spin layout (exact CG inversion,
     # so the band-pass and Riesz fields below share one consistent set of coefficients).
     a = zeros(Complex{T}, lmax + 1, 2lmax + 1)
-    NUFSHT.nusht_solve_spin!(a, Complex{T}.(field), p0)
+    NUFSHT.nusht_solve_spin!(a, Complex{T}.(field), p0; ws = ws0)
 
     # sf = b_j(ℓ)·a  (b_j(0)=0, so the ℓ=0 term vanishes as the Riesz operator requires).
     bfn = ST.SphericalCore.band_multiplier(st.sigma2[j + 1], st.sigma2[j])
