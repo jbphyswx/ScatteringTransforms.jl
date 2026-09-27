@@ -514,9 +514,9 @@ Test.@testset "2D Filter Tests" begin
 
     # 1. Peak location
     # Since theta = π/4 and j = 2, the center frequency is k0 = 3π / (4 * 2^2) = 3π / 16 ≈ 0.589.
-    # Frequency grid: kx = _fftfreq(Nx, ix-1) * 2π, ky = _fftfreq(Ny, iy-1) * 2π.
-    freqs_x = [ScatteringTransforms.Filters._fftfreq(Nx, ix-1) * 2π for ix in 1:Nx]
-    freqs_y = [ScatteringTransforms.Filters._fftfreq(Ny, iy-1) * 2π for iy in 1:Ny]
+    # Frequency grid: kx = 2π·fftfreq(Nx), ky = 2π·fftfreq(Ny).
+    freqs_x = 2π .* collect(FFTW.fftfreq(Nx))
+    freqs_y = 2π .* collect(FFTW.fftfreq(Ny))
     
     # Find peak index
     peak_idx = argmax(abs.(resp))
@@ -565,9 +565,8 @@ Test.@testset "2D Morlet equals the FFT of its spatial form" begin
         gξ, g0 = g(k0), g(0.0)
         ref = FFTW.fft((gξ .- (sum(gξ) / sum(g0)) .* g0) ./ (2π * σpar * σperp))
         ψ = ScatteringTransforms.Filters.frequency_response(m)
-        kpar = [2π * (ScatteringTransforms.Filters._fftfreq(Nx, ix - 1) * cos(θ) +
-                      ScatteringTransforms.Filters._fftfreq(Ny, iy - 1) * sin(θ))
-                for iy in 1:Ny, ix in 1:Nx]
+        fx, fy = FFTW.fftfreq(Nx), FFTW.fftfreq(Ny)
+        kpar = [2π * (fx[ix] * cos(θ) + fy[iy] * sin(θ)) for iy in 1:Ny, ix in 1:Nx]
         half = kpar .>= 0
         Test.@test maximum(abs, ψ[half] .- ref[half]) < 1e-12
     end

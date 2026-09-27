@@ -33,9 +33,6 @@ using ..Cascade: Cascade
 export MonogenicFilterBank, ComputedMonogenicFilterBank, MonogenicScattering
 export build_monogenic_bank, riesz_multipliers, monogenic_amplitude, monogenic_components
 
-# Inline fftfreq for bin k (0-indexed), length N — normalized frequency in cycles/sample.
-@inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
-
 # Radial (isotropic) band-pass response over a D-dim frequency grid: a Gaussian bump on |k| at
 # center ξ with width σ, minus a low-pass term pinning the DC bin to zero (admissibility).
 _radial_bandpass(dims::NTuple{D,Int}, ξ::T, σ::T) where {D,T} =
@@ -47,7 +44,7 @@ function _radial_bandpass!(ψ::AbstractArray{T,D}, ξ::T, σ::T) where {D,T}
     @inbounds for I in CartesianIndices(dims)
         kk = zero(T)
         for d in 1:D
-            f = T(_fftfreq(dims[d], I[d] - 1))
+            f = T(Filters._frequency(dims[d], I[d]))
             kk += f * f
         end
         kn = sqrt(kk)
@@ -70,13 +67,13 @@ function riesz_multipliers(dims::NTuple{D,Int}, ::Type{T}=Float64) where {D,T}
     R = ntuple(_ -> Array{Complex{T},D}(undef, dims), D)
     @inbounds for I in CartesianIndices(dims)
         kk = zero(T)
-        ks = ntuple(d -> T(_fftfreq(dims[d], I[d] - 1)), D)
+        ks = ntuple(d -> T(Filters._frequency(dims[d], I[d])), D)
         for d in 1:D
             kk += ks[d]^2
         end
         kn = sqrt(kk)
         for d in 1:D
-            nyq = iseven(dims[d]) && I[d] - 1 == dims[d] ÷ 2
+            nyq = Filters._isnyquist(dims[d], I[d])
             R[d][I] = kn == zero(T) || nyq ? zero(Complex{T}) : Complex{T}(zero(T), -ks[d] / kn)
         end
     end

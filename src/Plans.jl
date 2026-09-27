@@ -610,9 +610,6 @@ end
 # consumer reads contiguously, so neither the `Sbuf` fill nor the type-2 accumulation gathers.
 # ---------------------------------------------------------------------------
 
-# FFT-ordered integer frequencies for a length-`m` axis: 0,1,…,⌈m/2⌉−1, −⌊m/2⌋,…,−1.
-_fftfreqs(m::Int) = Int[i <= (m - 1) ÷ 2 ? i : i - m for i in 0:(m - 1)]
-
 # The exponential tables of the direct sums and the scratch they write through. It is also the operator
 # of the plan's least-squares solve, Type-2 as `A` and Type-1 as `A†`, on stacks of one column: an
 # `ms` matrix of modes and a length-`M` vector of values.
@@ -670,9 +667,9 @@ function DirectNUFFTPlan(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int
     py = period === nothing ? (T(maximum(y)) - ymin) * ms[2] / (ms[2] - 1) : T(period[2])
     sx = T(2π) .* (T.(x) .- xmin) ./ px
     sy = T(2π) .* (T.(y) .- ymin) ./ py
-    f1, f2 = _fftfreqs(ms[1]), _fftfreqs(ms[2])
-    Ex = Complex{T}[cis(-f1[k] * sx[n]) for k in 1:ms[1], n in 1:M]
-    Ey = Complex{T}[cis(-f2[k] * sy[n]) for n in 1:M, k in 1:ms[2]]
+    f(k, m) = FTB.mode_frequency(FTB.FFTModes(), k, m)
+    Ex = Complex{T}[cis(-f(k, ms[1]) * sx[n]) for k in 1:ms[1], n in 1:M]
+    Ey = Complex{T}[cis(-f(k, ms[2]) * sy[n]) for n in 1:M, k in 1:ms[2]]
     tab = _NUDFTTables{T, Matrix{Complex{T}}, Vector{Complex{T}}}(
         ms, M, Ex, Ey, conj.(Ex), Matrix(conj.(transpose(Ey))),
         Matrix{Complex{T}}(undef, M, ms[2]), Matrix{Complex{T}}(undef, ms[1], M),

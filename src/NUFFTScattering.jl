@@ -51,7 +51,6 @@ end
 batch_width(::NUFFTScatteringPlan{T, B}) where {T, B} = B
 
 _fft_index(f::Int, n::Int) = f >= 0 ? f + 1 : n + f + 1
-_fft_frequency(i::Int, n::Int) = (k = i - 1; k <= (n - 1) ÷ 2 ? k : k - n)
 
 function _like_ints(ref::AbstractArray, v::Vector{Int})
     d = similar(ref, Int, length(v))
@@ -91,10 +90,10 @@ function _nufft_plan_at(backend, ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::T
     rplan = FTB.plan_nufft(backend, T, (sx, sy), (ms[1], n2); kw...)
     m1h = ms[1] ÷ 2 + 1
     half() = B == 1 ? similar(sx, Complex{T}, m1h, n2) : similar(sx, Complex{T}, m1h, n2, B)
-    f2 = [_fft_frequency(j, ms[2]) for j in 1:ms[2]]
+    f2 = [FTB.mode_frequency(FTB.FFTModes(), j, ms[2]) for j in 1:ms[2]]
     col = _like_ints(sx, [_fft_index(f, n2) for f in f2])
     negcol = _like_ints(sx, [_fft_index(-f, n2) for f in f2])
-    negcol_half = _like_ints(sx, [_fft_index(-_fft_frequency(k, n2), n2) for k in 1:n2])
+    negcol_half = _like_ints(sx, [_fft_index(-FTB.mode_frequency(FTB.FFTModes(), k, n2), n2) for k in 1:n2])
     hx = half()
     dc = similar(sx, Complex{T}, 1, n2, B)
     rsolve = solve ? _solver(_HalfSolve(FTB.NUFFTOperator(rplan), ms, dc, negcol_half)) : nothing

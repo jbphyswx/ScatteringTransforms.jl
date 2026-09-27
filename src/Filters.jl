@@ -6,6 +6,8 @@ module Filters
 Implements Morlet wavelets in the frequency domain for FFT-based convolutions.
 """
 
+using FlowTransformBindings: FlowTransformBindings as FTB
+
 export Morlet1D, Morlet2D, Morlet3D
 export frequency_response, frequency_response!
 export gaussian_lowpass, gaussian_lowpass!
@@ -52,14 +54,11 @@ end
 # Convenience constructor - defaults to Float64
 Morlet1D(N::Int, j::Real; kwargs...) = Morlet1D{Float64}(N, j; kwargs...)
 
-# Inline fftfreq for a single bin k (0-indexed) of length N.
-# Equivalent to FFTW.fftfreq(N)[k+1]. No allocation.
-# For even N: bins 0..N÷2-1 are positive, bins N÷2..N-1 are negative (Nyquist goes negative).
-# For odd N: bins 0..(N-1)÷2 are positive, rest negative.
-@inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
+# The frequency of bin `i` of an `n`-point FFT axis in cycles per sample, `fftfreq(n)[i]`.
+@inline _frequency(n::Int, i::Int) = FTB.mode_frequency(FTB.FFTModes(), i, n) / n
 
-# Whether bin `k` (0-indexed) of an `N`-point axis is the Nyquist bin, which stands for both ±½.
-@inline _isnyquist(N::Int, k::Int) = iseven(N) && k == N ÷ 2
+# Whether bin `i` of an `n`-point axis is the Nyquist bin, which stands for both ±½.
+@inline _isnyquist(n::Int, i::Int) = iseven(n) && i == n ÷ 2 + 1
 
 """
     _alias_rms(f, n, I) -> value
@@ -70,8 +69,8 @@ of `f` over every sign of those coordinates. A real field's Littlewood–Paley s
 the mean of the continuous sum over its aliases: an analytic wavelet centred at `+½` keeps the bin.
 """
 function _alias_rms(f::F, n::NTuple{D,Int}, I::CartesianIndex{D}) where {F,D}
-    fr = ntuple(d -> _fftfreq(n[d], I[d] - 1), Val(D))
-    nyq = ntuple(d -> _isnyquist(n[d], I[d] - 1), Val(D))
+    fr = ntuple(d -> _frequency(n[d], I[d]), Val(D))
+    nyq = ntuple(d -> _isnyquist(n[d], I[d]), Val(D))
     v = f(fr)
     any(nyq) || return v
     acc = v * v
@@ -293,7 +292,7 @@ function gaussian_lowpass!(φ::AbstractArray{T, D}, σ::Real) where {T <: Real, 
     @inbounds for I in CartesianIndices(φ)
         s = zero(T)
         for d in 1:D
-            k = T(2π) * T(_fftfreq(n[d], I[d] - 1))
+            k = T(2π) * T(_frequency(n[d], I[d]))
             s += k * k
         end
         φ[I] = exp(-s * h)

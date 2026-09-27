@@ -17,10 +17,6 @@ export build_filter_bank1d, build_filter_bank2d, build_filter_bank3d
 export WaveletMeta
 export ComputedFilterBank2D, nwavelets, filter_at, task_bank, batch_views, iscomputed
 
-# Inline fftfreq for a single 0-indexed bin — no allocation.
-# Mirrors FFTW.fftfreq(N)[k+1].
-@inline _fftfreq(N::Int, k::Int) = k < (N + 1) ÷ 2 ? k / N : (k - N) / N
-
 # ---------------------------------------------------------------------------
 # Littlewood–Paley normalization
 #
