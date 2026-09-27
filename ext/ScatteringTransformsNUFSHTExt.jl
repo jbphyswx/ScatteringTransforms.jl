@@ -22,6 +22,7 @@ iterative solve runs once per field rather than once per band.
 """
 
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using SpectralBackends: SpectralBackends as SB
 using ScatteringTransforms: ScatteringTransforms as ST
 
@@ -57,8 +58,8 @@ struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, NB, SP, W, SW} <: ST.Sp
 end
 
 function NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, nufft, spin = nothing)
-    ws = NUFSHT.LSMRWorkspace(plan)
-    sws = spin === nothing ? nothing : NUFSHT.LSMRWorkspace(spin[1])
+    ws = FTB.LSMRWorkspace(plan)
+    sws = spin === nothing ? nothing : FTB.LSMRWorkspace(spin[1])
     return NUSHTSphericalPlan{typeof(plan), typeof(theta), typeof(rtol), typeof(nufft), typeof(spin),
                               typeof(ws), typeof(sws)}(plan, M, lmax, theta, phi, rtol, maxiter, nufft,
                                                        spin, ws, sws)
@@ -238,7 +239,7 @@ function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogen
     # rebuilt from a spec by an older caller) builds them here instead of refusing.
     p0, p1 = ST.SphericalCore.plan_spin(p) === nothing ?
              _spin_plans(Complex{T}, p.theta, p.phi, lmax, p.nufft) : ST.SphericalCore.plan_spin(p)
-    ws0 = p.spin_ws === nothing ? NUFSHT.LSMRWorkspace(p0) : p.spin_ws
+    ws0 = p.spin_ws === nothing ? FTB.LSMRWorkspace(p0) : p.spin_ws
     # Complex spin-0 coefficients of the field in NUFSHT's dense spin layout (exact CG inversion,
     # so the band-pass and Riesz fields below share one consistent set of coefficients).
     a = zeros(Complex{T}, lmax + 1, 2lmax + 1)
