@@ -23,7 +23,6 @@ using ..ScatteringCore: ScatteringCore
 using ..FilterBanks: FilterBanks
 using ..Filters: Filters
 using ..PathGraph: PathGraph
-using SpectralBackends: SpectralBackends as SB
 
 """
     decimation(N, scale, α) -> NTuple{D,Int}
@@ -99,18 +98,24 @@ function PeriodizedWorkspace(dims::NTuple{D, Int}, α::Integer, resolutions, lev
         shapefilter)
 end
 
+Base.show(io::IO, ws::PeriodizedWorkspace{T, D}) where {T, D} =
+    print(io, "PeriodizedWorkspace{", T, ", ", D, "}(dims=", ws.dims, ", oversampling=", ws.oversampling,
+          ", resolutions=", ws.resolutions, ")")
+
 _one(::Val{D}) where {D} = ntuple(_ -> 1, D)
 
 """
-    build(fb, groups, dims, T, α, spectral) -> PeriodizedWorkspace
+    build(fb, groups, dims, T, α, plan) -> PeriodizedWorkspace
 
 `groups` is the cascade work list `(j1, children, pathids)`; it determines which resolutions are
 live and which `(wavelet, resolution)` filter pairs are ever applied, so nothing unused is built.
+`plan` is the transform's full-grid plan and serves as level 1; the coarser levels are planned with
+its spectral backend.
 """
 build(fb, groups, dims::NTuple{D, Int}, ::Type{T}, α::Int,
-      spectral::SB.AbstractSpectralBackend) where {T, D} =
+      plan::Plans.AbstractScatteringPlan) where {T, D} =
     build(fb, groups, dims, T, α; alloc = rd -> zeros(Complex{T}, rd),
-          makeplan = rd -> Plans.make_plan(spectral, T, rd))
+          makeplan = rd -> Plans.make_plan(Plans.spectral_backend(plan), T, rd), level1 = plan)
 
 # `alloc`/`makeplan` are the only device-aware pieces, so a device-resident transform builds its
 # workspace through the same code by supplying device versions — no second implementation, and no
@@ -124,8 +129,12 @@ build(fb, groups, dims::NTuple{D, Int}, ::Type{T}, α::Int,
 #
 # `shapefilter` post-processes each periodized filter — the batched build reshapes to `(spatial…, 1)`
 # so filters broadcast over the stack axis.
+#
+# `level1`, when given, is the plan for the full grid, so a transform that already holds one does not
+# plan that grid a second time.
 function build(fb, groups, dims::NTuple{D, Int}, ::Type{T}, α::Int;
-               alloc, makeplan, alias_out::Bool = true, shapefilter = identity) where {T, D}
+               alloc, makeplan, alias_out::Bool = true, shapefilter = identity,
+               level1 = nothing) where {T, D}
     nw = FilterBanks.nwavelets(fb)
     meta = fb.meta
     full = _one(Val(D))
@@ -150,7 +159,7 @@ function build(fb, groups, dims::NTuple{D, Int}, ::Type{T}, α::Int;
     end
 
     rdims(l) = ntuple(d -> dims[d] ÷ resolutions[l][d], D)
-    plans = [l == 1 ? makeplan(dims) : makeplan(rdims(l)) for l in 1:nl]
+    plans = [l > 1 ? makeplan(rdims(l)) : level1 === nothing ? makeplan(dims) : level1 for l in 1:nl]
     work = [alloc(rdims(l)) for l in 1:nl]
     out = [(alias_out && Plans.inplace_inverse(plans[l])) ? work[l] : alloc(rdims(l)) for l in 1:nl]
     empty_buf = alloc(ntuple(_ -> 0, D))
@@ -366,6 +375,9 @@ struct FieldWorkspace{T, D, PW <: PeriodizedWorkspace{T, D}, FV <: AbstractVecto
     small_out::A           # === small when the output plan inverts in place
     plan::P
 end
+
+Base.show(io::IO, fw::FieldWorkspace{T, D}) where {T, D} =
+    print(io, "FieldWorkspace{", T, ", ", D, "}(output decimation=", fw.rout, ", ", fw.pw, ")")
 
 """
     field_oversampling(fb, α, s) -> Int

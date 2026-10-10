@@ -534,7 +534,7 @@ the batched cascade never reshapes in its inner loop.
 
 A computed bank returns the same view `nwavelets` times — one view of the one scratch array. That
 is only sound because [`filter_at`](@ref) refills the scratch immediately before each use, which is
-what `Batched._filter` does.
+what `Cascade._filter` does.
 """
 batch_views(fb::StoredBank, spatial::Tuple) =
     [reshape(ψ, (spatial..., 1)) for ψ in fb.wavelets]

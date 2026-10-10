@@ -239,6 +239,9 @@ struct MonogenicWorkspace{T, D, PW <: Cascade.PeriodizedWorkspace{T, D},
     rfilters::FV   # rfilters[l][j][d]; empty at level 1 and wherever `j` is not applied at `l`
 end
 
+Base.show(io::IO, mw::MonogenicWorkspace{T, D}) where {T, D} =
+    print(io, "MonogenicWorkspace{", T, ", ", D, "}(", mw.pw, ")")
+
 """
     MonogenicScattering{D,T,FB,Tree,P,G,CB,MW}
 
@@ -262,8 +265,8 @@ end
 # `R_d ψ_j` periodized onto each parent resolution. Only the pairs the cascade actually applies are
 # built, so the storage follows the same geometric decay the working buffers do.
 function _monogenic_workspace(fb, groups, dims::NTuple{D, Int}, ::Type{T}, α::Int,
-                              spectral) where {T, D}
-    pw = Cascade.build(fb, groups, dims, T, α, spectral)
+                              plan) where {T, D}
+    pw = Cascade.build(fb, groups, dims, T, α, plan)
     nw = FilterBanks.nwavelets(fb)
     R = fb.riesz
     amp = [zeros(T, ntuple(d -> dims[d] ÷ r[d], D)) for r in pw.resolutions]
@@ -304,7 +307,7 @@ function MonogenicScattering(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1, m
     nw = FilterBanks.nwavelets(fb)
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
              [(j, Int[], Int[]) for j in 1:nw]
-    mw = _monogenic_workspace(fb, groups, dims, T, oversampling, spectral)
+    mw = _monogenic_workspace(fb, groups, dims, T, oversampling, plan)
     return MonogenicScattering{D,T,typeof(fb),typeof(tree),typeof(plan),typeof(groups),
                                typeof(mw.pw.work[1]),typeof(mw)}(
         fb, tree, groups, max_order, plan, dims, zeros(Complex{T}, dims), mw)
@@ -314,6 +317,11 @@ MonogenicScattering(::Type{T}, N::Int, J::Int; kwargs...) where {T} =
 MonogenicScattering(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
     MonogenicScattering(Float64, dims, J; kwargs...)
 MonogenicScattering(N::Int, J::Int; kwargs...) = MonogenicScattering(Float64, (N,), J; kwargs...)
+
+Base.show(io::IO, st::MonogenicScattering{D, T}) where {D, T} =
+    print(io, "MonogenicScattering{", D, ", ", T, "}(dims=", st.dims, ", J=", st.filter_bank.J, ", Q=",
+          st.filter_bank.Q, ", max_order=", st.max_order, ", oversampling=", st.mw.pw.oversampling, ", ",
+          st.plan, ")")
 
 # `√(m₀² + Σ_d m_d²)` into `dst`, from the full-resolution spectrum `Xf` band-passed by wavelet `j`
 # and produced on level `l`'s grid. Both filters are full resolution, so the Riesz weighting fuses

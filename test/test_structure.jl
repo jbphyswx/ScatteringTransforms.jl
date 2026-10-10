@@ -56,14 +56,13 @@ end
 
 Test.@testset "Workspace is O(field), not O(nw * field)" begin
     # Only one first-order field and one spectrum are live at a time, so a transform's scratch must
-    # not grow with the number of wavelets. It used to hold `nw` of each.
+    # not grow with the number of wavelets.
     #
-    # Deduplicating by identity is load-bearing, not tidiness: `buffer_conv` is `buffer_input`
-    # itself when the plan inverts in place, and each periodized resolution's inverse destination is
-    # its own working array, so a naive `sum(sizeof, ...)` reports scratch that was never allocated.
+    # Arrays are counted once by identity: where a plan inverts in place, a resolution's inverse
+    # destination is its own working array.
     function ws_bytes(s)
         seen = Base.IdSet{Any}()
-        for a in (s.buffer_input, s.buffer_signal_fft, s.buffer_conv, s.buffer_u1_fft)
+        for a in (s.buffer_input, s.buffer_signal_fft)
             push!(seen, a)
         end
         for d in (s.pw.work, s.pw.out, s.pw.spec), a in values(d)
@@ -95,9 +94,9 @@ Test.@testset "task_workspace shares read-only state, copies only scratch" begin
     Test.@test ws.filter_bank === st.filter_bank
     Test.@test ws.tree === st.tree
     Test.@test ws.groups === st.groups
-    Test.@test ws.buffer_conv !== st.buffer_conv
-    Test.@test ws.buffer_u1_fft !== st.buffer_u1_fft
+    Test.@test ws.buffer_input !== st.buffer_input
     Test.@test ws.buffer_signal_fft !== st.buffer_signal_fft
+    Test.@test ws.plan === first(ws.pw.plans)
 
     # The cascade workspace is where the mutable state actually lives now, so the same split has to
     # hold inside it: buffers per task, filters shared. Sharing the buffers is a silent data race.
@@ -152,11 +151,35 @@ Test.@testset "Plan-owning structs print one line" begin
     # The default `show` of a struct holding an FFTW plan can reach `fftw_sprint_plan`, which can
     # segfault; a device plan would print its whole buffer. Every such struct prints a summary.
     for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.FFTSpectralBackend())
-        st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(32, 3; Q = 1, spectral = spec)
-        s = sprint(show, st.plan)
-        Test.@test !occursin('\n', s)
-        Test.@test !isempty(s)
+        sts = (ScatteringTransforms.Scattering1D.ScatteringTransform1D(32, 3; Q = 1, spectral = spec),
+               ScatteringTransforms.Scattering2D.ScatteringTransform2D((16, 16), 2; L = 4, spectral = spec),
+               ScatteringTransforms.Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient = 4,
+                                                                      spectral = spec),
+               ScatteringTransforms.Monogenic.MonogenicScattering((16, 16), 2; spectral = spec))
+        for st in sts
+            for x in (st, st.plan)
+                s = sprint(show, x)
+                Test.@test !occursin('\n', s)
+                Test.@test !isempty(s)
+            end
+            pw = st isa ScatteringTransforms.Monogenic.MonogenicScattering ? st.mw.pw : st.pw
+            Test.@test !occursin('\n', sprint(show, pw))
+        end
     end
+end
+
+Test.@testset "A transform plans its full grid once" begin
+    # The cascade's level 1 is the full grid, which the transform's own plan already covers; an FFTW
+    # plan measured twice doubles construction time at every size.
+    FB = SpectralBackends.FFTSpectralBackend()
+    for st in (ScatteringTransforms.Scattering1D.ScatteringTransform1D(64, 3; Q = 2, spectral = FB),
+               ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L = 4, spectral = FB),
+               ScatteringTransforms.Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient = 4,
+                                                                      spectral = FB))
+        Test.@test st.plan === first(st.pw.plans)
+    end
+    mono = ScatteringTransforms.Monogenic.MonogenicScattering((32, 32), 3; spectral = FB)
+    Test.@test mono.plan === first(mono.mw.pw.plans)
 end
 
 # Fixed arity, and the function comes in as a value: a captured module local or a splatted `args...`

@@ -21,41 +21,34 @@ export ScatteringTransform2D, scattering_transform2d!, cascade!
 export compute_shape_sparsity
 
 """
-    ScatteringTransform2D{T,M,R}
+    ScatteringTransform2D{T,M,P,Tree,FB,G,PW}
 
 2D planar scattering transform with oriented wavelets and pre-allocated workspace.
 
-# Type Parameters
-- `T`: Real element type (Float32, Float64, ...)
-- `M`: Complex matrix type for buffers (Matrix{Complex{T}}, CuMatrix{Complex{T}}, ...)
-- `R`: Real matrix type for modulus buffers (Matrix{T}, ...)
-
 # Fields
-- `filter_bank`: Pre-computed 2D filter bank
-- `max_order::Int`: Maximum scattering order (1 or 2)
-- `plan`: spectral transform plan (in-core direct sum by default; FFTW fast path if loaded)
-- `buffer_input`: Complex matrix for real→complex promotion (zero alloc)
-- `buffer_signal_fft`: Preserved copy of signal FFT (buffer_conv gets overwritten)
-- `buffer_conv`: Complex matrix for IFFT output
+- `filter_bank`: pre-computed 2D filter bank
+- `tree`: admissible scattering paths
+- `groups`: `(j1, children, path ids)` from `tree`, longest-first — the order the cascade walks
+- `max_order::Int`: maximum scattering order (1 or 2)
+- `plan`: spectral transform plan (in-core direct sum by default; FFTW fast path if loaded), also
+  level 1 of `pw`
+- `buffer_input`: complex matrix for real→complex promotion
+- `buffer_signal_fft`: the input spectrum, read-only for the whole cascade
 - `dims`: the field's spatial size
-- `buffer_u1_fft`: the spectrum of the current first-order modulus, reused across that wavelet's
-  children. The modulus itself needs no buffer of its own — the cascade writes it straight into
-  `buffer_input`, which is what its transform reads.
+- `pw`: the periodized cascade's workspace (see `Cascade`)
 """
 struct ScatteringTransform2D{T, M<:AbstractMatrix{Complex{T}},
                              P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
                              FB, G<:AbstractVector, PW}
     filter_bank::FB
     tree::Tree
-    groups::G               # (j1, children, path ids) from the tree, longest-first
+    groups::G
     max_order::Int
     plan::P
     buffer_input::M
     buffer_signal_fft::M
-    buffer_conv::M
     dims::NTuple{2,Int}
-    buffer_u1_fft::M        # its spectrum, reused across that j1's children
-    pw::PW                  # periodized cascade workspace — see `Cascade`
+    pw::PW
 end
 
 """
@@ -76,31 +69,25 @@ function ScatteringTransform2D(::Type{T}, N::NTuple{2,Int}, J::Int;
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
              [(j, Int[], Int[]) for j in 1:nw]
     plan = Plans.make_plan(spectral, T, N)
-
-    dummy = zeros(Complex{T}, N)
-    # O(prod(N)) workspace, not O(nw·prod(N)): one first-order modulus and its spectrum are live at
-    # a time, because the cascade finishes every child of a `j1` before moving to the next.
-    # `buffer_conv` is `buffer_input` itself when the plan inverts in place — the convolution's input
-    # is scratch and its output replaces it, so the two need not be separate arrays.
-    input = similar(dummy)
-    conv = Plans.inplace_inverse(plan) ? input : similar(dummy)
-    pw = Cascade.build(filter_bank, groups, N, T, oversampling, Plans.spectral_backend(plan))
+    pw = Cascade.build(filter_bank, groups, N, T, oversampling, plan)
     return ScatteringTransform2D(filter_bank, tree, groups, max_order, plan,
-                                 input, similar(dummy), conv, N, similar(dummy), pw)
+                                 zeros(Complex{T}, N), zeros(Complex{T}, N), N, pw)
 end
 ScatteringTransform2D(N::NTuple{2,Int}, J::Int; kwargs...) =
     ScatteringTransform2D(Float64, N, J; kwargs...)
 
-# Shares filter bank / tree / groups; copies only the buffers and the plan's scratch. Where the
-# original aliases `buffer_conv` to `buffer_input`, the copy has to as well.
+Base.show(io::IO, st::ScatteringTransform2D{T}) where {T} =
+    print(io, "ScatteringTransform2D{", T, "}(N=", st.dims, ", J=", st.filter_bank.J, ", L=",
+          st.filter_bank.L, ", max_order=", st.max_order, ", oversampling=", st.pw.oversampling, ", ",
+          st.plan, ")")
+
+# Shares filter bank / tree / groups; copies only the buffers and the plans' scratch. The workspace's
+# level-1 plan is the transform's own.
 function ScatteringCore.task_workspace(st::ScatteringTransform2D)
-    input = similar(st.buffer_input)
-    conv = st.buffer_conv === st.buffer_input ? input : similar(st.buffer_conv)
     fb = FilterBanks.task_bank(st.filter_bank)
-    return ScatteringTransform2D(fb, st.tree, st.groups,
-                                 st.max_order, Plans.task_local_plan(st.plan),
-                                 input, similar(st.buffer_signal_fft), conv,
-                                 st.dims, similar(st.buffer_u1_fft), Cascade.task_copy(st.pw, fb))
+    pw = Cascade.task_copy(st.pw, fb)
+    return ScatteringTransform2D(fb, st.tree, st.groups, st.max_order, first(pw.plans),
+                                 similar(st.buffer_input), similar(st.buffer_signal_fft), st.dims, pw)
 end
 
 """
@@ -160,30 +147,6 @@ what the tree encodes; same-scale different-orientation pairs are not order-2 pa
 cascade!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform2D,
          image_fft::AbstractMatrix) =
     Cascade.cascade!(S1, S2, st.pw, st.filter_bank, st.groups, image_fft)
-
-# The undecimated form, kept as the oracle the periodized cascade is pinned against.
-function _cascade_full!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform2D,
-                        image_fft::AbstractMatrix)
-    isempty(S2) || fill!(S2, zero(eltype(S2)))
-    fb = st.filter_bank
-    @inbounds for (j1, children, _) in st.groups
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, image_fft, FilterBanks.filter_at(fb, j1),
-                                         st.plan, st.buffer_input)
-        if isempty(children)
-            S1[j1] = ScatteringCore.modulus_mean(st.buffer_conv)
-            continue
-        end
-        # Modulus written straight into the transform's input, not via a real buffer and a widen.
-        S1[j1] = ScatteringCore.modulus_mean!(st.buffer_input, st.buffer_conv)
-        Plans.forward_transform!(st.buffer_u1_fft, st.plan, st.buffer_input)
-        for j2 in children
-            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_u1_fft, FilterBanks.filter_at(fb, j2),
-                                             st.plan, st.buffer_input)
-            S2[j1, j2] = ScatteringCore.modulus_mean(st.buffer_conv)
-        end
-    end
-    return S1, S2
-end
 
 """
     compute_shape_sparsity(S1, S2, meta) -> (; sparsity, shape)

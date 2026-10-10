@@ -106,13 +106,15 @@ end
 # Device-resident transform constructors (parity with the CUDA ext, vendor-neutral)
 # ---------------------------------------------------------------------------
 
-# The periodized cascade's workspace, allocated and planned on the device. `Cascade.build` takes
-# these two hooks precisely so there is one implementation rather than a host copy and a device copy.
-_device_pw(b, fb, groups, dims, ::Type{T}, α::Int, D::Int) where {T} =
+# The periodized cascade's workspace, allocated and planned on the device, with the transform's own
+# plan as level 1. `Cascade.build` takes these hooks so the host and the device share one
+# implementation.
+_device_pw(b, fb, groups, dims, ::Type{T}, α::Int, D::Int, plan) where {T} =
     ST.Cascade.build(fb, groups, dims, T, α;
                      alloc = rd -> _dzeros(b, Complex{T}, rd),
                      makeplan = rd -> ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, rd);
-                                                                 region = 1:D))
+                                                                 region = 1:D),
+                     level1 = plan)
 
 function ST.Scattering1D.ScatteringTransform1D(::Type{T}, N::Int, J::Int, gpu::CB.GPUBackend;
                                                Q::Int = 1, max_order::Int = 2, oversampling::Int = J) where {T}
@@ -124,11 +126,9 @@ function ST.Scattering1D.ScatteringTransform1D(::Type{T}, N::Int, J::Int, gpu::C
     tree = ST.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
     groups = _groups(tree, length(wavelets), max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, (N,)))
-    input = _dzeros(b, Complex{T}, (N,))
-    conv = ST.Plans.inplace_inverse(plan) ? input : _dzeros(b, Complex{T}, (N,))
-    pw = _device_pw(b, filter_bank, groups, (N,), T, oversampling, 1)
+    pw = _device_pw(b, filter_bank, groups, (N,), T, oversampling, 1, plan)
     return ST.Scattering1D.ScatteringTransform1D(filter_bank, tree, groups, max_order, plan,
-        input, _dzeros(b, Complex{T}, (N,)), conv, (N,), _dzeros(b, Complex{T}, (N,)), pw)
+        _dzeros(b, Complex{T}, (N,)), _dzeros(b, Complex{T}, (N,)), (N,), pw)
 end
 # Scattered-planar parity: everything downstream of the points follows their array type, so the
 # device constructor only has to put the points on the device. Which NUFFT runs there is the
@@ -156,11 +156,9 @@ function ST.Scattering2D.ScatteringTransform2D(::Type{T}, N::NTuple{2,Int}, J::I
     tree = ST.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
     groups = _groups(tree, length(wavelets), max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, N))
-    input = _dzeros(b, Complex{T}, N)
-    conv = ST.Plans.inplace_inverse(plan) ? input : _dzeros(b, Complex{T}, N)
-    pw = _device_pw(b, filter_bank, groups, N, T, oversampling, 2)
+    pw = _device_pw(b, filter_bank, groups, N, T, oversampling, 2, plan)
     return ST.Scattering2D.ScatteringTransform2D(filter_bank, tree, groups, max_order, plan,
-        input, _dzeros(b, Complex{T}, N), conv, N, _dzeros(b, Complex{T}, N), pw)
+        _dzeros(b, Complex{T}, N), _dzeros(b, Complex{T}, N), N, pw)
 end
 ST.Scattering2D.ScatteringTransform2D(N::NTuple{2,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) =
     ST.Scattering2D.ScatteringTransform2D(Float32, N, J, gpu; kwargs...)
@@ -175,11 +173,9 @@ function ST.Scattering3D.ScatteringTransform3D(::Type{T}, N::NTuple{3,Int}, J::I
     tree = ST.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
     groups = _groups(tree, length(wavelets), max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, N))
-    input = _dzeros(b, Complex{T}, N)
-    conv = ST.Plans.inplace_inverse(plan) ? input : _dzeros(b, Complex{T}, N)
-    pw = _device_pw(b, filter_bank, groups, N, T, oversampling, 3)
+    pw = _device_pw(b, filter_bank, groups, N, T, oversampling, 3, plan)
     return ST.Scattering3D.ScatteringTransform3D(filter_bank, tree, groups, max_order, plan,
-        input, _dzeros(b, Complex{T}, N), conv, N, _dzeros(b, Complex{T}, N), pw)
+        _dzeros(b, Complex{T}, N), _dzeros(b, Complex{T}, N), N, pw)
 end
 ST.Scattering3D.ScatteringTransform3D(N::NTuple{3,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) =
     ST.Scattering3D.ScatteringTransform3D(Float32, N, J, gpu; kwargs...)

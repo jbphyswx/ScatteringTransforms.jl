@@ -3,10 +3,9 @@ module Scattering3D
 """
     Scattering3D.jl — 3D volumetric scattering transform
 
-Oriented 3D Morlet wavelets (`J` scales × `n_orient` sphere directions). Reuses the
-dimension-agnostic core ops (`wavelet_convolve!`, `apply_modulus!`, `spatial_average`), the
-scattering path tree (second order = strictly coarser scale, all orientation pairs), and the
-scales×orientations coefficient container.
+Oriented 3D Morlet wavelets (`J` scales × `n_orient` sphere directions), run through the periodized
+cascade (`Cascade`) over the scattering path tree (second order = strictly coarser scale, all
+orientation pairs), with the scales×orientations coefficient container.
 """
 
 using ..Plans: Plans
@@ -20,20 +19,24 @@ using ..Cascade: Cascade
 
 export ScatteringTransform3D, scattering_transform3d!, cascade!
 
+"""
+    ScatteringTransform3D{T,M,P,Tree,FB,G,PW}
+
+3D volumetric scattering transform; the fields are those of [`ScatteringTransform2D`](@ref), with
+`dims = (Nz, Ny, Nx)`.
+"""
 struct ScatteringTransform3D{T, M<:AbstractArray{Complex{T},3},
                              P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
                              FB, G<:AbstractVector, PW}
     filter_bank::FB
     tree::Tree
-    groups::G               # (j1, children, path ids) from the tree, longest-first
+    groups::G
     max_order::Int
     plan::P
     buffer_input::M
     buffer_signal_fft::M
-    buffer_conv::M
     dims::NTuple{3,Int}
-    buffer_u1_fft::M        # its spectrum, reused across that j1's children
-    pw::PW                  # periodized cascade workspace — see `Cascade`
+    pw::PW
 end
 
 """
@@ -55,29 +58,25 @@ function ScatteringTransform3D(::Type{T}, N::NTuple{3,Int}, J::Int;
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
              [(j, Int[], Int[]) for j in 1:nw]
     plan = Plans.make_plan(spectral, T, N)
-
-    dummy = zeros(Complex{T}, N)
-    # O(prod(N)) workspace, not O(nw·prod(N)): one first-order volume and one spectrum are live at
-    # a time, which matters most in 3D where a single volume is already large.
-    # `buffer_conv` is `buffer_input` itself when the plan inverts in place.
-    input = similar(dummy)
-    conv = Plans.inplace_inverse(plan) ? input : similar(dummy)
-    pw = Cascade.build(filter_bank, groups, N, T, oversampling, Plans.spectral_backend(plan))
+    pw = Cascade.build(filter_bank, groups, N, T, oversampling, plan)
     return ScatteringTransform3D(filter_bank, tree, groups, max_order, plan,
-                                 input, similar(dummy), conv, N, similar(dummy), pw)
+                                 zeros(Complex{T}, N), zeros(Complex{T}, N), N, pw)
 end
 ScatteringTransform3D(N::NTuple{3,Int}, J::Int; kwargs...) =
     ScatteringTransform3D(Float64, N, J; kwargs...)
 
-# Shares filter bank / tree / groups; copies only the buffers and the plan's scratch.
+Base.show(io::IO, st::ScatteringTransform3D{T}) where {T} =
+    print(io, "ScatteringTransform3D{", T, "}(N=", st.dims, ", J=", st.filter_bank.J, ", n_orient=",
+          st.filter_bank.n_orient, ", max_order=", st.max_order, ", oversampling=", st.pw.oversampling,
+          ", ", st.plan, ")")
+
+# Shares filter bank / tree / groups; copies only the buffers and the plans' scratch. The workspace's
+# level-1 plan is the transform's own.
 function ScatteringCore.task_workspace(st::ScatteringTransform3D)
-    input = similar(st.buffer_input)
-    conv = st.buffer_conv === st.buffer_input ? input : similar(st.buffer_conv)
     fb = FilterBanks.task_bank(st.filter_bank)
-    return ScatteringTransform3D(fb, st.tree, st.groups,
-                                 st.max_order, Plans.task_local_plan(st.plan),
-                                 input, similar(st.buffer_signal_fft), conv,
-                                 st.dims, similar(st.buffer_u1_fft), Cascade.task_copy(st.pw, fb))
+    pw = Cascade.task_copy(st.pw, fb)
+    return ScatteringTransform3D(fb, st.tree, st.groups, st.max_order, first(pw.plans),
+                                 similar(st.buffer_input), similar(st.buffer_signal_fft), st.dims, pw)
 end
 
 """
@@ -133,30 +132,6 @@ Both scattering orders in one grouped pass — see the 1D `cascade!` for the sch
 cascade!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform3D,
          vol_fft::AbstractArray{<:Any,3}) =
     Cascade.cascade!(S1, S2, st.pw, st.filter_bank, st.groups, vol_fft)
-
-# The undecimated form, kept as the oracle the periodized cascade is pinned against.
-function _cascade_full!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform3D,
-                        vol_fft::AbstractArray{<:Any,3})
-    isempty(S2) || fill!(S2, zero(eltype(S2)))
-    fb = st.filter_bank
-    @inbounds for (j1, children, _) in st.groups
-        ScatteringCore.wavelet_convolve!(st.buffer_conv, vol_fft, FilterBanks.filter_at(fb, j1),
-                                         st.plan, st.buffer_input)
-        if isempty(children)
-            S1[j1] = ScatteringCore.modulus_mean(st.buffer_conv)
-            continue
-        end
-        # Modulus written straight into the transform's input, not via a real buffer and a widen.
-        S1[j1] = ScatteringCore.modulus_mean!(st.buffer_input, st.buffer_conv)
-        Plans.forward_transform!(st.buffer_u1_fft, st.plan, st.buffer_input)
-        for j2 in children
-            ScatteringCore.wavelet_convolve!(st.buffer_conv, st.buffer_u1_fft, FilterBanks.filter_at(fb, j2),
-                                             st.plan, st.buffer_input)
-            S2[j1, j2] = ScatteringCore.modulus_mean(st.buffer_conv)
-        end
-    end
-    return S1, S2
-end
 
 # ============================================================================
 # Non-mutating, autodiff-friendly forward — see Scattering1D for the rationale.

@@ -65,10 +65,8 @@ end
 """
     wavelet_convolve!(out, signal_fft, filter_fft, plan, buffer)
 
-Truly zero-allocation wavelet convolution.
-
-Multiplies `signal_fft .* filter_fft` into `buffer` in-place, then applies the inverse spectral
-transform via `Plans.inverse_transform!(out, plan, buffer)` — writing directly into `out`.
+Wavelet convolution without allocation: multiplies `signal_fft .* filter_fft` into `buffer`, then
+applies the inverse spectral transform via `Plans.inverse_transform!(out, plan, buffer)`.
 
 `out` and `buffer` must both be pre-allocated complex arrays of the same size.
 """
