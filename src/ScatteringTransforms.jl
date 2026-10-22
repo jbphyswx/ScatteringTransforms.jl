@@ -55,8 +55,11 @@ include("Monogenic.jl")
 include("SphericalCore.jl")
 include("Inverse.jl")
 
-using ComputationalBackends: ComputationalBackends as CB
-using SpectralBackends: SpectralBackends as SB
+using ComputationalBackends: ComputationalBackends, ComputationalBackends as CB
+using SpectralBackends: SpectralBackends, SpectralBackends as SB
+
+public ComputationalBackends, CB
+public SpectralBackends, SB
 
 using .Execution: Execution
 using .Plans: Plans
