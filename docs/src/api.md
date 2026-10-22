@@ -18,7 +18,7 @@ Planar (Cartesian) and spherical scattering, on uniform/structured and nonunifor
 | Sphere (S²) | `structured_spherical_scattering` (exact direct SHT; FastSphericalHarmonics fast path) | `spherical_scattering` (exact direct SHT; NUFSHT fast path) |
 
 **Every cell has an in-core, dependency-free default** (direct summation), with an optional fast path
-selected by the `spectral` keyword, which takes a
+selected by the `transform` keyword, which takes a
 [SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag. `DirectSumSpectralBackend`
 is the in-core default everywhere; the fast paths are `FFTSpectralBackend` (FFTW) on a grid,
 [FlowTransformBindings.jl](https://github.com/jbphyswx/FlowTransformBindings.jl)'s
@@ -26,10 +26,11 @@ is the in-core default everywhere; the fast paths are `FFTSpectralBackend` (FFTW
 (NUFSHT) for the scattered sphere, and `FSHTSpectralBackend` (FastSphericalHarmonics) for the
 structured sphere. `AutoSpectralBackend` (the default) picks the fast path if its extension is
 loaded, else the direct sum — so nothing requires an external library. Naming a backend explicitly is
-honoured exactly: if its extension is absent it raises rather than silently downgrading.
+honoured exactly: if its extension is absent it throws.
 
-Monogenic (Riesz) variants exist on both sphere paths; see below (pointwise
-`spherical_monogenic_components` additionally needs the NUFSHT spin-1 synthesis).
+Monogenic (Riesz) variants exist on both sphere paths; see below. Pointwise
+`spherical_monogenic_components` takes a scattered-point transform, on the in-core or the NUFSHT
+plan.
 
 ## Transforms
 
@@ -113,11 +114,12 @@ ScatteringTransforms.Reductions.log_coefficients
 
 Where a transform runs is chosen with a backend from
 [ComputationalBackends.jl](https://github.com/jbphyswx/ComputationalBackends.jl) — `SerialBackend`,
-`ThreadedBackend`, `GPUBackend`, `DistributedBackend`, `MPIBackend`, `AutoBackend` — passed as the
-second argument to `scattering_batch`. Which spectral algorithm it uses is chosen with a
-[SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag passed as `spectral=` at
-construction. Each is honoured exactly: naming a backend whose extension is not loaded raises rather
-than falling back.
+`ThreadedBackend`, `GPUBackend`, `DistributedBackend`, `MPIBackend`, `AutoBackend` — passed as
+`execution=` to `scattering_batch` and `scattering_batch!`; the gridded `scattering_transform!`
+entries take `SerialBackend` or `ThreadedBackend` the same way. Which spectral algorithm it uses is
+chosen with a
+[SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag passed as `transform=` at
+construction. Each is honoured exactly: naming a backend whose extension is not loaded throws.
 
 ```@docs
 ScatteringTransforms.scattering_batch
@@ -139,6 +141,8 @@ undecimated cascade bit for bit; below that it trades accuracy for speed.
 ```@docs
 ScatteringTransforms.Cascade.decimation
 ScatteringTransforms.Cascade.PeriodizedWorkspace
+ScatteringTransforms.Cascade.DeviceMeans
+ScatteringTransforms.Cascade.gather_means!
 ScatteringTransforms.Cascade.build
 ScatteringTransforms.Cascade.cascade!
 ScatteringTransforms.Cascade.group!
@@ -214,6 +218,7 @@ ScatteringTransforms.Plans.task_local_plan
 ScatteringTransforms.Plans.batch_width
 ScatteringTransforms.Plans.plan_points
 ScatteringTransforms.Plans.plan_analysis
+ScatteringTransforms.Plans.DirectNUFFTPlan
 ScatteringTransforms.Plans.NUFFTScatteringPlan
 ScatteringTransforms.Plans.nufft_scattered_plan
 ScatteringTransforms.Plans.with_fft_nthreads
@@ -232,7 +237,8 @@ ScatteringTransforms.ScatteringCore.task_workspace
 ### Scattered least-squares solve
 
 `solve = true` on a scattered planar transform fits the mode grid to the samples by least squares with
-`FlowTransformBindings.lsmr!`. These are the defaults that configure it.
+`FlowTransformBindings.lsmr!`, as every scattered-sphere analysis does. These are the defaults that
+configure it.
 
 ```@docs
 ScatteringTransforms.Plans.default_solver_rtol
@@ -281,6 +287,7 @@ FastSphericalHarmonics supply the fast ones.
 
 ```@docs
 ScatteringTransforms.SphericalCore.AbstractSphericalPlan
+ScatteringTransforms.SphericalCore.DirectSHTSphericalPlan
 ScatteringTransforms.SphericalCore.sphere_coeffs
 ScatteringTransforms.SphericalCore.sphere_coeffs!
 ScatteringTransforms.SphericalCore.sphere_coeffs_buffer

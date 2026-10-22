@@ -1,13 +1,5 @@
 module Scattering3D
 
-"""
-    Scattering3D.jl — 3D volumetric scattering transform
-
-Oriented 3D Morlet wavelets (`J` scales × `n_orient` sphere directions), run through the periodized
-cascade (`Cascade`) over the scattering path tree (second order = strictly coarser scale, all
-orientation pairs), with the scales×orientations coefficient container.
-"""
-
 using ..Plans: Plans
 using ComputationalBackends: ComputationalBackends as CB
 using SpectralBackends: SpectralBackends as SB
@@ -22,8 +14,9 @@ export ScatteringTransform3D, scattering_transform3d!, cascade!
 """
     ScatteringTransform3D{T,M,P,Tree,FB,G,PW}
 
-3D volumetric scattering transform; the fields are those of [`ScatteringTransform2D`](@ref), with
-`dims = (Nz, Ny, Nx)`.
+3D volumetric scattering transform; the fields are those of
+[`Scattering2D.ScatteringTransform2D`](@ref ScatteringTransforms.Scattering2D.ScatteringTransform2D),
+with `dims = (Nz, Ny, Nx)`.
 """
 struct ScatteringTransform3D{T, M<:AbstractArray{Complex{T},3},
                              P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
@@ -40,24 +33,25 @@ struct ScatteringTransform3D{T, M<:AbstractArray{Complex{T},3},
 end
 
 """
-    ScatteringTransform3D([T=Float64,] N, J; n_orient=6, max_order=2, spectral=AutoSpectralBackend())
+    ScatteringTransform3D([T=Float64,] N, J; n_orient=6, max_order=2, cache=true, oversampling=J,
+                          transform=AutoSpectralBackend())
 
 Build a 3D volumetric scattering transform for `N = (Nz, Ny, Nx)` volumes over `J` scales and
 `n_orient` sphere directions. The element type is positional, as for `zeros(T, …)`; omit it for
-`Float64`.
+`Float64`. `cache`, `oversampling` and `transform` are as for `Scattering1D.ScatteringTransform1D`.
 """
 function ScatteringTransform3D(::Type{T}, N::NTuple{3,Int}, J::Int;
                                n_orient::Int=6,
                                max_order::Int=2,
                                cache::Bool=true,
                                oversampling::Int=J,
-                               spectral::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T}
+                               transform::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T}
     filter_bank = FilterBanks.build_filter_bank3d(T, N, J, Val(cache); n_orient=n_orient)
     tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
     nw = FilterBanks.nwavelets(filter_bank)
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
              [(j, Int[], Int[]) for j in 1:nw]
-    plan = Plans.make_plan(spectral, T, N)
+    plan = Plans.make_plan(transform, T, N)
     pw = Cascade.build(filter_bank, groups, N, T, oversampling, plan)
     return ScatteringTransform3D(filter_bank, tree, groups, max_order, plan,
                                  zeros(Complex{T}, N), zeros(Complex{T}, N), N, pw)
@@ -82,7 +76,7 @@ end
 """
     (st::ScatteringTransform3D)(volume) -> ScatteringCoefficients2D
 
-Apply the 3D scattering transform. (Coefficients use the scales×orientations container.)
+The scattering coefficients of `volume`, in a new scales × orientations container.
 """
 function (st::ScatteringTransform3D)(volume::AbstractArray{<:Any,3})
     J = st.filter_bank.J
@@ -93,31 +87,17 @@ function (st::ScatteringTransform3D)(volume::AbstractArray{<:Any,3})
 end
 
 """
-    scattering_transform3d!(coeffs, st, volume) -> coeffs
+    scattering_transform3d!(coeffs, st, volume; execution = SerialBackend()) -> coeffs
 
 In-place 3D volumetric scattering transform; fills `coeffs` (a scales×orientations container)
-and returns it with `S0` updated.
+and returns it with `S0` updated. `execution` is as for `Scattering2D.scattering_transform2d!`.
 """
 function scattering_transform3d!(coeffs::Coefficients.ScatteringCoefficients2D,
-                                 st::ScatteringTransform3D,
-                                 volume::AbstractArray{<:Any,3})
+                                 st::ScatteringTransform3D, volume::AbstractArray{<:Any,3};
+                                 execution::CB.AbstractExecutionBackend = CB.SerialBackend())
     st.buffer_input .= complex.(volume)
     Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
-    cascade!(coeffs.S1, coeffs.S2, st, st.buffer_signal_fft)
-    return Coefficients.update_S0(coeffs, ScatteringCore.spatial_average(volume))
-end
-
-"""
-    scattering_transform3d!(coeffs, backend, st, volume)
-
-Transform one volume on an explicit execution backend — see the 2D counterpart.
-"""
-function scattering_transform3d!(coeffs::Coefficients.ScatteringCoefficients2D,
-                                 backend::CB.AbstractExecutionBackend,
-                                 st::ScatteringTransform3D, volume::AbstractArray{<:Any,3})
-    st.buffer_input .= complex.(volume)
-    Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
-    cascade!(coeffs.S1, coeffs.S2, backend, st, st.buffer_signal_fft)
+    cascade!(coeffs.S1, coeffs.S2, execution, st, st.buffer_signal_fft)
     return Coefficients.update_S0(coeffs, ScatteringCore.spatial_average(volume))
 end
 
@@ -127,14 +107,14 @@ cascade!(S1::AbstractVector, S2::AbstractMatrix, ::CB.AbstractSerialBackend,
 """
     cascade!(S1, S2, st, vol_fft) -> (S1, S2)
 
-Both scattering orders in one grouped pass — see the 1D `cascade!` for the scheme.
+Both scattering orders in one grouped pass, as in the 1D `cascade!`.
 """
 cascade!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform3D,
          vol_fft::AbstractArray{<:Any,3}) =
     Cascade.cascade!(S1, S2, st.pw, st.filter_bank, st.groups, vol_fft)
 
 # ============================================================================
-# Non-mutating, autodiff-friendly forward — see Scattering1D for the rationale.
+# Non-mutating forward for autodiff; see `ScatteringCore.scattering`.
 # ============================================================================
 
 function ScatteringCore.scattering(st::ScatteringTransform3D, volume::AbstractArray{<:Any,3})

@@ -1,29 +1,11 @@
 module SphericalCore
 
-"""
-    SphericalCore.jl — backend-agnostic spherical scattering core
-
-Shared machinery for scattering on S², independent of *how* the spherical harmonic transform is
-performed. Two backends plug in through a tiny interface (methods added by extensions):
-
-  * scattered points  — `ScatteringTransformsNUFSHTExt` (NUFSHT, adjoint / CG-solve);
-  * structured grid    — `ScatteringTransformsFastSphericalHarmonicsExt` (fast SHT on a CC grid).
-
-The interface a backend `plan` must implement is just:
-
-  * `sphere_coeffs(plan, field)`      — analyse `field` to its SH coefficients (exact inverse for
-    scattered points, forward SHT for a structured grid);
-  * `sphere_apply!(out, plan, C, h)`  — apply the per-degree multiplier `h(ℓ)` to a copy of `C` and
-    synthesise into `out`;
-  * `sphere_mean(plan, field)`        — the spherical average of `field` (unweighted sample mean for
-    scattered points; quadrature-weighted integral for a structured grid).
-
-Everything else — the dyadic difference-of-Gaussians band-pass bank and the S0/S1/S2 cascade (which
-analyses each field once and reuses its coefficients across bands) — is shared math built on those
-primitives. The monogenic amplitude also needs [`sphere_riesz_energy!`](@ref), and pointwise
-monogenic orientation/phase (`spherical_monogenic_components`) a spin-1 synthesis, supplied by the
-NUFSHT extension.
-"""
+# Scattering on S², independent of how the spherical-harmonic transform is performed. A plan
+# implements analysis (`sphere_coeffs`, `sphere_coeffs!`), per-degree multiplier and synthesis
+# (`sphere_apply!`) and the spherical mean (`sphere_mean`); the difference-of-Gaussians bank and the
+# S0/S1/S2 cascade are built on those, and the monogenic amplitude also uses `sphere_riesz_energy!`.
+# The in-core plans are defined here; the NUFSHT (scattered points) and FastSphericalHarmonics
+# (structured grid) extensions supply fast ones.
 
 export AbstractSphericalPlan, SphericalScattering, SphericalMonogenicScattering
 export SphericalWorkspace, SphericalMonogenicWorkspace
@@ -33,14 +15,12 @@ export sphere_coeffs, sphere_coeffs!, sphere_coeffs_buffer, sphere_apply!, spher
 using ..Plans: Plans
 using LinearAlgebra: LinearAlgebra
 using SpectralBackends: SpectralBackends as SB
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 # ---------------------------------------------------------------------------
-# Backend interface — methods provided by the NUFSHT / FastSphericalHarmonics extensions.
-#
-# The band-pass filter is factored into *analyse once* (`sphere_coeffs`) + *apply-a-multiplier-and-
-# synthesise* (`sphere_apply!`). This lets the cascade analyse each field a single time and reuse its
-# coefficients across all bands (and, for the scattered backend, use an accurate inverse rather than
-# the mis-scaled adjoint — analysing per band would multiply that solve cost by J).
+# Backend interface. Analysis (`sphere_coeffs`) is separate from multiplier-and-synthesis
+# (`sphere_apply!`), so the cascade analyses each field once and reuses its coefficients across every
+# band.
 # ---------------------------------------------------------------------------
 
 """
@@ -54,10 +34,10 @@ abstract type AbstractSphericalPlan end
 """
     sphere_coeffs(plan, field) -> C
 
-Spherical-harmonic **analysis**: the coefficients `C` of `field` (up to the plan's band limit). For a
-structured grid this is the fast forward SHT; for scattered points it is the **exact** (least-squares /
-CG) inversion — *not* the adjoint, which mis-scales the coefficients. Returned opaquely and consumed
-only by [`sphere_apply!`](@ref)/`sphere_mean` on the same `plan`.
+Spherical-harmonic analysis: the coefficients `C` of `field` up to the plan's band limit. For a
+structured grid this is the forward SHT; for scattered points it is the least-squares inversion of
+synthesis. `C` is opaque and valid only with the same `plan`'s interface functions, such as
+[`sphere_apply!`](@ref).
 """
 function sphere_coeffs end
 
@@ -65,8 +45,7 @@ function sphere_coeffs end
     sphere_coeffs!(C, plan, field) -> C
 
 In-place [`sphere_coeffs`](@ref): analyse `field` into the pre-allocated coefficient container `C`,
-which must have come from `sphere_coeffs_buffer(plan)`. This is what lets the cascade re-analyse a
-first-order field without allocating a coefficient vector per scale.
+which must have come from `sphere_coeffs_buffer(plan)`.
 """
 function sphere_coeffs! end
 
@@ -90,8 +69,9 @@ function sphere_apply! end
 """
     sphere_mean(plan, field) -> scalar
 
-Spherical average of `field` under the plan's sampling: an unweighted sample mean for (quasi-uniform)
-scattered points, the exact quadrature integral for a structured grid. Provided by each backend.
+Spherical average of `field` under the plan's quadrature: for scattered points the sample mean, or
+the weighted mean when the plan carries weights; for a structured grid the exact quadrature
+integral. Provided by each backend.
 """
 function sphere_mean end
 
@@ -193,11 +173,8 @@ end
     sphere_plan_at(plan, lmax) -> plan or nothing
 
 A plan of the same kind at the lower band limit `lmax`, or `nothing` when this backend cannot be
-narrowed. `nothing` is not a defect — it means every band is synthesised at the full band limit, which
-is what the cascade did before.
-
-This is the spherical form of decimation. Band-pass wavelet `j` is confined to degrees `≲ ℓ_j`, so
-synthesising it at the full `lmax` transforms a grid whose resolution the band cannot use.
+narrowed, in which case every band is synthesised at the full band limit. This is the spherical
+form of decimation: band-pass wavelet `j` is confined to degrees `≲ ℓ_j`.
 """
 sphere_plan_at(::Any, ::Integer) = nothing
 
@@ -205,10 +182,8 @@ sphere_plan_at(::Any, ::Integer) = nothing
     sphere_restrict!(Cdst, pdst, Csrc, psrc) -> Cdst
 
 Copy the spherical-harmonic coefficients of degree `≤ pdst`'s band limit out of `Csrc` (laid out for
-`psrc`) into `Cdst` (laid out for `pdst`), zeroing anything `Cdst` holds beyond them.
-
-Coefficient layout is backend-specific, so narrowing a band limit is a backend operation rather than
-an array slice.
+`psrc`) into `Cdst` (laid out for `pdst`), zeroing anything `Cdst` holds beyond them. Coefficient
+layout is backend-specific, so each backend defines this.
 """
 function sphere_restrict! end
 
@@ -224,12 +199,12 @@ sphere_field_buffer(plan) = sphere_coeffs_buffer(plan)
 """
     band_lmax(lmax, J, j, headroom) -> Int
 
-Band limit that carries wavelet `j`: `headroom · ℓ_j`, clamped to `lmax`.
+Band limit that carries wavelet `j`: `headroom · ℓ_j`, clamped to `lmax`; `headroom = Inf` keeps
+`lmax`.
 
 Band `j` is a difference of Gaussians whose transfer above its cutoff is
-`exp(-ℓ(ℓ+1) / 2ℓ_j(ℓ_j+1))`, which decays slowly — `0.135` at `2ℓ_j`, `0.011` at `3ℓ_j`, `3.4e-4` at
-`4ℓ_j`. `headroom` is therefore what is actually traded here, and `4` keeps the discarded tail below
-the transform's other approximations.
+`exp(-ℓ(ℓ+1) / 2ℓ_j(ℓ_j+1))`: `0.135` at `2ℓ_j`, `0.011` at `3ℓ_j`, `3.4e-4` at `4ℓ_j`, the
+largest value a given `headroom` discards.
 """
 function band_lmax(lmax::Integer, J::Integer, j::Integer, headroom::Real)
     isfinite(headroom) || return Int(lmax)
@@ -240,9 +215,8 @@ end
 """
     plan_points(plan) -> (θ, φ) or nothing
 
-The sample locations a spherical plan was built on, or `nothing` when the plan is defined by its
-band limit alone (a structured grid). This is what a transform needs to be rebuilt on another
-process, where the plan itself cannot travel.
+The sample locations a spherical plan was built on, from which a transform is rebuilt on another
+process, or `nothing` when the plan is defined by its band limit alone (a structured grid).
 """
 function plan_points end
 
@@ -250,45 +224,40 @@ function plan_points end
     plan_weights(plan) -> weights or nothing
 
 The quadrature weights the plan averages with, or `nothing` for a backend that takes the unweighted
-sample mean.
-
-These have to be carried, not re-derived: a structured grid's Fejér weights vary by a factor of ~5
-across colatitudes, so rebuilding a plan on the same points without them silently substitutes a
-uniform average and shifts every coefficient.
+sample mean or whose quadrature follows from its grid. A plan rebuilt on the same points needs these
+too: the in-core structured plan's Fejér weights are not uniform.
 """
 function plan_weights end
 
 """
     plan_solver(plan) -> (; rtol, maxiter)
 
-The iterative-solver settings a plan analyses with, so a rebuilt plan inverts to the same tolerance
-rather than to whatever the constructor defaults to.
+The iterative-solver settings a plan analyses with, as its constructor takes them, or `nothing` for
+a plan whose analysis is an exact transform.
 """
 function plan_solver end
 
 """
     batch_plan(plan, B) -> plan or nothing
 
-An equivalent plan that transforms `B` co-located fields per call, or `nothing` if this backend has
-no batched form. Same points, band limit, weights and solver settings — only the batch width differs.
-
-A backend that returns a plan here lets [`spherical_scattering_batch!`](@ref) issue one transform per
-cascade step for the whole stack instead of one per field. Returning `nothing` is not a defect; it
-means the per-field loop is the only path, and callers fall back to it.
+An equivalent plan that transforms `B` co-located fields per call, for
+[`spherical_scattering_batch!`](@ref), or `nothing` if this backend has no batched form. Only the
+batch width differs from `plan`.
 
 Returns `plan` itself when `Plans.batch_width(plan) == B`, and otherwise a plan the caller owns and
-closes with `Plans.close_plan!`. A per-task caller wants [`task_local_batch_plan`](@ref).
+closes with `Plans.close_plan!`. Concurrent tasks use [`task_local_batch_plan`](@ref).
 """
 batch_plan(::Any, ::Integer) = nothing
 
 """
     task_local_batch_plan(plan, B) -> plan or nothing
 
-A `B`-wide plan safe to apply while `plan` is applied in another task, owned by the caller.
+A `B`-wide plan safe to apply while `plan` is applied in another task, owned by the caller, or
+`nothing` when the backend has no batched form.
 
-A spherical plan carries the scratch its analysis solves through, so a task sharing `plan` corrupts
-the solve into a diverging residual. At `plan`'s own width this is `Plans.task_local_plan(plan)`, and
-at any other width [`batch_plan`](@ref) builds a fresh one.
+A spherical plan's analysis solves through its own scratch, so tasks cannot share one. At `plan`'s
+own width this is `Plans.task_local_plan(plan)`, and at any other width [`batch_plan`](@ref) builds a
+fresh one.
 """
 function task_local_batch_plan(plan, B::Integer)
     supports_batch(plan) || return nothing
@@ -298,8 +267,7 @@ end
 """
     supports_batch(plan) -> Bool
 
-Whether [`batch_plan`](@ref) can widen this plan. Asked before building anything, so a caller can
-choose between the batched and per-field cascades without paying for a plan it may not use.
+Whether [`batch_plan`](@ref) can widen this plan, answered without building one.
 """
 supports_batch(::Any) = false
 
@@ -307,12 +275,8 @@ supports_batch(::Any) = false
     plan_nufft(plan) -> SpectralBackends.AbstractSpectralBackend
 
 The NUFFT backend a scattered-sphere plan resolved to, or `AutoSpectralBackend()` for a plan that
-runs none.
-
-`Plans.spectral_backend` cannot express this: it reports `NUFSHTSpectralBackend` whether the
-transform is driven by FINUFFT, NonuniformFFTs, or direct summation. Carrying it separately is what
-lets a rebuilt transform — on a distributed worker, say — run the same transform as the original
-instead of silently re-resolving to whatever that process happens to have loaded.
+runs none. `Plans.spectral_backend` reports `NUFSHTSpectralBackend` whichever NUFFT runs underneath,
+so a transform rebuilt on another process needs this too to run the same one.
 """
 plan_nufft(::Any) = SB.AutoSpectralBackend()
 
@@ -341,19 +305,21 @@ dog_sigma2(lmax::Integer, J::Integer, ::Type{T}) where {T} =
 "Per-degree multiplier for the difference-of-Gaussians band-pass wavelet `j`."
 band_multiplier(σ²hi, σ²lo) = ℓ -> _bj(ℓ, σ²hi, σ²lo)
 
-# g = (−Δ_S)^{-1/2} of the band:  h(ℓ) = b_j(ℓ)/√(ℓ(ℓ+1)),  0 at ℓ=0.
-riesz_potential_multiplier(σ²hi, σ²lo) = ℓ -> ℓ == 0 ? 0.0 : _bj(ℓ, σ²hi, σ²lo) / sqrt(ℓ * (ℓ + 1))
+# g = (−Δ_S)^{-1/2} of the band:  h(ℓ) = b_j(ℓ)/√(ℓ(ℓ+1)),  0 at ℓ=0, in the variances' type.
+riesz_potential_multiplier(σ²hi::T, σ²lo::T) where {T} =
+    ℓ -> ℓ == 0 ? zero(T) : _bj(ℓ, σ²hi, σ²lo) / sqrt(T(ℓ * (ℓ + 1)))
 
 # ---------------------------------------------------------------------------
-# Transforms (backend-generic; the plan supplies sphere_filter! / sphere_mean).
+# Transforms, generic over the plan interface above
 # ---------------------------------------------------------------------------
 
 """
-    SphericalScattering{T,P,V}
+    SphericalScattering{T,P,V,BV}
 
 Spherical scattering transform over a backend `plan::P`. `sigma2[k+1]` is the Gaussian-transfer
 variance for the dyadic low-pass cutoff `ℓ_k` (`k=0..J`); band-pass wavelet `j` is
-`lowpass(ℓ_j) − lowpass(ℓ_{j-1})`.
+`lowpass(ℓ_j) − lowpass(ℓ_{j-1})`. `bands` holds one narrowed plan per scale
+([`band_plans`](@ref)), or `nothing`.
 """
 struct SphericalScattering{T, P, V <: AbstractVector{T}, BV}
     lmax::Int
@@ -369,16 +335,18 @@ end
 SphericalScattering(lmax::Int, J::Int, max_order::Int, plan, sigma2) =
     SphericalScattering(lmax, J, max_order, plan, sigma2, nothing)
 
+Base.show(io::IO, st::SphericalScattering{T}) where {T} =
+    print(io, "SphericalScattering{", T, "}(lmax=", st.lmax, ", J=", st.J, ", max_order=", st.max_order,
+          ", ", st.plan, st.bands === nothing ? "" : ", per-scale band limits", ")")
+
 """
     band_plans(plan, lmax, J, headroom) -> Vector or nothing
 
-One narrowed plan per scale, or `nothing` if this backend cannot narrow. A scale whose band needs the
-full band limit reuses `plan` itself rather than building a duplicate.
+One narrowed plan per scale, or `nothing` if this backend cannot narrow or no band needs narrowing.
+A scale whose band needs the full band limit reuses `plan`.
 """
 function band_plans(plan, lmax::Integer, J::Integer, headroom::Real)
     ls = [band_lmax(lmax, J, j, headroom) for j in 1:J]
-    # Nothing to narrow: fall back to the full-band-limit cascade rather than run the narrowed one
-    # with `plan` in every slot, which would add a no-op coefficient copy per band.
     all(>=(lmax), ls) && return nothing
     sphere_plan_at(plan, lmax) === nothing && return nothing
     return map(l -> l >= lmax ? plan : sphere_plan_at(plan, l), ls)
@@ -387,10 +355,9 @@ end
 """
     task_local(st) -> st
 
-A copy of the spherical transform safe to run concurrently with the original: the design matrix,
-Gram factor and point set are read-only and shared, while the plan's analysis/synthesis scratch is
-duplicated by `Plans.task_local_plan`. Analysis writes through that scratch, so tasks sharing one
-plan would overwrite each other's coefficients.
+A copy of `st` safe to run concurrently with it: the plan's read-only tables are shared and its
+analysis and synthesis scratch duplicated by `Plans.task_local_plan`. Release it with
+[`close_task_local!`](@ref).
 """
 function task_local(st::SphericalScattering)
     plan = Plans.task_local_plan(st.plan)
@@ -416,23 +383,22 @@ end
 _close_unshared!(p, shared) = (p === shared || Plans.close_plan!(p); nothing)
 
 """
-    SphericalWorkspace{A,C}
+    SphericalWorkspace{A,C,AV,CV}
 
 Scratch for one spherical cascade: the band-pass output `band`, the current first-order field `u1`,
-and two coefficient containers — `C` for the input field, `C1` for the first-order field being
-re-analysed. Two is all the cascade ever needs, because it finishes every child of a scale before
-starting the next.
+and two coefficient containers, `C` for the input field and `C1` for the first-order field being
+re-analysed. Two suffice, since the cascade finishes every child of a scale before starting the
+next. `bband`, `bu1`, `bC` and `bC1` are the same per scale at its narrowed band limit, and empty
+when the transform has no `bands`.
 
 Build one with `SphericalWorkspace(st, field)` and reuse it across calls; a task that transforms
-concurrently needs its own (and its own `Plans.task_local_plan` of the spherical plan).
+concurrently needs its own, with a [`task_local`](@ref) transform.
 """
 struct SphericalWorkspace{A, C, AV, CV}
     band::A
     u1::A
     C::C
     C1::C
-    # Per-scale scratch at that scale's narrowed band limit; empty when the cascade runs at the full
-    # band limit, where `band`/`u1`/`C1` above are all it needs.
     bband::AV
     bu1::AV
     bC::CV
@@ -453,6 +419,9 @@ function SphericalWorkspace(st, field::AbstractArray)
     bC1 = [sphere_coeffs_buffer(p) for p in st.bands]
     return SphericalWorkspace(similar(field), similar(field), C(), C(), bband, bu1, bC, bC1)
 end
+
+Base.show(io::IO, ws::SphericalWorkspace) =
+    print(io, "SphericalWorkspace(fields of size ", size(ws.band), ", ", length(ws.bband), " band buffers)")
 
 """
     (st::SphericalScattering)(field) -> (; S0, S1, S2)
@@ -532,9 +501,8 @@ end
     spherical_scattering_batch!(S1, S2, st, ws, X) -> (; S0, S1, S2)
 
 Cascade over a stack of `B` fields sampled at the same points: `X` is `(M, B)`, `S1` is `(J, B)` and
-`S2` is `(J, J, B)`. Every transform covers all `B` fields in one call, so the per-call setup is paid
-once per cascade step rather than `B` times — `st.plan` must have been built with a matching batch
-size for that to hold.
+`S2` is `(J, J, B)`. Every transform covers all `B` fields in one call; `st.plan` must have batch
+width `B`.
 """
 function spherical_scattering_batch!(S1::AbstractMatrix, S2::AbstractArray,
                                      st::SphericalScattering, ws::SphericalWorkspace,
@@ -560,7 +528,7 @@ end
 
 
 """
-    SphericalMonogenicScattering{T,P}
+    SphericalMonogenicScattering{T,P,V}
 
 Spherical monogenic scattering: shares the dyadic difference-of-Gaussians bands of
 [`SphericalScattering`](@ref) but replaces the analytic modulus with the spherical monogenic
@@ -573,6 +541,10 @@ struct SphericalMonogenicScattering{T, P, V <: AbstractVector{T}}
     plan::P
     sigma2::V
 end
+
+Base.show(io::IO, st::SphericalMonogenicScattering{T}) where {T} =
+    print(io, "SphericalMonogenicScattering{", T, "}(lmax=", st.lmax, ", J=", st.J, ", max_order=",
+          st.max_order, ", ", st.plan, ")")
 
 task_local(st::SphericalMonogenicScattering) =
     SphericalMonogenicScattering(st.lmax, st.J, st.max_order, Plans.task_local_plan(st.plan),
@@ -621,6 +593,9 @@ SphericalMonogenicWorkspace(st, field::AbstractArray) = SphericalMonogenicWorksp
     sphere_coeffs_buffer(st.plan), sphere_coeffs_buffer(st.plan),
     (r2 = similar(field), riesz = riesz_scratch(st.plan, field)))
 
+Base.show(io::IO, ws::SphericalMonogenicWorkspace) =
+    print(io, "SphericalMonogenicWorkspace(fields of size ", size(ws.u1), ")")
+
 """
     (st::SphericalMonogenicScattering)(field) -> (; S0, S1, S2)
 
@@ -636,9 +611,9 @@ end
 """
     spherical_monogenic_scattering!(S1, S2, st, ws, field) -> (; S0, S1, S2)
 
-In-place spherical monogenic scattering — the monogenic counterpart of
-[`spherical_scattering!`](@ref), grouped by first-order scale so one amplitude field is live at a
-time rather than all `J`.
+In-place spherical monogenic scattering, the monogenic counterpart of
+[`spherical_scattering!`](@ref), grouped by first-order scale with one amplitude field live at a
+time.
 """
 function spherical_monogenic_scattering!(S1::AbstractVector, S2::AbstractMatrix,
                                          st::SphericalMonogenicScattering,
@@ -661,223 +636,381 @@ function spherical_monogenic_scattering!(S1::AbstractVector, S2::AbstractMatrix,
 end
 
 # ---------------------------------------------------------------------------
-# In-core dependency-free scattered-sphere plan: SH analysis/synthesis by direct real-Yℓm summation.
+# In-core scattered-sphere plan: `O(M·(lmax+1)²)` per transform, `O(M + (lmax+1)²)` memory. A field's
+# real spherical-harmonic coefficients, laid out `(ℓ, m = -ℓ:ℓ)` in order, are fitted by LSMR to the
+# synthesis
 #
-# The `O(M·(lmax+1)²)` fallback that lets `spherical_scattering` run with no external SH library — the
-# spherical counterpart of the direct-sum planar plans. A real spherical-harmonic design matrix `Y`
-# (M points × (lmax+1)² harmonics) is built by an associated-Legendre recurrence; analysis is a
-# conjugate-gradient least-squares solve of the normal equations `Y'Y a = Y'field` (the accurate
-# inverse, like NUFSHT's `nusht_solve!`, not the adjoint), and synthesis is `Σ_ℓm h(ℓ)·a_ℓm·Yℓm`.
-# Columns are L2-normalized for conditioning; since the band multiplier `h(ℓ)` is constant within a
-# degree, the per-degree filtering is invariant to that scaling.
+#     f(θ, φ) = Σ_ℓ P̄_ℓ^0(cosθ) a_ℓ0 + √2 Σ_ℓ Σ_{m=1}^{ℓ} P̄_ℓ^m(cosθ) (a_ℓm cos mφ + a_ℓ,-m sin mφ),
+#
+# summed directly at the points. Points of one colatitude form a ring and share its Legendre values:
+# per ring the order sums `Σ_ℓ P̄_ℓ^m a_ℓ,±m` cost `O((lmax+1)²)`, and per point the sum over orders
+# `O(lmax)`, with `cos mφ, sin mφ` by rotation from `cos φ, sin φ`.
 # ---------------------------------------------------------------------------
 
-# Fully-normalized associated Legendre P̄_ℓ^m(cosθ) for all 0≤m≤ℓ≤lmax at one point, via the standard
-# stable recurrence (values stay O(1) — unlike the raw `(2m-1)!!` form, which overflows at large lmax).
-# The overall per-(ℓ,m) normalization constant is immaterial here: it is absorbed by the column
-# normalization of the design matrix and cancels in the per-degree band multiplier.
-function _assoc_legendre!(P::AbstractMatrix{T}, x::Real, lmax::Int) where {T}
-    xT = T(x)
-    u = sqrt(max(zero(T), one(T) - xT^2))       # sinθ
-    fill!(P, zero(T))
-    P[1, 1] = one(T)                            # P̄_0^0 (arbitrary O(1) scale)
-    @inbounds for m in 1:lmax                   # sectoral: P̄_m^m = -√((2m+1)/(2m))·sinθ·P̄_{m-1}^{m-1}
-        P[m + 1, m + 1] = -sqrt((2m + one(T)) / (2m)) * u * P[m, m]
+# `P̄_ℓ^m = √((2ℓ+1)(ℓ−m)!/(ℓ+m)!)·P_ℓ^m`, with the Condon–Shortley phase, has the recurrences
+# `P̄_m^m = sectoral[m]·sinθ·P̄_{m-1}^{m-1}`, `P̄_{m+1}^m = subdiagonal[m+1]·cosθ·P̄_m^m` and
+# `P̄_ℓ^m = a[ℓ+1, m+1]·cosθ·P̄_{ℓ-1}^m − b[ℓ+1, m+1]·P̄_{ℓ-2}^m` for `ℓ ≥ m + 2`, whose values stay
+# `O(1)`; these are their coefficients up to a band limit.
+struct _LegendreTable{T, V <: AbstractVector{T}, M <: AbstractMatrix{T}}
+    lmax::Int
+    sectoral::V
+    subdiagonal::V
+    a::M
+    b::M
+end
+
+function _LegendreTable(::Type{T}, lmax::Int) where {T}
+    sectoral = T[-sqrt((2m + one(T)) / (2m)) for m in 1:lmax]
+    subdiagonal = T[sqrt(2m + T(3)) for m in 0:(lmax - 1)]
+    a = zeros(T, lmax + 1, lmax + 1)
+    b = zeros(T, lmax + 1, lmax + 1)
+    for m in 0:lmax, ℓ in (m + 2):lmax
+        a[ℓ + 1, m + 1] = sqrt((2ℓ - one(T)) * (2ℓ + one(T)) / ((ℓ - m) * (ℓ + m)))
+        b[ℓ + 1, m + 1] = sqrt((2ℓ + one(T)) * (ℓ + m - one(T)) * (ℓ - m - one(T)) /
+                               ((2ℓ - T(3)) * (ℓ + m) * (ℓ - m)))
     end
-    @inbounds for m in 0:lmax
-        if m < lmax                             # subdiagonal: P̄_{m+1}^m = √(2m+3)·cosθ·P̄_m^m
-            P[m + 2, m + 1] = sqrt(2m + T(3)) * xT * P[m + 1, m + 1]
+    return _LegendreTable(lmax, sectoral, subdiagonal, a, b)
+end
+
+# `P[ℓ+1, m+1] = P̄_ℓ^m` for `0 ≤ m ≤ ℓ ≤ lmax` at `x = cosθ`, `u = sinθ`; entries with `ℓ < m` are left
+# as they were. The overall scale is arbitrary, since analysis and synthesis share it.
+function _assoc_legendre!(P::AbstractMatrix{T}, tab::_LegendreTable, x::T, u::T) where {T}
+    lmax = tab.lmax
+    @inbounds begin
+        P[1, 1] = one(T)
+        for m in 1:lmax
+            P[m + 1, m + 1] = tab.sectoral[m] * u * P[m, m]
         end
-        for ℓ in (m + 2):lmax                   # three-term recurrence in ℓ
-            a = sqrt((2ℓ - one(T)) * (2ℓ + one(T)) / ((ℓ - m) * (ℓ + m)))
-            b = sqrt((2ℓ + one(T)) * (ℓ + m - one(T)) * (ℓ - m - one(T)) /
-                     ((2ℓ - T(3)) * (ℓ + m) * (ℓ - m)))
-            P[ℓ + 1, m + 1] = a * xT * P[ℓ, m + 1] - b * P[ℓ - 1, m + 1]
+        for m in 0:(lmax - 1)
+            P[m + 2, m + 1] = tab.subdiagonal[m + 1] * x * P[m + 1, m + 1]
+            for ℓ in (m + 2):lmax
+                P[ℓ + 1, m + 1] = tab.a[ℓ + 1, m + 1] * x * P[ℓ, m + 1] -
+                                  tab.b[ℓ + 1, m + 1] * P[ℓ - 1, m + 1]
+            end
         end
     end
     return P
 end
 
-struct DirectSHTSphericalPlan{T, YM<:AbstractMatrix{T}, GM<:AbstractMatrix{T},
-                              IV<:AbstractVector{Int}, VV<:AbstractVector{T}} <: AbstractSphericalPlan
+# The coefficient slot of `(ℓ, m)`.
+@inline _lm(ℓ::Int, m::Int) = ℓ * ℓ + ℓ + m + 1
+
+# A direct plan's points grouped by colatitude: ring `r` holds the points `pts[ptr[r]:ptr[r+1]-1]`, at
+# `cosθ = rcos[r]`, `sinθ = rsin[r]`; `cφ`, `sφ` hold each point's `cos φ`, `sin φ`.
+struct _SHTRings{T, V <: AbstractVector{T}, I <: AbstractVector{Int}}
+    rcos::V
+    rsin::V
+    ptr::I
+    pts::I
+    cφ::V
+    sφ::V
+end
+
+function _SHTRings(θ::Vector{T}, φ::Vector{T}) where {T}
+    order = sortperm(θ)
+    ptr = Int[]
+    rcos, rsin = T[], T[]
+    for t in eachindex(order)
+        n = order[t]
+        if t == 1 || θ[n] != θ[order[t - 1]]
+            push!(ptr, t)
+            s, c = sincos(θ[n])
+            push!(rsin, s)
+            push!(rcos, c)
+        end
+    end
+    push!(ptr, length(order) + 1)
+    sφ, cφ = similar(φ), similar(φ)
+    @inbounds for n in eachindex(φ)
+        sφ[n], cφ[n] = sincos(φ[n])
+    end
+    return _SHTRings(rcos, rsin, ptr, order, cφ, sφ)
+end
+
+_nrings(r::_SHTRings) = length(r.ptr) - 1
+
+# What a direct plan's transforms write through, per task: the Legendre values of the current ring,
+# its order sums for each of `B` columns (`(B, lmax+1)`, column-contiguous), and one point's sum per
+# column.
+struct _SHTScratch{T, M <: AbstractMatrix{T}, V <: AbstractVector{T}}
+    P::M
+    gc::M
+    gs::M
+    acc::V
+end
+
+_SHTScratch(::Type{T}, lmax::Int, B::Int) where {T} =
+    _SHTScratch(Matrix{T}(undef, lmax + 1, lmax + 1), Matrix{T}(undef, B, lmax + 1),
+                Matrix{T}(undef, B, lmax + 1), Vector{T}(undef, B))
+
+# `f[:, b] = Σ_ℓm a[_lm(ℓ, m), b]·Y_ℓm` at every point, for the first `nb` of the `(lmax+1)²`-long
+# columns of `a`, into the `M`-long columns of `f`. Both are indexed linearly, so a field may have any
+# shape holding its `M` values.
+function _sht_synthesize!(f, rings::_SHTRings{T}, tab::_LegendreTable, s::_SHTScratch,
+                          a, nb::Int) where {T}
+    lmax = tab.lmax
+    M = length(rings.pts)
+    K = (lmax + 1)^2
+    P, gc, gs, acc = s.P, s.gc, s.gs, s.acc
+    s2 = sqrt(T(2))
+    @inbounds for r in 1:_nrings(rings)
+        _assoc_legendre!(P, tab, rings.rcos[r], rings.rsin[r])
+        for b in 1:nb
+            o = (b - 1) * K
+            c = zero(T)
+            for ℓ in 0:lmax
+                c += P[ℓ + 1, 1] * a[o + _lm(ℓ, 0)]
+            end
+            gc[b, 1] = c
+        end
+        for m in 1:lmax, b in 1:nb
+            o = (b - 1) * K
+            c = zero(T)
+            sn = zero(T)
+            for ℓ in m:lmax
+                p = P[ℓ + 1, m + 1]
+                c += p * a[o + _lm(ℓ, m)]
+                sn += p * a[o + _lm(ℓ, -m)]
+            end
+            gc[b, m + 1] = s2 * c
+            gs[b, m + 1] = s2 * sn
+        end
+        for t in rings.ptr[r]:(rings.ptr[r + 1] - 1)
+            n = rings.pts[t]
+            c1, s1 = rings.cφ[n], rings.sφ[n]
+            for b in 1:nb
+                acc[b] = gc[b, 1]
+            end
+            cm, sm = one(T), zero(T)
+            for m in 1:lmax
+                cm, sm = cm * c1 - sm * s1, sm * c1 + cm * s1
+                for b in 1:nb
+                    acc[b] += cm * gc[b, m + 1] + sm * gs[b, m + 1]
+                end
+            end
+            for b in 1:nb
+                f[(b - 1) * M + n] = acc[b]
+            end
+        end
+    end
+    return f
+end
+
+# The adjoint of `_sht_synthesize!`: `v[_lm(ℓ, m), b] = Σ_n u[n, b]·Y_ℓm(n)`, the same sums in the
+# transposed order.
+function _sht_adjoint!(v, rings::_SHTRings{T}, tab::_LegendreTable, s::_SHTScratch,
+                       u, nb::Int) where {T}
+    lmax = tab.lmax
+    M = length(rings.pts)
+    K = (lmax + 1)^2
+    P, hc, hs = s.P, s.gc, s.gs
+    s2 = sqrt(T(2))
+    @inbounds begin
+        for i in 1:(K * nb)
+            v[i] = zero(eltype(v))
+        end
+        for r in 1:_nrings(rings)
+            for m in 0:lmax, b in 1:nb
+                hc[b, m + 1] = zero(T)
+                hs[b, m + 1] = zero(T)
+            end
+            for t in rings.ptr[r]:(rings.ptr[r + 1] - 1)
+                n = rings.pts[t]
+                c1, s1 = rings.cφ[n], rings.sφ[n]
+                for b in 1:nb
+                    hc[b, 1] += u[(b - 1) * M + n]
+                end
+                cm, sm = one(T), zero(T)
+                for m in 1:lmax
+                    cm, sm = cm * c1 - sm * s1, sm * c1 + cm * s1
+                    for b in 1:nb
+                        x = u[(b - 1) * M + n]
+                        hc[b, m + 1] += cm * x
+                        hs[b, m + 1] += sm * x
+                    end
+                end
+            end
+            _assoc_legendre!(P, tab, rings.rcos[r], rings.rsin[r])
+            for b in 1:nb
+                o = (b - 1) * K
+                c = hc[b, 1]
+                for ℓ in 0:lmax
+                    v[o + _lm(ℓ, 0)] += P[ℓ + 1, 1] * c
+                end
+            end
+            for m in 1:lmax, b in 1:nb
+                o = (b - 1) * K
+                c, sn = s2 * hc[b, m + 1], s2 * hs[b, m + 1]
+                for ℓ in m:lmax
+                    p = P[ℓ + 1, m + 1]
+                    v[o + _lm(ℓ, m)] += p * c
+                    v[o + _lm(ℓ, -m)] += p * sn
+                end
+            end
+        end
+    end
+    return v
+end
+
+# The synthesis as the operator of the least-squares analysis, on `B` columns: `t` holds `A v` and `w`
+# holds `A† u`.
+struct _SHTOperator{R, LT, S, TA, WA}
+    rings::R
+    tab::LT
+    scr::S
+    B::Int
+    t::TA
+    w::WA
+end
+
+FTB.lsmr_ncolumns(op::_SHTOperator) = op.B
+FTB.lsmr_allocate_domain(op::_SHTOperator) = fill!(similar(op.w), 0)
+FTB.lsmr_allocate_range(op::_SHTOperator) = fill!(similar(op.t), 0)
+FTB.lsmr_forward!(u, op::_SHTOperator, v, c, n) =
+    FTB.colxpby!(u, _sht_synthesize!(op.t, op.rings, op.tab, op.scr, v, n), c, n, op.B)
+FTB.lsmr_adjoint!(v, op::_SHTOperator, u, c, n) =
+    FTB.colxpby!(v, _sht_adjoint!(op.w, op.rings, op.tab, op.scr, u, n), c, n, op.B)
+
+"""
+    DirectSHTSphericalPlan{T,B}
+
+The in-core scattered-sphere plan over `M` points at band limit `lmax`, transforming `B` co-located
+fields per call. Analysis is the least-squares fit of the real spherical harmonics of degree
+`≤ lmax` by LSMR (`FlowTransformBindings.lsmr!`), synthesis their direct sum at the points; neither
+forms the `M × (lmax+1)²` matrix of harmonics, so memory is `O(M + (lmax+1)²)`.
+"""
+struct DirectSHTSphericalPlan{T, B, VV <: AbstractVector{T}, R, LT, OP, WS, HA} <: AbstractSphericalPlan
     lmax::Int
     M::Int
     K::Int
-    Y::YM            # (M, K) fully-normalized real-SH design matrix
-    G::GM            # (K, K) Gram matrix Y'Y (SPD) for the least-squares analysis
-    ldeg::IV         # (K) degree ℓ of each column
-    theta::VV        # (M) colatitudes (retained for the spin-1 gradient synthesis)
+    theta::VV        # (M) colatitudes
     phi::VV          # (M) longitudes
+    weights::VV      # (M) spatial-mean quadrature weights, summing to 1
     rtol::T
     maxiter::Int
-    weights::VV      # (M) spatial-mean quadrature weights (sum to 1)
-    rhs::VV          # (K) Y'field
-    r::VV            # (K) CG residual
-    p::VV            # (K) CG search direction
-    Gp::VV           # (K) CG G·p
-    ha::VV           # (K) synthesis scratch h(ℓ)·C
+    rings::R         # read-only, shared with every copy
+    tab::LT          # read-only, shared with every copy
+    op::OP           # the transforms' operator and scratch
+    ls::WS           # its `FTB.LSMRWorkspace`
+    ha::HA           # (K[, B]) coefficients times a degree multiplier, for `sphere_apply!`
 end
 
-# `Y`, `G`, `ldeg`, the point set and the quadrature weights are read-only and shared; the CG and
-# synthesis scratch is per-task, because analysis writes its result through it.
+function _direct_sht_plan(θ::V, φ::V, w::V, rtol::T, maxiter::Int, rings, tab, lmax::Int,
+                          B::Int) where {T, V <: AbstractVector{T}}
+    M, K = length(θ), (lmax + 1)^2
+    op = _SHTOperator(rings, tab, _SHTScratch(T, lmax, B), B, Matrix{T}(undef, M, B),
+                      Matrix{T}(undef, K, B))
+    ls = FTB.LSMRWorkspace(op)
+    ha = B == 1 ? Vector{T}(undef, K) : Matrix{T}(undef, K, B)
+    return DirectSHTSphericalPlan{T, B, V, typeof(rings), typeof(tab), typeof(op), typeof(ls),
+                                  typeof(ha)}(lmax, M, K, θ, φ, w, rtol, maxiter, rings, tab, op, ls, ha)
+end
+
+function DirectSHTSphericalPlan(θ::AbstractVector, φ::AbstractVector, lmax::Int, ::Type{T};
+                                rtol::Real = 1.0e-8, maxiter::Int = 500, weights = nothing,
+                                ntrans::Int = 1) where {T}
+    M = length(θ)
+    length(φ) == M || throw(DimensionMismatch("θ and φ must have equal length"))
+    lmax >= 0 || throw(ArgumentError("lmax must be nonnegative; got $lmax"))
+    ntrans >= 1 || throw(ArgumentError("ntrans must be at least 1; got $ntrans"))
+    # Host arrays: the transforms visit the points one at a time.
+    θT, φT = collect(T, θ), collect(T, φ)
+    w = weights === nothing ? fill(one(T) / M, M) : collect(T, T.(weights) ./ sum(weights))
+    return _direct_sht_plan(θT, φT, w, T(rtol), maxiter, _SHTRings(θT, φT), _LegendreTable(T, lmax),
+                            lmax, ntrans)
+end
+
+Base.show(io::IO, p::DirectSHTSphericalPlan{T, B}) where {T, B} =
+    print(io, "DirectSHTSphericalPlan{", T, "}(lmax=", p.lmax, ", M=", p.M, ", ntrans=", B, ")")
+
+# The point set, the quadrature weights and the tables are read-only and shared; a task gets its own
+# operator scratch and solver workspace, which analysis writes its result through.
 plan_points(p::DirectSHTSphericalPlan) = (p.theta, p.phi)
 plan_weights(p::DirectSHTSphericalPlan) = p.weights
 plan_solver(p::DirectSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter)
 Plans.spectral_backend(::DirectSHTSphericalPlan) = SB.DirectSumSpectralBackend()
+Plans.batch_width(::DirectSHTSphericalPlan{T, B}) where {T, B} = B
 
-Plans.task_local_plan(p::DirectSHTSphericalPlan) = DirectSHTSphericalPlan(
-    p.lmax, p.M, p.K, p.Y, p.G, p.ldeg, p.theta, p.phi, p.rtol, p.maxiter, p.weights,
-    similar(p.rhs), similar(p.r), similar(p.p), similar(p.Gp), similar(p.ha))
+Plans.task_local_plan(p::DirectSHTSphericalPlan{T, B}) where {T, B} =
+    _direct_sht_plan(p.theta, p.phi, p.weights, p.rtol, p.maxiter, p.rings, p.tab, p.lmax, B)
 
-function DirectSHTSphericalPlan(θ::AbstractVector, φ::AbstractVector, lmax::Int, ::Type{T};
-                                rtol::Real = 1.0e-8, maxiter::Int = 500, weights = nothing) where {T}
-    M = length(θ)
-    length(φ) == M || throw(DimensionMismatch("θ and φ must have equal length"))
-    w = weights === nothing ? fill(one(T) / M, M) : (T.(weights) ./ sum(weights))
-    # Brought to the host deliberately, unlike the NUFSHT plan: `Y` below is filled by scalar
-    # indexing over the Legendre recurrence, which is what makes this the exact reference rather
-    # than a fast path. A device-resident spherical transform goes through NUFSHT.
-    θT, φT = collect(T, θ), collect(T, φ)
-    K = (lmax + 1)^2
-    Y = Matrix{T}(undef, M, K)
-    ldeg = Vector{Int}(undef, K)
-    P = Matrix{T}(undef, lmax + 1, lmax + 1)
-    s2 = sqrt(T(2))
-    @inbounds for n in 1:M
-        _assoc_legendre!(P, cos(θT[n]), lmax)
-        φn = φT[n]
-        col = 0
-        for ℓ in 0:lmax, m in -ℓ:ℓ
-            col += 1
-            am = abs(m)
-            Pv = P[ℓ + 1, am + 1]
-            Y[n, col] = m == 0 ? Pv : (m > 0 ? s2 * Pv * cos(m * φn) : s2 * Pv * sin(am * φn))
-            ldeg[col] = ℓ
-        end
-    end
-    G = transpose(Y) * Y
-    return DirectSHTSphericalPlan{T, Matrix{T}, Matrix{T}, Vector{Int}, Vector{T}}(
-        lmax, M, K, Y, G, ldeg, θT, φT, T(rtol), maxiter, w,
-        Vector{T}(undef, K), Vector{T}(undef, K), Vector{T}(undef, K),
-        Vector{T}(undef, K), Vector{T}(undef, K))
-end
+supports_batch(::DirectSHTSphericalPlan) = true
+batch_plan(p::DirectSHTSphericalPlan{T, B}, n::Integer) where {T, B} =
+    n == B ? p : _direct_sht_plan(p.theta, p.phi, p.weights, p.rtol, p.maxiter, p.rings, p.tab,
+                                  p.lmax, Int(n))
 
-# CG on the SPD Gram matrix: solve G·a = rhs (the least-squares normal equations Y'Y a = Y'field).
-function _cg_gram!(a::AbstractVector, plan::DirectSHTSphericalPlan{T}) where {T}
-    fill!(a, zero(T))
-    copyto!(plan.r, plan.rhs)
-    copyto!(plan.p, plan.r)
-    rsold = real(LinearAlgebra.dot(plan.r, plan.r))
-    rs0 = rsold
-    rs0 == 0 && return a
-    iters = 0
-    rel = one(T)
-    @inbounds for k in 1:plan.maxiter
-        iters = k
-        LinearAlgebra.mul!(plan.Gp, plan.G, plan.p)
-        curvature = real(LinearAlgebra.dot(plan.p, plan.Gp))
-        # The Gram matrix is positive definite only while the sampling determines every mode. Where it
-        # does not, the curvature reaches zero at the roundoff floor and `α` becomes `Inf`, which the
-        # iterate then absorbs — so the step is not taken and the last good iterate stands.
-        (isfinite(curvature) && curvature > 0) || break
-        α = rsold / curvature
-        a .+= α .* plan.p
-        plan.r .-= α .* plan.Gp
-        rsnew = real(LinearAlgebra.dot(plan.r, plan.r))
-        if !isfinite(rsnew)
-            rel = T(Inf)
-            break
-        end
-        rel = sqrt(rsnew) / sqrt(rs0)
-        if rel <= plan.rtol
-            # `plan.r` is updated by recurrence, so it drifts away from `rhs - G·a` as it shrinks —
-            # exactly far enough, on an ill-conditioned Gram matrix, to report a convergence that did
-            # not happen. Convergence is therefore never declared on it: the residual is recomputed
-            # once, and if the true one disagrees the iteration resumes from it with a fresh
-            # direction, since the accumulated one is conjugate to the stale residual, not this one.
-            # The extra product costs one iteration and is paid only when the recurrence claims to be
-            # finished.
-            LinearAlgebra.mul!(plan.Gp, plan.G, a)
-            plan.r .= plan.rhs .- plan.Gp
-            rsnew = real(LinearAlgebra.dot(plan.r, plan.r))
-            if !isfinite(rsnew)
-                rel = T(Inf)
-                break
-            end
-            rel = sqrt(rsnew) / sqrt(rs0)
-            rel <= plan.rtol && break
-            copyto!(plan.p, plan.r)
-            rsold = rsnew
-            continue
-        end
-        plan.p .= plan.r .+ (rsnew / rsold) .* plan.p
-        rsold = rsnew
-    end
-    # Reports like the NUFSHT-backed analysis rather than returning a meaningless answer silently: on
-    # the normal equations of an under-determined point set, conjugate gradients grow without bound,
-    # and coefficients that exceed the field by orders of magnitude then propagate into every band.
-    (isfinite(rel) && rel <= plan.rtol) || throw(Plans.AnalysisNotConverged(
-        Float64(rel), Float64(plan.rtol), iters, plan.maxiter,
-        "In-core spherical analysis over $(plan.M) points at lmax = $(plan.lmax). Accurate " *
-        "inversion needs roughly M ≳ (lmax+1)² well-distributed points, or `maxiter` may be short."))
+# Analysis: the least-squares coefficients of `field`, one column per field of a `(M, B)` stack. A
+# field may be a length-`M` vector (scattered) or the `(Nθ, Nφ)` grid matrix (structured), read in the
+# order the plan's points were built. LSMR stops on `‖A†r‖ ≤ rtol ‖A†b‖` and returns its best iterate
+# at `maxiter`.
+sphere_coeffs(plan::DirectSHTSphericalPlan, field::AbstractArray) =
+    sphere_coeffs!(sphere_coeffs_buffer(plan), plan, field)
+
+function sphere_coeffs!(a::AbstractArray, plan::DirectSHTSphericalPlan{T}, field::AbstractArray) where {T}
+    FTB.lsmr!(a, plan.op, field, plan.ls; rtol = plan.rtol, maxiter = plan.maxiter,
+              conlim = inv(eps(T)))
+    check_sphere_solve(plan.ls, plan.M, plan.lmax, plan.rtol, plan.maxiter)
     return a
 end
 
-# Analysis: least-squares SH coefficients of `field` (fresh array — the cascade holds several at once).
-# `field` may be a length-M vector (scattered) or the (Nθ,Nφ) grid matrix (structured); `vec` flattens
-# it in the same order the plan's points were built.
-function sphere_coeffs(plan::DirectSHTSphericalPlan{T}, field::AbstractArray) where {T}
-    return sphere_coeffs!(Vector{T}(undef, plan.K), plan, field)
-end
+sphere_coeffs_buffer(plan::DirectSHTSphericalPlan{T, B}) where {T, B} =
+    B == 1 ? Vector{T}(undef, plan.K) : Matrix{T}(undef, plan.K, B)
 
-function sphere_coeffs!(a::AbstractVector, plan::DirectSHTSphericalPlan, field::AbstractArray)
-    LinearAlgebra.mul!(plan.rhs, transpose(plan.Y), vec(field))
-    _cg_gram!(a, plan)
-    return a
-end
-
-sphere_coeffs_buffer(plan::DirectSHTSphericalPlan{T}) where {T} = Vector{T}(undef, plan.K)
-
-# Synthesis: out = Σ_k h(ℓ_k)·C_k·Y_k  (apply the per-degree multiplier, then evaluate at the points).
-#
-# `h` is constant within a degree, and the design matrix's columns are laid out `(ℓ, m = -ℓ:ℓ)` in
-# order, so walking that layout evaluates `h` once per degree — `lmax+1` times rather than
-# `(lmax+1)²`. `h` is a difference of exponentials, so this replaces `2(lmax+1)²` transcendental
-# calls per band with `2(lmax+1)`: measured 6.10 µs -> 0.38 µs at lmax=24, 23.4 µs -> 0.86 µs at
-# lmax=48. It is a small share of the call, which the `Y * ha` product below dominates.
-function sphere_apply!(out::AbstractArray, plan::DirectSHTSphericalPlan{T}, C, h) where {T}
-    @inbounds begin
-        k = 1
-        for l in 0:plan.lmax
-            hl = T(h(l))
-            for _ in -l:l
+# Synthesis: out = Σ_k h(ℓ_k)·C_k·Y_k for each column. The coefficients are laid out `(ℓ, m = -ℓ:ℓ)` in
+# order, so `h` is evaluated once per degree.
+function sphere_apply!(out::AbstractArray, plan::DirectSHTSphericalPlan{T, B}, C, h) where {T, B}
+    K = plan.K
+    @inbounds for l in 0:plan.lmax
+        hl = T(h(l))
+        for b in 1:B
+            o = (b - 1) * K
+            for k in (o + l * l + 1):(o + (l + 1) * (l + 1))
                 plan.ha[k] = hl * C[k]
-                k += 1
             end
         end
     end
-    LinearAlgebra.mul!(vec(out), plan.Y, plan.ha)
+    _sht_synthesize!(out, plan.rings, plan.tab, plan.op.scr, plan.ha, B)
     return out
 end
 
-# Spherical average under the plan's quadrature weights (uniform 1/M for scattered points; sinθ area
-# weights for the structured grid).
-sphere_mean(plan::DirectSHTSphericalPlan, field::AbstractArray) =
-    LinearAlgebra.dot(plan.weights, vec(field))
+# Spherical average under the plan's quadrature weights: uniform `1/M` by default for scattered
+# points, Fejér weights on the structured grid. A plan `B > 1` wide averages each column of an
+# `(M, B)` stack.
+sphere_mean(plan::DirectSHTSphericalPlan{T, B}, field::AbstractArray) where {T, B} =
+    B == 1 ? LinearAlgebra.dot(plan.weights, vec(field)) :
+             transpose(reshape(field, plan.M, B)) * plan.weights
+
+# Throw `Plans.AnalysisNotConverged` when a spherical analysis has no usable answer for some column: a
+# condition estimate at `conlim` or `1/eps` (`FTB.LSMR_CONDITION`), or a residual that is not finite. A
+# solve that stopped at `maxiter` keeps its best iterate.
+function check_sphere_solve(ws::FTB.LSMRWorkspace, M::Integer, lmax::Integer, rtol::Real,
+                            maxiter::Integer)
+    @inbounds for k in eachindex(ws.status)
+        (ws.status[k] == FTB.LSMR_CONDITION || !isfinite(ws.normr[k])) &&
+            _refuse_sphere_solve(ws, k, M, lmax, rtol, maxiter)
+    end
+    return nothing
+end
+
+@noinline _refuse_sphere_solve(ws::FTB.LSMRWorkspace, k::Int, M::Integer, lmax::Integer, rtol::Real,
+                               maxiter::Integer) =
+    throw(Plans.AnalysisNotConverged(ws.residual[k], rtol, ws.iterations[k], maxiter,
+        "cond(A) ≈ $(Float32(ws.condA[k])), stopped on $(ws.status[k]). The $M points do not " *
+        "determine the $((lmax + 1)^2) coefficients of band limit $lmax: supply roughly " *
+        "M ≳ (lmax+1)² well-distributed points, or lower lmax."))
 
 # ---------------------------------------------------------------------------
-# Spherical-plan backend seam (mirrors the planar `Plans.make_scattered_plan`).
+# Scattered-sphere plan selection
 # ---------------------------------------------------------------------------
 
-# Only `Auto*` needs to ask what is loaded; an explicitly named backend dispatches straight to the
-# extension's builder, or to that builder's throwing stub.
+# Whether the NUFSHT extension is loaded; consulted only by `AutoSpectralBackend`.
 _have_nufsht() = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsNUFSHTExt) !== nothing
 
 """
-    nusht_spherical_plan(θ, φ, lmax, T; rtol, maxiter)
+    nusht_spherical_plan(θ, φ, lmax, T; rtol, maxiter, weights, ntrans, spin, nufft)
 
-Fast-path scattered-sphere plan constructor. The real method lives in the NUFSHT extension; this is
-its throwing stub.
+Scattered-sphere plan on NUFSHT, a method the NUFSHT extension defines; this fallback throws an
+`ArgumentError` naming `using NUFSHT`.
 """
 nusht_spherical_plan(args...; kwargs...) = throw(ArgumentError(
     "NUFSHTSpectralBackend requires the NUFSHT extension. Run `using NUFSHT`."))
@@ -885,14 +1018,9 @@ nusht_spherical_plan(args...; kwargs...) = throw(ArgumentError(
 """
     default_rtol(spectral) -> Real
 
-Conjugate-gradient tolerance for the scattered-sphere analysis solve under `spectral`.
-
-The solve cannot resolve the field better than the transform it is built on, so the useful tolerance
-is backend-specific. In-core direct summation evaluates `Y` exactly, so the solve tolerance *is* the
-analysis accuracy and `1e-8` buys real digits. NUFSHT analysis instead floors at its own
-approximation error — measured against the exact in-core transform, ~2e-4 at `lmax = 8`, `M = 500`
-and ~2e-5 at `lmax = 16`, `M = 1500` — and `1e-4` reaches that floor, matching `1e-8`'s accuracy in
-up to 3× less time. `1e-2` does not: it lands about twice as far off.
+Tolerance for the scattered-sphere analysis solve under `spectral`: `1e-8` for the in-core direct
+sum, which evaluates the harmonics exactly, and `1e-4` for NUFSHT, whose analysis is accurate only to
+its own approximation error.
 """
 default_rtol(::SB.AbstractSpectralBackend) = 1.0e-8
 default_rtol(::SB.AbstractNUFSHTSpectralBackend) = 1.0e-4
@@ -904,55 +1032,47 @@ default_rtol(::SB.AbstractAutoSpectralBackend) =
 
 The spin-weighted plan pair a scattered-sphere plan carries for
 [`spherical_monogenic_components`](@ref ScatteringTransforms.spherical_monogenic_components), or
-`nothing` for a plan built without one.
-
-Built with the plan rather than per call because a spin plan is the expensive part of that
-decomposition — two NUFFTs plus the Wigner-d recurrence tables — while the transform it drives is one
-synthesis. Only the monogenic constructors ask for it, so a plain spherical transform pays nothing.
-Like every other buffer a plan owns, the pair is working state: concurrent use needs
-`Plans.task_local_plan`.
+`nothing` for a plan built without one. Only the monogenic constructors build it. The pair is
+working state, so concurrent use needs `Plans.task_local_plan`.
 """
 plan_spin(::Any) = nothing
 
 """
-    make_spherical_plan(spectral, θ, φ, lmax, T; rtol, maxiter, spin) -> AbstractSphericalPlan
+    make_spherical_plan(spectral, θ, φ, lmax, T; rtol, maxiter, weights, ntrans, spin, nufft)
+        -> AbstractSphericalPlan
 
 Build the scattered-sphere plan selected by `spectral` over points `(θ, φ)` and band limit `lmax`.
 `SpectralBackends.DirectSumSpectralBackend` is the dependency-free default;
 `SpectralBackends.NUFSHTSpectralBackend` (or `SpectralBackends.AutoSpectralBackend` once the NUFSHT
 extension is loaded) uses the NUFSHT fast path.
 
-The in-core plan transforms one field per call, so `ntrans` is accepted and ignored rather than
-rejected: a caller asking for a batch still gets correct results, just not the batched transform. It
-ignores `spin` for a stronger reason — its monogenic decomposition needs no spin-weighted synthesis at
-all, taking the surface gradient of `(−Δ_S)^{-1/2}U⁰` instead (see [`plan_spin`](@ref)).
+`ntrans = B` builds a plan that transforms `B` co-located fields per call, and `weights` are the
+quadrature weights of the spherical mean. `spin = true` asks for what
+[`spherical_monogenic_components`](@ref ScatteringTransforms.spherical_monogenic_components) needs:
+the NUFSHT plan builds its spin pair (see [`plan_spin`](@ref)), and the in-core plan, which takes the
+surface gradient of `(−Δ_S)^{-1/2}U⁰`, needs nothing more. The in-core plan runs no NUFFT and throws
+for a named `nufft`.
 """
 function make_spherical_plan(s::SB.AbstractDirectSumSpectralBackend, θ, φ, lmax, ::Type{T};
                              rtol::Real = default_rtol(s), maxiter::Int = 500, weights = nothing,
                              ntrans::Int = 1, spin::Bool = false,
                              nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {T}
-    # Refused rather than ignored: this plan evaluates `Y` directly and runs no NUFFT, so honouring a
-    # named one is impossible and silently dropping it would misreport what the transform does.
     nufft isa SB.AbstractAutoSpectralBackend || throw(ArgumentError(
         "the in-core spherical plan performs no NUFFT, so `nufft = $nufft` cannot be honoured; " *
-        "pass spectral = SpectralBackends.NUFSHTSpectralBackend() for a NUFFT-backed transform."))
-    return DirectSHTSphericalPlan(θ, φ, lmax, T; rtol = rtol, maxiter = maxiter, weights = weights)
+        "pass transform = SpectralBackends.NUFSHTSpectralBackend() for a NUFFT-backed transform."))
+    return DirectSHTSphericalPlan(θ, φ, lmax, T; rtol = rtol, maxiter = maxiter, weights = weights,
+                                  ntrans = ntrans)
 end
-# NUFSHT takes the unweighted sample mean, so it has no quadrature to accept; `weights` is dropped
-# rather than silently ignored further down.
-make_spherical_plan(::SB.AbstractNUFSHTSpectralBackend, θ, φ, lmax, ::Type{T};
-                    weights = nothing, kwargs...) where {T} =
+make_spherical_plan(::SB.AbstractNUFSHTSpectralBackend, θ, φ, lmax, ::Type{T}; kwargs...) where {T} =
     nusht_spherical_plan(θ, φ, lmax, T; kwargs...)
 make_spherical_plan(::SB.AbstractAutoSpectralBackend, θ, φ, lmax, ::Type{T}; kwargs...) where {T} =
     _have_nufsht() ? make_spherical_plan(SB.NUFSHTSpectralBackend(), θ, φ, lmax, T; kwargs...) :
     make_spherical_plan(SB.DirectSumSpectralBackend(), θ, φ, lmax, T; kwargs...)
 
 # ---------------------------------------------------------------------------
-# Structured (uniform-grid) sphere: the equiangular (Fejér-midpoint) grid `θ_j = π(j-½)/N`,
-# `φ_k = 2π(k-1)/(2N-1)`, `N = lmax+1` — the same grid FastSphericalHarmonics uses, computed here
-# dependency-free so `structured_sphere_points` is backend-independent. The in-core default treats the
-# grid as points for the direct SHT (with sinθ area weights for the spherical mean); FastSpherical
-# harmonics is the fast exact path.
+# Structured sphere: the equiangular midpoint grid `θ_j = π(j-½)/N`, `φ_k = 2π(k-1)/(2N-1)`,
+# `N = lmax+1`, which is FastSphericalHarmonics' grid. The in-core plan treats it as points for the
+# direct SHT, with Fejér quadrature weights for the spherical mean.
 # ---------------------------------------------------------------------------
 
 """
@@ -969,8 +1089,8 @@ function structured_grid(lmax::Int, ::Type{T}) where {T}
 end
 
 # Fejér first-rule quadrature weights for the midpoint colatitudes θ_j = π(j-½)/N: they integrate
-# ∫₀^π g(cosθ) sinθ dθ = ∫₋₁¹ g dx exactly for band-limited g, so the spherical mean below is exact
-# (not just the sinθ area approximation). Non-negative and sum to 2.
+# ∫₀^π g(cosθ) sinθ dθ = ∫₋₁¹ g dx exactly for band-limited g, so the spherical mean below is exact.
+# Non-negative and sum to 2.
 function _fejer1_weights(N::Int, ::Type{T}) where {T}
     w = Vector{T}(undef, N)
     @inbounds for j in 1:N
@@ -1002,8 +1122,8 @@ _have_fsh() =
 """
     fsh_structured_plan(lmax, T)
 
-Fast-path structured-sphere plan constructor. The real method lives in the FastSphericalHarmonics
-extension; this is its throwing stub.
+Structured-sphere plan on FastSphericalHarmonics, a method the FastSphericalHarmonics extension
+defines; this fallback throws an `ArgumentError` naming `using FastSphericalHarmonics`.
 """
 fsh_structured_plan(args...; kwargs...) = throw(ArgumentError(
     "FSHTSpectralBackend requires the FastSphericalHarmonics extension. " *
@@ -1028,27 +1148,21 @@ make_structured_plan(::SB.AbstractAutoSpectralBackend, lmax, ::Type{T}; kwargs..
     make_structured_plan(SB.DirectSumSpectralBackend(), lmax, T; kwargs...)
 
 # ---------------------------------------------------------------------------
-# Dependency-free spin-1 Riesz field for the pointwise monogenic decomposition.
+# Spin-1 Riesz field on the in-core plan, for the pointwise monogenic decomposition.
 #
 # The Riesz tangent vector is the surface gradient of `g = (−Δ_S)^{-1/2} U⁰`: `u_θ = ∂_θ g`,
-# `u_φ = (1/sinθ) ∂_φ g` (equivalently the spin-1 field `ð g`). Given `g`'s real-SH coefficients `gc`,
-# the φ-derivative of the `cos/sin(mφ)` factor is analytic, and so is the θ-derivative of the
-# associated Legendre part — see `_dtheta_pbar`. This is the direct-plan counterpart of NUFSHT's
-# spin-1 synthesis.
+# `u_φ = (1/sinθ) ∂_φ g`. Given `g`'s real-SH coefficients, the φ-derivative of the `cos/sin(mφ)`
+# factor is analytic, and so is the θ-derivative of the associated Legendre part (`_dtheta_pbar`).
+# Like the synthesis, both run ring by ring: per ring the order sums of `P̄` and of its derivative, per
+# point the sum over orders.
 # ---------------------------------------------------------------------------
 
-# ∂_θ P̄_ℓ^m from same-degree neighbours:
-#   ∂_θ P̄_ℓ^m = ½[ √((ℓ+m)(ℓ−m+1))·P̄_ℓ^{m−1} − √((ℓ−m)(ℓ+m+1))·P̄_ℓ^{m+1} ]
-# with `P̄_ℓ^{−1} = −P̄_ℓ^{1}` (the normalised form of `P_ℓ^{−m} = (−1)^m (ℓ−m)!/(ℓ+m)!·P_ℓ^m`), which
-# collapses the `m = 0` case to `−√(ℓ(ℓ+1))·P̄_ℓ^1`.
-#
-# The overall sign is fixed by ground truth rather than by convention-matching: for `m = 0` the field
-# is `∝ P_ℓ(cosθ)`, so the surface gradient has no `φ` component and its `θ` component is a plain
-# `∂_θ`, which a central difference of the analytic harmonic pins to 1e-9.
-#
-# The identity is homogeneous in the normalisation, so it holds for `_assoc_legendre!`'s output as
-# written — that routine's arbitrary overall scale cancels. One Legendre recurrence per point instead
-# of the three a central difference needs, and exact rather than accurate to `cbrt(eps)`.
+# `−∂_θ P̄_ℓ^m` from same-degree neighbours:
+#   ½[ √((ℓ+m)(ℓ−m+1))·P̄_ℓ^{m−1} − √((ℓ−m)(ℓ+m+1))·P̄_ℓ^{m+1} ],
+# the identity for `∂_θ P_ℓ^m` without the Condon–Shortley phase, which `P̄` carries, so it gives the
+# negated derivative. `P̄_ℓ^{−1} = −P̄_ℓ^{1}` (the normalised form of
+# `P_ℓ^{−m} = (−1)^m (ℓ−m)!/(ℓ+m)!·P_ℓ^m`) collapses the `m = 0` case to `−√(ℓ(ℓ+1))·P̄_ℓ^1`. The
+# identity is linear in `P̄`, so `_assoc_legendre!`'s arbitrary overall scale cancels.
 @inline function _dtheta_pbar(P::AbstractMatrix{T}, ℓ::Int, m::Int) where {T}
     up = (m + 1 > ℓ) ? zero(T) : sqrt(T((ℓ - m) * (ℓ + m + 1))) * P[ℓ + 1, m + 2]
     dn = m == 0 ? -sqrt(T(ℓ * (ℓ + 1))) * (ℓ >= 1 ? P[ℓ + 1, 2] : zero(T)) :
@@ -1058,60 +1172,67 @@ end
 
 riesz_scratch(plan::DirectSHTSphericalPlan{T}, ::AbstractArray) where {T} =
     (gc = Vector{T}(undef, plan.K), P = Matrix{T}(undef, plan.lmax + 1, plan.lmax + 1),
-     cm = Vector{T}(undef, plan.lmax + 1), sm = Vector{T}(undef, plan.lmax + 1))
+     dc = Vector{T}(undef, plan.lmax + 1), ds = Vector{T}(undef, plan.lmax + 1),
+     pc = Vector{T}(undef, plan.lmax + 1), ps = Vector{T}(undef, plan.lmax + 1))
 
-# `scr.gc = h(ℓ)·C` in the design matrix's `(ℓ, m = -ℓ:ℓ)` column order.
+# `scr.gc = h(ℓ)·C` in the `(ℓ, m = -ℓ:ℓ)` coefficient order.
 function _scaled_coeffs!(scr, plan::DirectSHTSphericalPlan{T}, C, h) where {T}
-    k = 1
     @inbounds for l in 0:plan.lmax
         hl = T(h(l))
-        for _ in -l:l
+        for k in (l * l + 1):((l + 1) * (l + 1))
             scr.gc[k] = hl * C[k]
-            k += 1
         end
     end
     return scr.gc
 end
 
-# Legendre table and `cos(mφ), sin(mφ)` of point `n` into `scr`; returns `1/sinθ`.
-function _prepare_point!(scr, plan::DirectSHTSphericalPlan{T}, n::Int) where {T}
-    _assoc_legendre!(scr.P, cos(plan.theta[n]), plan.lmax)
-    @inbounds for m in 0:plan.lmax
-        scr.sm[m + 1], scr.cm[m + 1] = sincos(m * plan.phi[n])
-    end
-    return one(T) / sin(plan.theta[n])
-end
-
-# `(∂_θ g, ∂_φ g / sinθ)` at the point `scr` was prepared for, `g` having coefficients `scr.gc`.
-function _gradient_at(plan::DirectSHTSphericalPlan{T}, scr, invs::T) where {T}
-    gc, P, cm, sm = scr.gc, scr.P, scr.cm, scr.sm
+# `store(n, Gθ, Gφ)` at every point `n`, with `(Gθ, Gφ) = (−∂_θ g, −∂_φ g / sinθ)` for the field `g`
+# whose coefficients are `scr.gc`.
+function _each_gradient(store::F, plan::DirectSHTSphericalPlan{T}, scr) where {F, T}
+    lmax = plan.lmax
+    rings = plan.rings
+    P, g = scr.P, scr.gc
+    dc, ds, pc, ps = scr.dc, scr.ds, scr.pc, scr.ps
     s2 = sqrt(T(2))
-    aθ = zero(T)
-    aφ = zero(T)
-    col = 0
-    @inbounds for ℓ in 0:plan.lmax, m in -ℓ:ℓ
-        col += 1
-        am = abs(m)
-        dP = _dtheta_pbar(P, ℓ, am)                                  # ∂_θ P̄_ℓ^|m|
-        if m == 0
-            aθ += gc[col] * dP
-        elseif m > 0
-            aθ += gc[col] * s2 * dP * cm[am + 1]
-            aφ += gc[col] * s2 * P[ℓ + 1, am + 1] * (m * sm[am + 1]) * invs
-        else
-            aθ += gc[col] * s2 * dP * sm[am + 1]
-            aφ -= gc[col] * s2 * P[ℓ + 1, am + 1] * (am * cm[am + 1]) * invs
+    @inbounds for r in 1:_nrings(rings)
+        _assoc_legendre!(P, plan.tab, rings.rcos[r], rings.rsin[r])
+        for m in 0:lmax
+            sdc = zero(T)
+            sds = zero(T)
+            spc = zero(T)
+            sps = zero(T)
+            for ℓ in m:lmax
+                dP = _dtheta_pbar(P, ℓ, m)
+                p = P[ℓ + 1, m + 1]
+                gp, gm = g[_lm(ℓ, m)], g[_lm(ℓ, -m)]
+                sdc += dP * gp
+                sds += dP * gm
+                spc += p * gp
+                sps += p * gm
+            end
+            dc[m + 1], ds[m + 1], pc[m + 1], ps[m + 1] = sdc, sds, spc, sps
+        end
+        invs = one(T) / rings.rsin[r]
+        for t in rings.ptr[r]:(rings.ptr[r + 1] - 1)
+            n = rings.pts[t]
+            c1, s1 = rings.cφ[n], rings.sφ[n]
+            gθ = dc[1]
+            gφ = zero(T)
+            cm, sm = one(T), zero(T)
+            for m in 1:lmax
+                cm, sm = cm * c1 - sm * s1, sm * c1 + cm * s1
+                gθ += s2 * (cm * dc[m + 1] + sm * ds[m + 1])
+                gφ += s2 * m * (sm * pc[m + 1] - cm * ps[m + 1])
+            end
+            store(n, gθ, gφ * invs)
         end
     end
-    return aθ, aφ
+    return nothing
 end
 
 function sphere_riesz_energy!(out::AbstractArray, plan::DirectSHTSphericalPlan, C, h, scr)
     _scaled_coeffs!(scr, plan, C, h)
-    @inbounds for n in 1:plan.M
-        aθ, aφ = _gradient_at(plan, scr, _prepare_point!(scr, plan, n))
-        out[n] = aθ^2 + aφ^2
-    end
+    _each_gradient((n, gθ, gφ) -> (@inbounds out[n] = gθ^2 + gφ^2), plan, scr)
     return out
 end
 
@@ -1123,17 +1244,12 @@ function direct_monogenic_components(st::SphericalMonogenicScattering{<:Any, <:D
     a = sphere_coeffs(plan, field)                                  # spin-0 SH coefficients
     U0 = similar(plan.theta)
     sphere_apply!(U0, plan, a, band_multiplier(σ²hi, σ²lo))         # band-pass U⁰ (real)
-    # Coefficients of g = (−Δ_S)^{-1/2} U⁰, then its surface gradient at each point.
+    # Coefficients of g = (−Δ_S)^{-1/2} U⁰, then its surface gradient `(∂_θ g, ∂_φ g / sinθ)` at each
+    # point, the negation of what `_each_gradient` stores.
     scr = riesz_scratch(plan, field)
     _scaled_coeffs!(scr, plan, a, riesz_potential_multiplier(σ²hi, σ²lo))
     uθ, uφ = similar(plan.theta), similar(plan.theta)
-    for n in 1:plan.M
-        uθ[n], uφ[n] = _gradient_at(plan, scr, _prepare_point!(scr, plan, n))
-    end
-    # NUFSHT's spin-1 synthesis uses ð g = -(∂_θ + i/sinθ ∂_φ)g, so its Riesz vector is the negative of
-    # the raw surface gradient; match that sign so the two backends give identical riesz/orientation.
-    @. uθ = -uθ
-    @. uφ = -uφ
+    _each_gradient((n, gθ, gφ) -> (@inbounds (uθ[n] = -gθ; uφ[n] = -gφ)), plan, scr)
     rnorm = sqrt.(uθ .^ 2 .+ uφ .^ 2)
     amplitude = sqrt.(U0 .^ 2 .+ rnorm .^ 2)
     phase = atan.(rnorm, U0)

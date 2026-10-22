@@ -1,28 +1,18 @@
 module PathGraph
 
-"""
-    PathGraph.jl — Scattering path enumeration
-
-The scattering transform is a tree of paths `(λ₁, λ₂, …)` of wavelet indices. A path is
-*admissible* iff its effective log-scale is strictly increasing — `j_eff(λ_{k+1}) > j_eff(λ_k)`
-— i.e. each successive wavelet is strictly coarser (lower center frequency). This single rule:
-
-- reproduces the 1D constraint `j₂ > j₁` exactly (the 1D bank is built in `j_eff`-increasing
-  order, so a flat `i₂ > i₁` already meant `j_eff` increasing); and
-- in 2D, admits all orientation pairs `(l₁, l₂)` across strictly coarser scales while excluding
-  same-scale pairs, which share `j_eff`. Admissibility is a statement about scale alone; a flat
-  loop over the wavelet index would mix scale and orientation, since one index encodes both.
-"""
+# A path `(λ₁, λ₂, …)` of wavelet indices is admissible iff its effective log-scale strictly
+# increases, `j_eff(λ_{k+1}) > j_eff(λ_k)`, so each wavelet is strictly coarser than the last. In 1D
+# this is `j₂ > j₁`; in 2D and 3D it admits every orientation pair across strictly coarser scales and
+# excludes same-scale pairs, which share `j_eff`.
 
 export ScatteringTree, build_tree, npaths, path_indices, order_range, order2_groups
 
 """
     ScatteringTree{IV,RV}
 
-Flat CSR description of the scattering tree. Pure integer topology (indices into the filter
-bank + integer order labels) — outside the differentiable data path, so the *values* are
-integers, but the containers stay parametric (default builders produce `Vector{Int}` /
-`Vector{UnitRange{Int}}`, yet `MArray`/`CuVector`/`Int32` storage is permitted).
+Flat CSR description of the scattering tree: wavelet indices into the filter bank and per-path
+order labels. The containers are parametric; [`build_tree`](@ref) produces `Vector{Int}` and
+`Vector{UnitRange{Int}}`.
 
 # Fields
 - `path_data`: concatenated wavelet-index lists for all paths
@@ -115,14 +105,12 @@ end
 """
     order2_groups(tree, nw) -> Vector{Tuple{Int,Vector{Int},Vector{Int}}}
 
-Every first-order wavelet `j1` paired with its admissible order-2 children `j2` and the tree path
-ids of those `(j1, j2)` pairs, ordered longest-first. The path ids are what the localized-field
-output is indexed by; the coefficient cascade only needs `(j1, j2)`.
+Every first-order wavelet `j1` with its admissible order-2 children `j2` and the tree path ids of
+those `(j1, j2)` pairs, longest group first.
 
-The cascade walks this instead of the flat order-2 path list so that a first-order modulus is
-computed and transformed **once** per `j1` and reused across its children, rather than recomputed
-per path. Longest-first ordering is for the parallel backends: the child count varies by roughly
-`3×` across scales, so equal-sized chunks of a natural-order list load-imbalance badly.
+The cascade computes each first-order modulus once per group, and the localized-field output is
+indexed by the path ids. Longest-first order balances the parallel backends, since the child count
+varies across scales.
 """
 function order2_groups(tree::ScatteringTree, nw::Integer)
     children = [Int[] for _ in 1:nw]

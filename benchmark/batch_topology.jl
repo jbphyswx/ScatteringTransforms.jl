@@ -96,7 +96,7 @@ function study(label, st, X, spatial)
     end
     row("floor (steps / threads)", roofline, nothing)
     row("serial, per-slice", bench(() -> ST.scattering_batch!(out, st, X), 2), slice_bytes(T, spatial) * 5)
-    row("threaded, per-slice", bench(() -> ST.scattering_batch(CB.ThreadedBackend(), st, X), 2),
+    row("threaded, per-slice", bench(() -> ST.scattering_batch(st, X; execution = CB.ThreadedBackend()), 2),
         slice_bytes(T, spatial) * 5)
 
     ext = Base.get_extension(ST, :ScatteringTransformsOhMyThreadsExt)
@@ -116,13 +116,13 @@ function main()
     FB = SB.FFTSpectralBackend()
     for (label, st, X, spatial) in (
         ("1D N=1024 J=6 Q=1",
-         ST.Scattering1D.ScatteringTransform1D(1024, 6; Q = 1, spectral = FB), randn(1024, 64), (1024,)),
+         ST.Scattering1D.ScatteringTransform1D(1024, 6; Q = 1, transform = FB), randn(1024, 64), (1024,)),
         ("1D N=4096 J=8 Q=1",
-         ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, spectral = FB), randn(4096, 64), (4096,)),
+         ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, transform = FB), randn(4096, 64), (4096,)),
         ("2D 64^2 J=4 L=8",
-         ST.Scattering2D.ScatteringTransform2D((64, 64), 4; L = 8, spectral = FB), randn(64, 64, 32), (64, 64)),
+         ST.Scattering2D.ScatteringTransform2D((64, 64), 4; L = 8, transform = FB), randn(64, 64, 32), (64, 64)),
         ("2D 128^2 J=4 L=8",
-         ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8, spectral = FB), randn(128, 128, 16), (128, 128)))
+         ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8, transform = FB), randn(128, 128, 16), (128, 128)))
         study(label, st, X, spatial)
     end
     println("\n  'vs roof' is time / (transform count x one-full-step time x B / threads).")

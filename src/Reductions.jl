@@ -1,19 +1,7 @@
 module Reductions
 
-"""
-    Reductions.jl — Reduced / normalized scattering descriptors
-
-Post-processing of the raw `(S0, S1, S2)` coefficients into the descriptors commonly used in
-practice (Cheng & Ménard 2021; Allys et al. 2019):
-
-- `normalized_coefficients` — `s1 = S1/S0`, `s2 = S2/S1` (removes dependence on the field's
-  overall amplitude / first-order power), the standard inputs for classification & regression.
-- `log_coefficients` — `log S1`, `log S2`, which gaussianize heavy-tailed scattering
-  coefficients of intermittent fields.
-
-Orientation-reduced second-order descriptors (sparsity `s₂₁`, anisotropy/shape `s₂₂`) for 2D
-are produced by `compute_shape_sparsity` (in the 2D transform module).
-"""
+# Normalized and log scattering descriptors (Cheng & Ménard 2021; Allys et al. 2019). The 2D
+# orientation reductions are `Scattering2D.compute_shape_sparsity`.
 
 using ..Coefficients: Coefficients
 

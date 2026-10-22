@@ -3,13 +3,11 @@ module ScatteringTransformsCairoMakieExt
 using CairoMakie: CairoMakie
 using ScatteringTransforms: ScatteringTransforms
 
-# Sequential colormap for non-negative energy/coefficient heatmaps: light (≈ white) at zero so
-# it reads cleanly on a white page (avoids the dark-purple-on-white look). Invalid/empty
-# scattering paths are shaded a light transparent gray rather than left blank.
+# Sequential colormap for non-negative heatmaps, near white at zero; empty scattering paths are
+# shaded light gray.
 const _ENERGY_CMAP = :dense
 const _NAN_COLOR = (:gray, 0.18)
 
-# Implement plot_filter_bank for 1D Filter Banks
 function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBanks.FilterBank1D)
     MK = CairoMakie
     FB = ScatteringTransforms.FilterBanks
@@ -59,7 +57,6 @@ function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBa
     return fig
 end
 
-# Implement plot_filter_bank for 2D Filter Banks
 function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBanks.FilterBank2D)
     Ny, Nx = size(fb.averaging)
     # Zero frequency centred; the first array axis is fy, drawn vertically.
@@ -94,7 +91,6 @@ function ScatteringTransforms.plot_filter_bank(fb::ScatteringTransforms.FilterBa
     return fig
 end
 
-# Implement plot_coefficients for 1D Coefficients
 function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Coefficients.ScatteringCoefficients1D; signal=nothing)
     has_sig = !isnothing(signal)
     
@@ -168,7 +164,6 @@ function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Coeffici
     return fig
 end
 
-# Implement plot_coefficients for 2D Coefficients
 function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Coefficients.ScatteringCoefficients2D; image=nothing)
     has_img = !isnothing(image)
     J = c.n_scales

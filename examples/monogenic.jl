@@ -43,7 +43,7 @@ M = 128
 cx = cy = (M + 1) / 2
 rr = [sqrt((i - cx)^2 + (j - cy)^2) for i in 1:M, j in 1:M]
 field = cos.(2π .* rr ./ (M / 16))
-st = ST.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1, spectral=SB.FFTSpectralBackend())
+st = ST.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1, transform=SB.FFTSpectralBackend())
 best = argmax([sum(abs2, ST.Monogenic.monogenic_components(st, field, j).bandpass) for j in 1:5])
 comp = ST.Monogenic.monogenic_components(st, field, best)
 

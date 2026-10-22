@@ -1,11 +1,5 @@
 module Filters
 
-"""
-    Filters.jl — Frequency-domain wavelet filter definitions
-
-Implements Morlet wavelets in the frequency domain for FFT-based convolutions.
-"""
-
 using FlowTransformBindings: FlowTransformBindings as FTB
 
 export Morlet1D, Morlet2D, Morlet3D
@@ -37,7 +31,7 @@ struct Morlet1D{T<:Real}
     N::Int
 
     function Morlet1D{T}(N::Int, j::Real; Q::Int=1, r::T=T(sqrt(0.5))) where T<:Real
-        # Center frequency: xi = 0.5 * 2^(-j/Q) in normalized frequency [0, 1]
+        # Center frequency `ξ = ½·2^(-j/Q)` in cycles per sample.
         xi = T(0.5) / (T(2.0)^(j / Q))
 
         # Bandwidth: sigma = xi * (1 - 2^(-1/Q)) / (1 + 2^(-1/Q)) / sqrt(2*log(1/r)), which puts the
@@ -45,13 +39,12 @@ struct Morlet1D{T<:Real}
         factor = T(1.0) / (T(2.0)^(T(1.0) / Q))
         term1 = (T(1.0) - factor) / (T(1.0) + factor)
         term2 = T(1.0) / Base.sqrt(T(2.0) * Base.log(T(1.0) / r))
-        sigma = xi * term1 * term2  # Bandwidth proportional to center frequency
+        sigma = xi * term1 * term2
 
         new{T}(xi, sigma, N)
     end
 end
 
-# Convenience constructor - defaults to Float64
 Morlet1D(N::Int, j::Real; kwargs...) = Morlet1D{Float64}(N, j; kwargs...)
 
 # The frequency of bin `i` of an `n`-point FFT axis in cycles per sample, `fftfreq(n)[i]`.
@@ -87,11 +80,7 @@ end
 """
     frequency_response(m::Morlet1D{T}) -> Vector{T}
 
-Compute the frequency response Ψ(ω) of a 1D Morlet wavelet.
-
-Returns a length-N vector with the Fourier-domain filter coefficients.
-The response is analytic (zero for negative frequencies) for proper
-wavelet transform. Element type matches the wavelet's precision.
+The frequency response `Ψ(ω)` of `m` on its `N`-point FFT grid, zero at negative frequencies.
 """
 frequency_response(m::Morlet1D{T}) where {T<:Real} =
     frequency_response!(Vector{T}(undef, m.N), m)
@@ -157,15 +146,13 @@ struct Morlet2D{T<:Real}
     end
 end
 
-# Convenience constructor - defaults to Float64
 Morlet2D(N::NTuple{2,Int}, j::Int, theta::Real; kwargs...) = 
     Morlet2D{Float64}(N, j, theta; kwargs...)
 
 """
     frequency_response(m::Morlet2D{T}) -> Matrix{T}
 
-Compute the 2D frequency response Ψ(kx, ky) of an oriented Morlet wavelet.
-Element type matches the wavelet's precision.
+The 2D frequency response `Ψ(kx, ky)` of an oriented Morlet wavelet, on its FFT grid.
 """
 frequency_response(m::Morlet2D{T}) where {T<:Real} =
     frequency_response!(Matrix{T}(undef, m.N), m)

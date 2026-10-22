@@ -176,8 +176,8 @@ in-core direct plan takes the gradient from `∂_θ P̄_ℓ^m` and `∂_φ` eval
 
 Convolutions are done in the spectral domain. The core ships a dependency-free **direct-sum
 DFT** default; loading `FFTW` selects an `O(N\log N)` fast path automatically
-(`spectral = AutoSpectralBackend()`). Batches reuse one plan (`scattering_batch`), and `using OhMyThreads`
-enables a multithreaded batched transform (`ThreadedBackend`). The hot path is written with
+(`transform = AutoSpectralBackend()`). Batches reuse one plan (`scattering_batch`), and `using OhMyThreads`
+enables a multithreaded batched transform (`execution = ThreadedBackend()`). The hot path is written with
 broadcasts/reductions so it also runs on GPU arrays. The mutation-free `scattering(st, x)` is the
 autodiff-friendly counterpart used by synthesis.
 

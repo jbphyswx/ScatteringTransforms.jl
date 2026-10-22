@@ -1,31 +1,11 @@
 module ScatteringTransformsKernelAbstractionsExt
 
-"""
-    ScatteringTransformsKernelAbstractionsExt — vendor-neutral GPU scattering
-
-The device-agnostic GPU execution path, dispatched on `CB.GPUBackend{B}` where `B` is any
-`KernelAbstractions.Backend` (CUDA/ROCm/oneAPI/Metal for real hardware, `KA.CPU()` for CPU-parity CI).
-
-The scattering engine (`ScatteringCore`, `Scattering{1,2,3}D`) is already array-type-generic — every hot
-op is a fused broadcast or a `mul!` through the plan interface — so this path needs **no hand-written
-`@kernel`s**. The only vendor-specific pieces are:
-
-  1. device allocation — `KA.allocate(backend, T, dims)` + `copyto!` / `fill!`;
-  2. the FFT plan — `AbstractFFTs.plan_fft(device_array)` / `plan_ifft`, which dispatch on the array
-     *type* (cuFFT for `CuArray`, rocFFT for `ROCArray`, FFTW for a plain `Array`).
-
-Two entry points are provided:
-
-  * **device-resident constructors** `ScatteringTransform{1,2,3}D(N, J, gpu::GPUBackend; …)` — build a
-    transform whose filter bank + workspace + plan live on the device; the existing generic `st(x_dev)`
-    then runs on-device unchanged;
-  * **batched-FFT throughput** `scattering_batch(gpu, st, X)` / `scattering_batch!(out, gpu, st, X)` —
-    transform a whole `(N…, B)` stack with one batched plan and fused broadcasts.
-
-Core elementwise ops (`apply_modulus!`, complexify) are not overridden by a broad `::AbstractArray`
-method: that would also capture CPU arrays once this extension loads, and base broadcast is already
-correct on device arrays.
-"""
+# Device execution on `CB.GPUBackend{B}` for any `KernelAbstractions.Backend` `B`. The cascade is
+# array-type generic (broadcasts and plan executions), so this extension supplies only device
+# allocation and `AbstractFFTs` plans, which dispatch on the array type. It adds device-resident
+# constructors `ScatteringTransform{1,2,3}D([T,] N, J, gpu::GPUBackend; …)` and
+# `MonogenicScattering([T,] dims, J, gpu::GPUBackend; …)`, and the batched
+# `scattering_batch(st, X; execution = gpu)` / `scattering_batch!(out, st, X; execution = gpu)`.
 
 using KernelAbstractions: KernelAbstractions as KA
 using AbstractFFTs: AbstractFFTs
@@ -38,10 +18,10 @@ using ScatteringTransforms: ScatteringTransforms as ST
 # ---------------------------------------------------------------------------
 
 """
-    AbstractFFTsScatteringPlan{T,FP,IP}
+    AbstractFFTsScatteringPlan{T,FP,IP,IPI}
 
-Spectral plan backed by any `AbstractFFTs` plan (cuFFT / rocFFT / FFTW). Mirrors `FFTWScatteringPlan`:
-in-place `!` transforms via `mul!`, allocating non-`!` transforms via `plan * x` (autodiff-friendly).
+Spectral plan backed by any `AbstractFFTs` plan (cuFFT / rocFFT / FFTW), as `FFTWScatteringPlan` is
+by FFTW: in-place `!` transforms through `mul!`, allocating non-`!` transforms through `plan * x`.
 """
 struct AbstractFFTsScatteringPlan{T, FP, IP, IPI} <: ST.Plans.AbstractScatteringPlan
     fwd::FP
@@ -51,10 +31,8 @@ end
 
 function ST.Plans.abstractffts_plan(dummy::AbstractArray{Complex{T}}; region = 1:ndims(dummy),
                                     fft_nthreads::Int = 1) where {T}
-    # On a host array `AbstractFFTs` dispatches to FFTW, whose thread count is process-global and is
-    # raised by unrelated packages simply being loaded — so without naming it here, how many threads
-    # this plan uses (and therefore how many tasks it spawns, and allocates, per execution) would
-    # depend on load order. Device plans ignore it; the hook is a no-op when FFTW is absent.
+    # On a host array `AbstractFFTs` dispatches to FFTW, whose process-global thread count other
+    # packages change, so the plan names its own. Device plans ignore it.
     return ST.Plans.with_fft_nthreads(fft_nthreads) do
         fwd = AbstractFFTs.plan_fft(dummy, region)
         inv = AbstractFFTs.plan_ifft(dummy, region)
@@ -69,8 +47,8 @@ Base.show(io::IO, ::AbstractFFTsScatteringPlan{T}) where {T} =
     print(io, "AbstractFFTsScatteringPlan{", T, "}()")
 Base.show(io::IO, ::MIME"text/plain", p::AbstractFFTsScatteringPlan) = show(io, p)
 
-# A device plan is not reconstructible from a tag alone — it needs its device too — so it declares
-# no spectral backend and `transform_spec` refuses rather than silently reporting a host FFTW plan.
+# A tag cannot rebuild a device plan without its device, so the plan declares no spectral backend and
+# `transform_spec` throws for it.
 ST.Plans.task_local_plan(p::AbstractFFTsScatteringPlan) = p
 
 ST.Plans.forward_transform!(out::AbstractArray, p::AbstractFFTsScatteringPlan, x::AbstractArray) =
@@ -78,9 +56,12 @@ ST.Plans.forward_transform!(out::AbstractArray, p::AbstractFFTsScatteringPlan, x
 ST.Plans.inverse_transform!(out::AbstractArray, p::AbstractFFTsScatteringPlan, x::AbstractArray) =
     out === x ? (p.inv! * x) : (LinearAlgebra.mul!(out, p.inv, x); out)
 ST.Plans.inplace_inverse(::AbstractFFTsScatteringPlan) = true
-# The array is the only thing that carries the device, which is why the generic resize takes one.
+# The prototype array carries the device.
 ST.Plans.plan_like(::AbstractFFTsScatteringPlan, prototype::AbstractArray) =
     ST.Plans.abstractffts_plan(prototype; region = 1:ndims(prototype))
+ST.Plans.plan_like(::AbstractFFTsScatteringPlan, prototype::AbstractArray, D::Int;
+                   fft_nthreads::Int = 1) =
+    ST.Plans.abstractffts_plan(prototype; region = 1:D, fft_nthreads = fft_nthreads)
 ST.Plans.forward_transform(p::AbstractFFTsScatteringPlan, x::AbstractArray) = p.fwd * x
 ST.Plans.inverse_transform(p::AbstractFFTsScatteringPlan, x::AbstractArray) = p.inv * x
 
@@ -103,18 +84,18 @@ function _dzeros(backend, ::Type{T}, dims) where {T}
 end
 
 # ---------------------------------------------------------------------------
-# Device-resident transform constructors (parity with the CUDA ext, vendor-neutral)
+# Device-resident transform constructors
 # ---------------------------------------------------------------------------
 
 # The periodized cascade's workspace, allocated and planned on the device, with the transform's own
-# plan as level 1. `Cascade.build` takes these hooks so the host and the device share one
-# implementation.
+# plan as level 1. Each path's mean is summed on the device, so a single-field transform synchronises
+# with the host once per call.
 _device_pw(b, fb, groups, dims, ::Type{T}, α::Int, D::Int, plan) where {T} =
     ST.Cascade.build(fb, groups, dims, T, α;
                      alloc = rd -> _dzeros(b, Complex{T}, rd),
                      makeplan = rd -> ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, rd);
                                                                  region = 1:D),
-                     level1 = plan)
+                     level1 = plan, device_zeros = (S, d) -> _dzeros(b, S, d))
 
 function ST.Scattering1D.ScatteringTransform1D(::Type{T}, N::Int, J::Int, gpu::CB.GPUBackend;
                                                Q::Int = 1, max_order::Int = 2, oversampling::Int = J) where {T}
@@ -130,9 +111,9 @@ function ST.Scattering1D.ScatteringTransform1D(::Type{T}, N::Int, J::Int, gpu::C
     return ST.Scattering1D.ScatteringTransform1D(filter_bank, tree, groups, max_order, plan,
         _dzeros(b, Complex{T}, (N,)), _dzeros(b, Complex{T}, (N,)), (N,), pw)
 end
-# Scattered-planar parity: everything downstream of the points follows their array type, so the
-# device constructor only has to put the points on the device. Which NUFFT runs there is the
-# caller's `spectral` choice — NonuniformFFTs is the KernelAbstractions-native one.
+# Scattered planar: everything downstream of the points follows their array type, so this moves the
+# points to the device. `transform` picks the NUFFT; NonuniformFFTs runs on KernelAbstractions
+# devices.
 function ST.ScatteredPlanar.build(::Type{T}, x::AbstractVector, y::AbstractVector,
                                   ms::NTuple{2,Int}, J::Int, gpu::CB.GPUBackend;
                                   kwargs...) where {T}
@@ -180,49 +161,54 @@ end
 ST.Scattering3D.ScatteringTransform3D(N::NTuple{3,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) =
     ST.Scattering3D.ScatteringTransform3D(Float32, N, J, gpu; kwargs...)
 
+function ST.Monogenic.MonogenicScattering(::Type{T}, dims::NTuple{D,Int}, J::Int, gpu::CB.GPUBackend;
+                                          Q::Int = 1, max_order::Int = 2,
+                                          oversampling::Int = J) where {T, D}
+    b = gpu.backend
+    cpu_fb = ST.Monogenic.build_monogenic_bank(T, dims, J; Q = Q)
+    wavelets = [_to_device(b, ψ) for ψ in cpu_fb.wavelets]
+    riesz = map(R -> _to_device(b, R), cpu_fb.riesz)
+    averaging = _to_device(b, cpu_fb.averaging)
+    fb = ST.Monogenic.MonogenicFilterBank{D, T, typeof(averaging), typeof(wavelets), typeof(riesz),
+                                          typeof(cpu_fb.meta)}(wavelets, riesz, averaging, cpu_fb.meta,
+                                                               cpu_fb.J, cpu_fb.Q)
+    tree, groups = ST.Monogenic.tree_groups(fb, max_order)
+    plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, dims))
+    pw = _device_pw(b, fb, groups, dims, T, oversampling, D, plan)
+    return ST.Monogenic.assemble(fb, tree, groups, max_order, plan, pw)
+end
+ST.Monogenic.MonogenicScattering(::Type{T}, N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) where {T} =
+    ST.Monogenic.MonogenicScattering(T, (N,), J, gpu; kwargs...)
+ST.Monogenic.MonogenicScattering(dims::NTuple{D,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) where {D} =
+    ST.Monogenic.MonogenicScattering(Float32, dims, J, gpu; kwargs...)
+ST.Monogenic.MonogenicScattering(N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) =
+    ST.Monogenic.MonogenicScattering(Float32, (N,), J, gpu; kwargs...)
+
 # The cascade's work list. Path topology is integer bookkeeping, so it stays on the host even for a
 # device-resident transform.
 _groups(tree, nw::Int, max_order::Int) =
     max_order >= 2 ? ST.PathGraph.order2_groups(tree, nw) : [(j, Int[], Int[]) for j in 1:nw]
 
 # ---------------------------------------------------------------------------
-# Batched-FFT throughput path — the performant `scattering_batch(::GPUBackend, …)`
+# Batched transforms on the device
 # ---------------------------------------------------------------------------
 
 """
     gpu_batch_workspace(gpu, st, B) -> ST.Batched.BatchWorkspace
 
-Device-resident state for repeated `scattering_batch!` calls at a fixed batch size `B`: the batched
-`AbstractFFTs` plan, `(spatial…, B)` scratch, and **device copies of the filter wavelets**, so a
-host-built `st` also runs on a device.
-
-The cascade itself is [`ST.Batched.batch_cascade!`](@ref) — the same code the CPU path runs. It
-names no device: every operation is a broadcast, a plan execution, or a `mapreduce`, all of which
-dispatch on the array type. This extension therefore supplies allocation and a plan, and nothing
-else.
+Device-resident state for repeated `scattering_batch!(out, st, X; execution = gpu, workspace)`
+calls at a fixed batch size `B`: the batched `AbstractFFTs` plan, `(spatial…, B)` scratch and device
+copies of the filters, so a host-built `st` runs on the device through `ST.Batched.batch_cascade!`.
 """
 function gpu_batch_workspace(gpu::CB.GPUBackend, st, B::Int)
     b = gpu.backend
     T = real(eltype(st.filter_bank.averaging))
-    spatial = st.dims                             # (N,) 1D, (Ny,Nx) 2D, (Nz,Ny,Nx) 3D
-    D = length(spatial)
-    # Filters carry the trailing singleton so they broadcast over the batch axis; shaping them here
-    # keeps `reshape` (which allocates an array object) out of the cascade's inner loop.
-    pw = ST.Cascade.build(st.filter_bank, st.groups, spatial, T, st.pw.oversampling;
-                          alloc = rd -> _dzeros(b, Complex{T}, (rd..., B)),
-                          makeplan = rd -> ST.Plans.abstractffts_plan(
-                              _dzeros(b, Complex{T}, (rd..., B)); region = 1:D),
-                          shapefilter = f -> reshape(_to_device(b, f), (size(f)..., 1)))
-    rdims(l) = ntuple(d -> spatial[d] ÷ pw.resolutions[l][d], D)
-    rmod = [isempty(pw.spec[l]) ? _dzeros(b, T, ntuple(_ -> 0, D + 1)) :
-            _dzeros(b, T, (rdims(l)..., B)) for l in eachindex(pw.resolutions)]
-    invN = [T(1) / prod(rdims(l)) for l in eachindex(pw.resolutions)]
-    red = _dzeros(b, T, (ntuple(_ -> 1, D)..., B))
-    return ST.Batched.BatchWorkspace(pw, _dzeros(b, T, (spatial..., B)),
-                                     _dzeros(b, Complex{T}, (spatial..., B)), rmod, red,
-                                     reshape(red, B), invN,
-                                     ST.FilterBanks.nwavelets(st.filter_bank), st.groups,
-                                     st.filter_bank)
+    D = length(st.dims)                           # (N,) 1D, (Ny,Nx) 2D, (Nz,Ny,Nx) 3D
+    # Filters carry a trailing singleton so they broadcast over the batch axis.
+    return ST.Batched.build_workspace(st, B, T; zeros_like = (S, d) -> _dzeros(b, S, d),
+                                      makeplan = rd -> ST.Plans.abstractffts_plan(
+                                          _dzeros(b, Complex{T}, (rd..., B)); region = 1:D),
+                                      shapefilter = f -> reshape(_to_device(b, f), (size(f)..., 1)))
 end
 
 for (Mod, TT, CF, ND, dimarg) in (
@@ -230,19 +216,19 @@ for (Mod, TT, CF, ND, dimarg) in (
         (:Scattering2D, :ScatteringTransform2D, :_flen2d, 3, :(size(X, 3))),
         (:Scattering3D, :ScatteringTransform3D, :_flen3d, 4, :(size(X, 4))))
     @eval begin
-        function ST.scattering_batch(gpu::CB.GPUBackend, st::ST.$Mod.$TT,
-                                     X::AbstractArray{<:Any,$ND})
+        # A complex stack has complex columns, for its complex `S0`.
+        function ST._scattering_batch(gpu::CB.GPUBackend, st::ST.$Mod.$TT,
+                                      X::AbstractArray{<:Any,$ND})
             T = real(eltype(st.filter_bank.averaging))
-            out = _dzeros(gpu.backend, T, ($CF(st, T), $dimarg))
-            return ST.scattering_batch!(out, gpu, st, X)
+            out = _dzeros(gpu.backend, ST._flat_eltype(T, X), ($CF(st, T), $dimarg))
+            return ST._scattering_batch!(out, gpu, st, X)
         end
 
-        # `workspace` is annotated so the keyword is concretely typed: an unannotated keyword is
-        # `Any`, and the call then boxes it on every invocation.
-        function ST.scattering_batch!(out::AbstractMatrix, gpu::CB.GPUBackend, st::ST.$Mod.$TT,
-                                      X::AbstractArray{<:Any,$ND};
-                                      workspace::ST.Batched.BatchWorkspace =
-                                          gpu_batch_workspace(gpu, st, $dimarg))
+        # The annotation keeps the `workspace` keyword concretely typed, so the call does not box it.
+        function ST._scattering_batch!(out::AbstractMatrix, gpu::CB.GPUBackend, st::ST.$Mod.$TT,
+                                       X::AbstractArray{<:Any,$ND};
+                                       workspace::ST.Batched.BatchWorkspace =
+                                           gpu_batch_workspace(gpu, st, $dimarg))
             return ST.Batched.batch_cascade!(out, workspace, X)
         end
     end

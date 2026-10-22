@@ -1,12 +1,5 @@
 module Coefficients
 
-"""
-    Coefficients.jl — Generic scattering coefficient storage
-
-Parametric types support: Float32/Float64, CPU/GPU arrays, autodiff.
-Immutable structs - zero-allocation by reusing S1/S2 buffers.
-"""
-
 using LinearAlgebra: LinearAlgebra
 
 export ScatteringCoefficients1D, ScatteringCoefficients2D
@@ -16,15 +9,15 @@ export flat_length, flat_row_s0, flat_row_s1, flat_row_s2
 export update_S0
 
 # ============================================================================
-# 1D Scattering Coefficients — Fully Generic
+# 1D scattering coefficients
 # ============================================================================
 
 """
     ScatteringCoefficients1D{T,V,M,S0}
 
-Immutable container for 1D scattering coefficients.
-S0 can be scalar T (return new struct) or mutable container (update in place).
-Uses multiple dispatch for optimal S0 handling.
+Immutable container for 1D scattering coefficients. `S0` is either a scalar, which
+[`update_S0`](@ref) replaces by returning a new container, or a 1-element array, which it writes in
+place.
 
 # Type Parameters
 - `T`: Element type
@@ -47,7 +40,6 @@ struct ScatteringCoefficients1D{T,V<:AbstractVector{T},M<:AbstractMatrix{T},S0}
     end
 end
 
-# Convenience constructor for pre-allocation
 function ScatteringCoefficients1D(n::Int, ::Type{T}=Float64; 
                                     compute_S2::Bool=true) where T
     S1 = Vector{T}(undef, n)
@@ -58,9 +50,9 @@ end
 n_wavelets(c::ScatteringCoefficients1D) = c.n_wavelets
 
 """
-    zeroth_order(c) -> Real
+    zeroth_order(c) -> Number
 
-Extract the zeroth-order (average / S0) scattering coefficient.
+The zeroth-order coefficient `S0`, the field mean, which is complex for a complex field.
 """
 @inline zeroth_order(c::ScatteringCoefficients1D) = _extract_S0(c.S0)
 @inline _extract_S0(s0) = s0                    # scalar fallback
@@ -81,17 +73,16 @@ Extract the second-order (S2) scattering coefficients.
 @inline second_order(c::ScatteringCoefficients1D) = c.S2
 
 """
-    update_S0(c, val)
+    update_S0(c, val) -> c′
 
-Update the zeroth-order coefficient storage with `val` and return the coefficients.
+The coefficients `c` with `S0 = val`. A 1-element-array `S0` is written in place and `c` returned; a
+scalar `S0` gives a new container sharing `c`'s `S1` and `S2`.
 """
 function update_S0(c::ScatteringCoefficients1D{T,V,M,S0}, val) where {T,V,M,S0<:AbstractArray}
-    # Mutable container S0: update in place, return same struct (true zero alloc)
     c.S0[1] = val
     return c
 end
 
-# Scalar S0: return new wrapper (only allocates the small struct, not S1/S2)
 function update_S0(c::ScatteringCoefficients1D{T,V,M,S0}, val) where {T,V,M,S0}
     return ScatteringCoefficients1D(c.S1, c.S2; S0=val)
 end
@@ -105,9 +96,8 @@ end
 Row layout of the flattened coefficient vector `[S0; S1; vec(S2 upper triangle)]` for `n` wavelets,
 as produced by [`flatten1d!`](@ref)/[`flatten2d!`](@ref).
 
-The batched paths write straight into flattened columns rather than filling a coefficient container
-first, so they need the layout as arithmetic. Defining it here keeps the one definition that
-`flatten*!` also walks — a second copy elsewhere would silently drift.
+The batched paths write flattened columns through these accessors, so they must match the order the
+`flatten*!` loops write.
 """
 flat_length(n::Integer) = n * (n - 1) ÷ 2 + n + 1
 @inline flat_row_s0() = 1
@@ -135,10 +125,10 @@ Length of the flattened coefficient vector `[S0; S1; vec(S2 upper triangle)]`.
 flatten_length(c::ScatteringCoefficients1D) = flat_length(c.n_wavelets)
 
 """
-    flatten1d(coeffs::ScatteringCoefficients1D{T}) -> Vector{T}
+    flatten1d(coeffs::ScatteringCoefficients1D) -> AbstractVector
 
-Flatten to vector: [S0; S1; vec(S2 upper triangular)].
-Only includes unique S2 elements where j2 > j1 (saves ~50% space).
+Flatten to `[S0; S1; S2 upper triangle]`, keeping only the `S2` entries with `j2 > j1`, in an array
+of element type [`flat_eltype`](@ref).
 """
 function flatten1d(c::ScatteringCoefficients1D)
     return flatten1d!(similar(c.S1, flat_eltype(c), flatten_length(c)), c)
@@ -165,14 +155,14 @@ function flatten1d!(out::AbstractVector, c::ScatteringCoefficients1D)
 end
 
 # ============================================================================
-# 2D Scattering Coefficients — Fully Generic  
+# 2D scattering coefficients
 # ============================================================================
 
 """
     ScatteringCoefficients2D{T,V,M,S0}
 
-Immutable container for 2D planar scattering coefficients.
-S0 can be scalar T or mutable container - dispatch handles both optimally.
+Immutable container for scales × orientations scattering coefficients (2D, 3D and scattered planar).
+`S0` is a scalar or a 1-element array, as in [`ScatteringCoefficients1D`](@ref).
 """
 struct ScatteringCoefficients2D{T,V<:AbstractVector{T},M<:AbstractMatrix{T},S0}
     S0::S0
@@ -191,7 +181,6 @@ struct ScatteringCoefficients2D{T,V<:AbstractVector{T},M<:AbstractMatrix{T},S0}
     end
 end
 
-# Convenience constructor
 function ScatteringCoefficients2D(n_scales::Int, n_orientations::Int, ::Type{T}=Float64;
                                  compute_S2::Bool=true) where T
     n = n_scales * n_orientations
@@ -221,9 +210,9 @@ end
 flatten_length(c::ScatteringCoefficients2D) = flat_length(c.n_wavelets)
 
 """
-    flatten2d(coeffs::ScatteringCoefficients2D{T}) -> Vector{T}
+    flatten2d(coeffs::ScatteringCoefficients2D) -> AbstractVector
 
-Flatten to vector: [S0; S1; vec(S2 upper triangular)].
+Flatten to `[S0; S1; S2 upper triangle]`, as [`flatten1d`](@ref) does.
 """
 function flatten2d(c::ScatteringCoefficients2D)
     return flatten2d!(similar(c.S1, flat_eltype(c), flatten_length(c)), c)

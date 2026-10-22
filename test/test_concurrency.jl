@@ -62,12 +62,12 @@ Test.@testset "Every plan a batch builds for itself is closed" begin
     for (spectral, ntrans) in ((SpectralBackends.DirectSumSpectralBackend(), 1),
                                (FTB.FINUFFTBackend(), 2), (FTB.NonuniformFFTsBackend(), 2))
         st = ScatteringTransforms.scattered_planar_scattering(x, y, ms, J; L = 4,
-                 period = (2π, 2π), spectral = spectral, ntrans = ntrans)
+                 period = (2π, 2π), transform = spectral, ntrans = ntrans)
         stc = with_lifecycle(st)
         serial = ntrans == 1 ? ScatteringTransforms.scattering_batch(st, X) :
                  hcat(ScatteringTransforms.scattering_batch(st, X[:, 1:2]),
                       ScatteringTransforms.scattering_batch(st, X[:, 3:4]))
-        Test.@test ScatteringTransforms.scattering_batch(CBk.ThreadedBackend(), stc, X) ≈ serial
+        Test.@test ScatteringTransforms.scattering_batch(stc, X; execution = CBk.ThreadedBackend()) ≈ serial
         Test.@test stc.plan.built[] >= 1
         Test.@test stc.plan.closed[] == stc.plan.built[]
         ScatteringTransforms.close_transform!(st)
@@ -80,11 +80,11 @@ Test.@testset "Every plan a batch builds for itself is closed" begin
     for spectral in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
         for build in (ScatteringTransforms.spherical_scattering,
                       ScatteringTransforms.spherical_monogenic_scattering)
-            st = build(θ, φ, lmax, J; spectral = spectral)
+            st = build(θ, φ, lmax, J; transform = spectral)
             stc = with_lifecycle(st)
             serial = ScatteringTransforms.scattering_batch(st, F)
             for backend in (CBk.SerialBackend(), CBk.ThreadedBackend())
-                Test.@test ScatteringTransforms.scattering_batch(backend, stc, F) ≈ serial rtol = 1e-8
+                Test.@test ScatteringTransforms.scattering_batch(stc, F; execution = backend) ≈ serial rtol = 1e-8
             end
             Test.@test stc.plan.closed[] == stc.plan.built[]
             ScatteringTransforms.close_transform!(st)
@@ -123,15 +123,13 @@ Test.@testset "Concurrent plan construction" begin
             Test.@test concurrent[t].S1 ≈ serial[t].S1
             Test.@test concurrent[t].S2 ≈ serial[t].S2
         end
-        # And the calling thread's FastTransforms count is left as it was found.
+        # The calling thread's FastTransforms count is restored.
         Test.@test ft_count() == before
     end
 
     Test.@testset "one reused spherical plan applied concurrently matches the serial batch" begin
-        # One column per thread makes every chunk one wide, which is the width this plan already has,
-        # so the threaded batch asks for a plan of the width it is holding. Any wider and each task
-        # builds its own plan, where no sharing can occur — that sizing is what the earlier threaded
-        # tests use, and why they never saw this. (At one thread there is nothing to race either way.)
+        # One column per thread makes every chunk one wide, the width this plan already has, so the
+        # threaded batch asks for a plan of the width it is holding.
         lmax, J, M = 8, 3, 800
         B = max(2, Threads.nthreads())
         gr = (sqrt(5) - 1) / 2
@@ -141,11 +139,8 @@ Test.@testset "Concurrent plan construction" begin
         X = [cos(2 * θ[k]) + 0.4 * cos(3 * φ[k]) * sin(θ[k]) + 0.1 * b for k in 1:M, b in 1:B]
 
         Test.@test ScatteringTransforms.Plans.batch_width(st.plan) == st.plan.plan.B == 1
-        serial = ScatteringTransforms.scattering_batch(ComputationalBackends.SerialBackend(), st, X)
-        threaded = ScatteringTransforms.scattering_batch(ComputationalBackends.ThreadedBackend(), st, X)
-        # A raced solve diverges rather than erroring, so the comparison is against the serial values,
-        # not merely against `isfinite`.
-        Test.@test all(isfinite, threaded)
+        serial = ScatteringTransforms.scattering_batch(st, X; execution = ComputationalBackends.SerialBackend())
+        threaded = ScatteringTransforms.scattering_batch(st, X; execution = ComputationalBackends.ThreadedBackend())
         Test.@test threaded ≈ serial rtol = 1e-8
         # The plan handed to a task is never the shared one, whatever width is asked for.
         for k in (1, B)
@@ -174,7 +169,7 @@ Test.@testset "Concurrent plan construction" begin
 
     Test.@testset "concurrent scattered-planar builds match serial ones" begin
         # The NUFFT backends plan through the same libfftw3 as the spherical ones, so their builds
-        # take the same lock; a spherical build racing a planar one was the observed crash.
+        # take the same lock.
         Ny, Nx, J, L, M, ntask = 16, 16, 3, 4, 800, 4
         xs = [2π .* rand(M) for _ in 1:ntask]
         ys = [2π .* rand(M) for _ in 1:ntask]
@@ -184,7 +179,7 @@ Test.@testset "Concurrent plan construction" begin
             function transform_once(t)
                 st = ScatteringTransforms.scattered_planar_scattering(
                     xs[t], ys[t], (Ny, Nx), J; L = L, max_order = 2, period = (2π, 2π),
-                    spectral = spectral)
+                    transform = spectral)
                 try
                     return st(fields[t])
                 finally

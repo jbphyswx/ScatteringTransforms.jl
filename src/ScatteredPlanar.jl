@@ -1,22 +1,5 @@
 module ScatteredPlanar
 
-"""
-    ScatteredPlanar.jl — scattered / nonuniform planar scattering
-
-Scattering of a scalar field sampled at arbitrary points `(x, y)` on the plane. Analysis lifts the
-samples onto a uniform Fourier **mode grid** of size `ms` (a nonuniform DFT), where the oriented-Morlet
-wavelet bank lives; the wavelet multiply happens on that grid and synthesis evaluates the filtered
-field back at the points. The modulus + a (quadrature-weighted) spatial mean give the S0/S1/S2
-coefficients, mirroring the gridded `ScatteringTransform2D` cascade (same `build_filter_bank2d`, same
-`PathGraph` admissible-path tree, same `wavelet_convolve!` / `apply_modulus!`).
-
-The spectral plan is chosen by `spectral`: the in-core `SB.DirectSumSpectralBackend` (exact
-direct-summation NUDFT, no dependencies) is the always-available default;
-`FlowTransformBindings.NonuniformFFTsBackend()` or `FlowTransformBindings.FINUFFTBackend()` (or
-`SB.AutoSpectralBackend` once one of them is loaded) selects the fast path. Both satisfy the same `AbstractScatteringPlan` interface, so the cascade is identical
-either way.
-"""
-
 using ..Plans: Plans
 using SpectralBackends: SpectralBackends as SB
 using ..FilterBanks: FilterBanks
@@ -25,12 +8,16 @@ using ..Coefficients: Coefficients
 using ..ScatteringCore: ScatteringCore
 using LinearAlgebra: LinearAlgebra
 
-# Standalone scattered cascade (point-buffers ≠ mode-buffers). All array/container fields are type
-# parameters, matching `ScatteringTransform2D`'s style.
-# The point and mode buffers carry no fixed rank: a transform built with `ntrans = B` holds
-# `(M, B)` / `(ms…, B)` buffers and runs the whole stack through one execution per cascade step,
-# where a single-field one holds `(M)` / `(ms)`. The plan's batch width is fixed at construction,
-# so a transform is either single-field or batched.
+"""
+    ScatteredPlanarScattering{T,FB,Tree,G,P,WV,WB,CV,MM,RV}
+
+Scattering transform of a field sampled at scattered planar points, as built by
+`scattered_planar_scattering`: an oriented Morlet bank on the `ms` mode grid, the spectral plan
+between the points and that grid, and the buffers the cascade runs in.
+
+A transform built with `ntrans = B > 1` holds `(M, B)` and `(ms…, B)` buffers and transforms exactly
+`B` fields per call; a single-field one holds `(M)` and `(ms)` buffers.
+"""
 struct ScatteredPlanarScattering{T, FB, Tree, G<:AbstractVector, P, WV<:AbstractVector{T},
                                  WB<:AbstractVector, CV<:AbstractArray{Complex{T}},
                                  MM<:AbstractArray{Complex{T}}, RV<:AbstractArray{T}}
@@ -38,11 +25,10 @@ struct ScatteredPlanarScattering{T, FB, Tree, G<:AbstractVector, P, WV<:Abstract
     tree::Tree               # admissible scattering paths
     groups::G                # (j1, children, path ids) from the tree, longest-first
     max_order::Int
-    plan::P                  # scattered spectral plan (DirectNUFFTPlan or FINUFFT NUFFTScatteringPlan)
+    plan::P                  # scattered spectral plan: `DirectNUFFTPlan` or `NUFFTScatteringPlan`
     weights::WV              # (M) spatial-mean quadrature weights, summing to 1
-    # The bank's filters viewed as `(ms…, 1)` so they broadcast across a batch axis. These share the
-    # bank's memory — no filter is copied — and exist only so the batched cascade does not build a
-    # reshape per wavelet and per path on every call, which is pure allocation.
+    # The bank's filters viewed as `(ms…, 1)`, sharing its memory, so they broadcast across a batch
+    # axis.
     wav_b::WB
     X_modes::MM              # (ms) signal mode coefficients
     buf_modes::MM            # (ms) wavelet-multiply scratch
@@ -52,18 +38,15 @@ struct ScatteredPlanarScattering{T, FB, Tree, G<:AbstractVector, P, WV<:Abstract
     buf_u1_modes::MM         # (ms) its mode coefficients, reused across that j1's children
 end
 
-# A copy of `A` living wherever `ref` lives. `similar` is the only device hook the cascade needs:
-# it keeps this file free of any device package while still producing a device-resident transform
-# when the caller hands in device points.
+# A copy of `A` on the array type of `ref`.
 function _like(ref::AbstractArray, A::AbstractArray)
     d = similar(ref, eltype(A), size(A))
     copyto!(d, A)
     return d
 end
 
-# The bank, moved to wherever the points live. A computed bank moves only its low-pass and its one
-# scratch array — the wavelets are parameters, and are evaluated into that scratch on the device the
-# same way they are on the host.
+# The bank on the array type of the points. A computed bank moves only its low-pass and scratch; its
+# wavelets are parameters.
 _to_points(ref::AbstractArray, fb::FilterBanks.FilterBank2D) =
     FilterBanks.FilterBank2D([_like(ref, ψ) for ψ in fb.wavelets], _like(ref, fb.averaging),
                              fb.meta, fb.J, fb.L)
@@ -72,32 +55,30 @@ _to_points(ref::AbstractArray, fb::FilterBanks.ComputedFilterBank2D) =
                                      _like(ref, fb.scratch), fb.meta, fb.J, fb.L)
 
 function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, J::Int;
-               L::Int = 8, max_order::Int = 2,
-               spectral::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
-               period = nothing, solve::Bool = false, weights = nothing,
+               period, origin = (0, 0), L::Int = 8, max_order::Int = 2,
+               transform::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
+               solve::Bool = false, weights = nothing,
                eps = nothing, maxiter::Int = 100,
-               rtol::Real = Plans.default_solver_rtol(T, spectral, eps), damp::Real = 0,
+               rtol::Real = Plans.default_solver_rtol(T, transform, eps), damp::Real = 0,
                ntrans::Int = 1, nufft_nthreads::Int = 0, cache::Bool = true) where {T}
     M = length(x)
     cpu_fb = FilterBanks.build_filter_bank2d(T, ms, J, Val(cache); L = L)
-    # The transform lives wherever its points do. Every array is `similar` to `x`, so host points
-    # give a host transform and device points a device-resident one through the same code — there is
-    # no separate device constructor, and no device package is referenced here.
+    # Every array is `similar` to `x`, so device points give a device-resident transform.
     fb = _to_points(x, cpu_fb)
     tree = PathGraph.build_tree([m.j_eff for m in fb.meta], max_order)
-    plan = Plans.make_scattered_plan(spectral, x, y, ms, T;
-                                     period = period, solve = solve, maxiter = maxiter,
-                                     rtol = rtol, damp = damp, eps = eps, ntrans = ntrans,
-                                     nufft_nthreads = nufft_nthreads)
-    # The buffers must match what the plan will actually execute, which is its own width — a backend
-    # that cannot batch reports 1 regardless of what was asked for.
+    plan = Plans.make_scattered_plan(transform, x, y, ms, T;
+                                     period = period, origin = origin, solve = solve,
+                                     maxiter = maxiter, rtol = rtol, damp = damp, eps = eps,
+                                     ntrans = ntrans, nufft_nthreads = nufft_nthreads)
+    # Buffers follow the plan's own batch width; a backend that cannot batch reports 1 whatever
+    # `ntrans` asked for.
     B = Plans.batch_width(plan)
     w = _like(x, weights === nothing ? fill(one(T) / M, M) : T.(weights) ./ sum(weights))
     nw = FilterBanks.nwavelets(fb)
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
              [(j, Int[], Int[]) for j in 1:nw]
-    # One first-order field and one mode array, not `nw` of each: the cascade finishes every child of
-    # a wavelet before starting the next.
+    # One first-order field and one mode array suffice: the cascade finishes every child of a
+    # wavelet before starting the next.
     cpts() = B == 1 ? similar(x, Complex{T}, M) : similar(x, Complex{T}, M, B)
     rpts() = B == 1 ? similar(x, T, M) : similar(x, T, M, B)
     modes() = B == 1 ? similar(x, Complex{T}, ms) : similar(x, Complex{T}, (ms..., B))
@@ -112,15 +93,18 @@ end
 build(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, J::Int; kwargs...) =
     build(Float64, x, y, ms, J; kwargs...)
 
+Base.show(io::IO, st::ScatteredPlanarScattering{T}) where {T} =
+    print(io, "ScatteredPlanarScattering{", T, "}(M=", length(st.weights), ", ms=", size(st.X_modes)[1:2],
+          ", J=", st.filter_bank.J, ", L=", st.filter_bank.L, ", max_order=", st.max_order, ", ",
+          st.plan, ")")
+
 _wmean(st::ScatteredPlanarScattering, v::AbstractVector) = LinearAlgebra.dot(st.weights, v)
 
 # Shares the read-only bank, tree, work list and weights; copies only the buffers and the plan's
-# scratch. The filter bank and the plan's interpolation tables are the bulk of a scattered
-# transform, so a task pays `O(M + prod(ms))`, not the whole transform.
+# scratch.
 function ScatteringCore.task_workspace(st::ScatteredPlanarScattering)
     fb = FilterBanks.task_bank(st.filter_bank)
-    # A stored bank is shared and its batch views with it. A computed one hands the task its own
-    # scratch, so the views have to be rebuilt against that scratch rather than the original's.
+    # A computed bank gives the task its own scratch, so its batch views are rebuilt against it.
     ms = size(st.X_modes)[1:2]
     wav_b = fb === st.filter_bank ? st.wav_b : FilterBanks.batch_views(fb, ms)
     u1pts = similar(st.buf_u1_pts)   # shared with `buf_mod_pts`, as in the original
@@ -146,20 +130,18 @@ end
     scattered_planar_scattering!(coeffs, st, x) -> coeffs
 
 In-place counterpart of the callable: write into a preallocated `ScatteringCoefficients2D`.
-Allocation-free when `coeffs` carries a 1-element `S0` (so `update_S0` writes rather than rewraps).
+Allocation-free when `coeffs` carries a 1-element `S0`, which [`Coefficients.update_S0`](@ref)
+writes in place.
 """
 function scattered_planar_scattering!(coeffs::Coefficients.ScatteringCoefficients2D,
                                       st::ScatteredPlanarScattering, x::AbstractVector)
     fb, plan = st.filter_bank, st.plan
 
-    # The field goes to the plan as it is. Widening it to `Complex` here would hide from the transform
-    # the one thing it needs to pick an algorithm: a real field has a Hermitian spectrum and can be
-    # analysed on half the mode grid, a complex one cannot.
+    # `x` reaches the plan unconverted: a real field has a Hermitian spectrum, which a NUFFT plan
+    # analyses on half the mode grid.
     Plans.forward_transform!(st.X_modes, plan, x)                        # signal mode coeffs
 
-    # Both orders in one grouped pass, as in the gridded `cascade!`: each first-order field is
-    # synthesised once and reused by its children, rather than once for S1 and again for S2, and
-    # only one first-order field and one mode array are live at a time.
+    # Both orders in one grouped pass, as in the gridded `cascade!`.
     isempty(coeffs.S2) || fill!(coeffs.S2, zero(eltype(coeffs.S2)))
     @inbounds for (j1, children, _) in st.groups
         ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.X_modes, FilterBanks.filter_at(fb, j1),
@@ -190,9 +172,8 @@ _wmean_batch!(dst::AbstractVector, st::ScatteredPlanarScattering, V::AbstractMat
 Cascade over a stack of `B` fields sampled at the same points: `X` is `(M, B)`, `S0` is `(B)`, `S1`
 is `(nw, B)` and `S2` is `(nw, nw, B)`.
 
-Every transform covers the whole stack in one execution, so the cascade issues its
-`1 + nparents + nw + npaths` transforms once rather than once per field. `st` must have been built
-with a matching `ntrans`, since a guru plan's batch width is fixed when it is made.
+Each transform covers the whole stack in one execution; `st` must have been built with
+`ntrans = B`.
 """
 function scattered_planar_scattering_batch!(S0::AbstractVector, S1::AbstractMatrix,
                                             S2::AbstractArray{<:Any, 3},

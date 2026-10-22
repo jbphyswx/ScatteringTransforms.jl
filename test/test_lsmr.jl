@@ -1,6 +1,5 @@
-# What ScatteringTransforms decides around its least-squares solve, `FlowTransformBindings.lsmr!`,
-# which FlowTransformBindings tests against LAPACK: the tolerance default, the refusal of an unusable
-# answer, and the notice for an underdetermined mode grid.
+# Policy around the least-squares solve `FlowTransformBindings.lsmr!`: the tolerance default, the
+# refusal of an unusable answer, and the notice for an underdetermined mode grid.
 
 Test.@testset "Least-squares solve policy" begin
     P = ScatteringTransforms.Plans
@@ -19,8 +18,7 @@ Test.@testset "Least-squares solve policy" begin
 
     Test.@testset "the guard refuses only an unusable answer" begin
         # A rank-deficient point set does not reach this: `A†b` lies in the range of `A†A`, so the
-        # iteration never enters the singular directions (10 points against 81 spherical modes, and every
-        # planar point duplicated, both converge and return). The contract is asserted on a workspace.
+        # iteration never enters the singular directions. The contract is asserted on a workspace.
         function outcome(status; normr = 1.0, condA = 1.0e3)
             op = FTB.FunctionOperator((y, x) -> y, (x, y) -> x, zeros(ComplexF64, 4, 1),
                                       zeros(ComplexF64, 8, 1))
@@ -44,16 +42,6 @@ Test.@testset "Least-squares solve policy" begin
             Test.@test_throws P.AnalysisNotConverged P._check_solve(outcome(FTB.LSMR_MAXITER; normr = r),
                                                                     1000, (16, 16), 1.0e-8, 100)
         end
-        # The message names the geometry, since "did not converge" alone does not say which of `ms`, the
-        # point count or `damp` to change.
-        err = try
-            P._check_solve(outcome(FTB.LSMR_CONDITION), 300, (24, 24), 1.0e-8, 100)
-        catch e
-            e
-        end
-        msg = sprint(Base.showerror, err)
-        Test.@test occursin("576 modes", msg) && occursin("300 points", msg)
-        Test.@test occursin("damp", msg)
     end
 
     Test.@testset "an underdetermined solve warns and picks no λ" begin

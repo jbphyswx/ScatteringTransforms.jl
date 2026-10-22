@@ -1,20 +1,8 @@
 module ScatteringTransformsFastSphericalHarmonicsExt
 
-"""
-    ScatteringTransformsFastSphericalHarmonicsExt — structured-grid spherical scattering (fast SHT)
-
-The **structured (uniform)** spherical backend for the shared spherical scattering core
-(`SphericalCore`), alongside the scattered-point NUFSHT backend. A scalar field is sampled on the
-Clenshaw–Curtis grid of `FastSphericalHarmonics`
-(`Nθ = lmax+1`, `Nφ = 2lmax+1`) and analysed/synthesised with the fast `sph_transform!` /
-`sph_evaluate!`. The DoG band-pass bank, S0/S1/S2 cascade, and the monogenic amplitude are shared
-with `SphericalCore`; this extension supplies the plan and its interface methods.
-
-The spherical average (`sphere_mean`) is the exact quadrature integral, evaluated directly as a
-weighted sum over the grid. Reading it from the degree-0 harmonic coefficient instead would be
-equally exact but would cost a full forward SHT — and the cascade takes `J + J(J−1)/2 + 1` means
-per transform.
-"""
+# Structured-grid spherical plan on FastSphericalHarmonics: a field sampled on its `(lmax+1, 2lmax+1)`
+# midpoint grid is analysed and synthesised with `sph_transform!` / `sph_evaluate!`. `sphere_mean` is
+# the exact quadrature sum over the grid, which needs no forward SHT.
 
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using FlowTransformBindings: FlowTransformBindings as FTB
@@ -23,11 +11,12 @@ using SpectralBackends: SpectralBackends as SB
 using ScatteringTransforms: ScatteringTransforms as ST
 
 """
-    SHTSphericalPlan{T,V,M} <: SphericalCore.AbstractSphericalPlan
+    SHTSphericalPlan{T,V,M,C} <: SphericalCore.AbstractSphericalPlan
 
-Structured spherical plan on a Clenshaw–Curtis grid (`N = lmax+1` colatitudes, `2N-1` longitudes),
-backed by `FastSphericalHarmonics`. The forward SHT is exact for band-limited fields, so this backend
-needs no iterative solve. `FastSphericalHarmonics` supports `Float64` only, so `T == Float64`.
+Structured spherical plan on the equiangular midpoint grid (`N = lmax+1` colatitudes
+`θ_j = π(j-½)/N`, `2N-1` longitudes), backed by `FastSphericalHarmonics`. The forward SHT is exact
+for band-limited fields, so this backend needs no iterative solve. `FastSphericalHarmonics`
+supports `Float64` only, so `T == Float64`.
 
 `θweights` are the colatitude quadrature weights (Fejér first rule, summing to 2 as `∫sinθ dθ` does);
 `cbuf` is the coefficient scratch `sphere_apply!` filters in, so a band costs no allocation.
@@ -41,15 +30,11 @@ struct SHTSphericalPlan{T, V <: AbstractVector{T}, M <: AbstractMatrix{T}, C} <:
     cache::C               # FastSphericalHarmonics transform plans, built once (see below)
 end
 
-# `sph_transform!`/`sph_evaluate!` take the plan cache as a keyword argument whose default
-# constructs a *fresh, empty* cache — so calling them without one rebuilds both FastTransforms
-# plans on every single call, and the cascade calls them once per field plus once per band. Owning
-# the cache on our plan builds them once instead.
+# `sph_transform!`/`sph_evaluate!` build a fresh plan cache on every call unless given one, so the
+# plan owns a cache. FastTransforms plans on FFTW.jl's process-global libfftw3 planner, so every
+# cache, the per-task copies built inside spawned tasks included, is populated under FFTW.jl's
+# planner lock at one planner thread (`Plans.with_fft_nthreads`).
 #
-# FastTransforms builds those plans on the libfftw3 FFTW.jl loads, whose planner is process-global, so
-# every cache is populated under FFTW.jl's planner lock at one planner thread, `Plans.with_fft_nthreads`
-# — including the per-task copies below, which are built inside spawned tasks.
-
 # Every FastTransforms call goes through `FTB.with_fasttransforms_threads`, which sets the OpenMP count
 # on the OS thread making the call and restores it after.
 function _warmed_cache(nθ::Int, nφ::Int)
@@ -73,24 +58,21 @@ end
 Base.show(io::IO, p::SHTSphericalPlan{T}) where {T} =
     print(io, "SHTSphericalPlan{", T, "}(lmax=", p.lmax, ")")
 
-# `cbuf` is mutated per band and the cached plans hold their own scratch, so a task needs both.
-# A structured plan is defined by its band limit alone, so it carries no points to rebuild from and
-# its quadrature follows from the grid. Analysis is an exact transform, not an iterative solve.
+# A structured plan is defined by its band limit: it has no points, its quadrature follows from the
+# grid, and its analysis is an exact transform with no solver settings.
 ST.SphericalCore.plan_points(::SHTSphericalPlan) = nothing
 ST.SphericalCore.plan_weights(::SHTSphericalPlan) = nothing
 ST.SphericalCore.plan_solver(::SHTSphericalPlan) = nothing
 ST.Plans.spectral_backend(::SHTSphericalPlan) = SB.FSHTSpectralBackend()
 
+# `cbuf` is mutated per band and the cached plans hold their own scratch, so a task needs both.
 ST.Plans.task_local_plan(p::SHTSphericalPlan) =
     SHTSphericalPlan(p.lmax, p.inv_sqrt4pi, p.θweights, p.invnφ, similar(p.cbuf),
                      _warmed_cache(size(p.cbuf)...))
 
-# Multiply each spherical-harmonic coefficient of degree ℓ by h(ℓ), in place.
-#
-# Indexed by position rather than by `sph_mode(l, m)` over `l ≤ lmax`: an `(nθ, nφ)` matrix holds
-# `nθ·nφ` coefficients, of which only `nθ²` have `|m| ≤ l ≤ nθ-1`, so a loop bounded by the plan's
-# band limit leaves the rest unmultiplied and they pass into the synthesis unfiltered. Column `c`
-# carries `|m| = c ÷ 2` and row `r` carries `l - |m|`, which gives every entry its degree.
+# Multiply every coefficient of degree ℓ by h(ℓ), in place. Column `c` carries `|m| = c ÷ 2` and row
+# `r` carries `l - |m|`; the `(nθ, nφ)` matrix also holds degrees above `nθ-1` at high `|m|`, and
+# those are multiplied too.
 function _apply_degree_multiplier!(C::AbstractMatrix, h)
     nθ, nφ = size(C)
     @inbounds for c in 1:nφ
@@ -120,13 +102,9 @@ ST.SphericalCore.sphere_coeffs_buffer(plan::SHTSphericalPlan) =
 # A structured plan is defined by its band limit alone, so narrowing is just building a smaller one.
 ST.SphericalCore.sphere_plan_at(::SHTSphericalPlan, lmax::Integer) = SHTSphericalPlan(Int(lmax))
 
-# A coefficient's position encodes `(l, m)` the same way at every grid size — the column carries `m`
-# and the row carries `l - |m|` — so the coefficients a narrower grid can represent are exactly the
-# leading sub-block, and restriction is that copy.
-#
-# Not a per-`sph_mode` loop over `l ≤ lmax`: this layout also carries degrees above `nθ-1` at high
-# `|m|` (an `(nθ, nφ)` matrix holds `nθ·nφ` coefficients, not `(nθ)²`), so a loop bounded by the
-# plan's `lmax` would silently drop them.
+# A coefficient's position encodes `(l, m)` the same way at every grid size (column `m`, row
+# `l - |m|`), so the coefficients a narrower grid represents are its leading sub-block, degrees above
+# `nθ-1` at high `|m|` included.
 function ST.SphericalCore.sphere_restrict!(Cd::AbstractMatrix, ::SHTSphericalPlan,
                                            Cs::AbstractMatrix, ::SHTSphericalPlan)
     nθ, nφ = size(Cd)
@@ -153,8 +131,8 @@ ST.SphericalCore.sphere_riesz_energy!(out::AbstractMatrix, plan::SHTSphericalPla
     ST.SphericalCore.sph_layout_riesz_energy!(out, plan, C, h, plan.lmax, scr)
 
 # ⟨f⟩ = (1/4π)∬ f sinθ dθ dφ. Longitude is uniform, so its integral is the plain row mean; colatitude
-# uses the Fejér weights, which integrate ∫₀^π g sinθ dθ exactly for band-limited `g` and sum to 2 —
-# hence the trailing ½. Equal to the degree-0 coefficient route, without its forward SHT.
+# uses the Fejér weights, which integrate ∫₀^π g sinθ dθ exactly for band-limited `g` and sum to 2,
+# hence the trailing ½.
 function ST.SphericalCore.sphere_mean(plan::SHTSphericalPlan{T}, field::AbstractMatrix) where {T}
     nθ, nφ = size(field)
     acc = zero(T)
@@ -165,10 +143,8 @@ function ST.SphericalCore.sphere_mean(plan::SHTSphericalPlan{T}, field::Abstract
 end
 
 # ---------------------------------------------------------------------------
-# Fast-path structured plan constructor (structured-sphere seam declared in SphericalCore). The core
-# `structured_spherical_scattering` / `structured_spherical_monogenic_scattering` build this when
-# `spectral` selects the fast SHT. The grid (`structured_sphere_points`) is computed in core and
-# matches `FSH.sph_points`, so a field sampled there is valid input to this plan.
+# The structured plan `SphericalCore.make_structured_plan` builds for `FSHTSpectralBackend`. Fields
+# sampled at `structured_sphere_points` are valid input.
 # ---------------------------------------------------------------------------
 
 function ST.SphericalCore.fsh_structured_plan(lmax::Int, ::Type{T}) where {T}

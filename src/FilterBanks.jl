@@ -1,15 +1,6 @@
 module FilterBanks
 
-"""
-    FilterBanks.jl — Construct dyadic filter banks for scattering transforms
-
-Creates complete filter bank structures with wavelets at multiple scales
-and orientations (for 2D), plus averaging (scaling) filters.
-"""
-
 using LinearAlgebra: LinearAlgebra
-
-# Import Filters submodule
 using ..Filters: Filters
 
 export FilterBank1D, FilterBank2D, FilterBank3D
@@ -175,18 +166,17 @@ negated(A::AbstractArray) = circshift(reverse(A), ntuple(_ -> 1, ndims(A)))
 """
     WaveletMeta{T}
 
-Concrete per-wavelet metadata: a struct rather than a `NamedTuple`, so the container stays
-concretely typed.
+Per-wavelet metadata.
 
 # Fields
 - `scale::Int`: octave index `j`
-- `q::Int`: sub-octave index within the octave (1D, `0..Q-1`); `0` for 2D
-- `orient::Int`: orientation index `l` (2D, `0..L-1`); `0` for 1D
-- `j_eff::T`: effective log-scale used to order paths. `j + q/Q` in 1D, `T(j)` in 2D. The
-  second-order admissibility constraint is `j_eff(child) > j_eff(parent)` (frequency strictly
-  decreasing) — which for 2D means *scale strictly increasing over all orientation pairs*.
+- `q::Int`: sub-octave index within the octave (1D, `0..Q-1`); `0` otherwise
+- `orient::Int`: orientation index (`0..L-1` in 2D, `0..n_orient-1` in 3D); `0` in 1D
+- `j_eff::T`: effective log-scale that orders paths, `j + q/Q` in 1D and `T(j)` in 2D and 3D. A
+  second-order path is admissible iff `j_eff(child) > j_eff(parent)`, which in 2D and 3D admits
+  every orientation pair at a strictly coarser scale.
 - `center_freq::T`: wavelet center frequency
-- `theta::T`: orientation angle in radians (2D); `0` for 1D
+- `theta::T`: orientation angle in radians (2D); `0` otherwise
 """
 struct WaveletMeta{T}
     scale::Int
@@ -200,9 +190,8 @@ end
 """
     FilterBank1D{T,V,W,MV}
 
-Complete 1D filter bank for the scattering transform. Every container is a type parameter (no
-hardcoded `Vector`): `V` the per-filter array type (CPU/GPU/static/…), `W` the wavelet
-collection, `MV` the metadata collection.
+Complete 1D filter bank for the scattering transform. `V` is the per-filter array type, `W` the
+wavelet collection and `MV` the metadata collection.
 
 # Fields
 - `wavelets::W`: wavelet filters in the Fourier domain (`W<:AbstractVector{V}`)
@@ -220,9 +209,10 @@ struct FilterBank1D{T, V<:AbstractVector{T}, W<:AbstractVector{V}, MV<:AbstractV
 end
 
 """
-    build_filter_bank1d(N::Int, J::Int; Q::Int=1) -> FilterBank1D
+    build_filter_bank1d([T = Float64,] N, J; Q = 1) -> FilterBank1D
 
-Build a 1D Morlet filter bank with dyadic scales.
+Build a 1D Morlet filter bank with dyadic scales, Littlewood–Paley normalized by
+[`lp_scale_1d`](@ref).
 
 # Arguments
 - `N::Int`: Signal length (FFT size)
@@ -262,9 +252,8 @@ build_filter_bank1d(N::Int, J::Int; kwargs...) = build_filter_bank1d(Float64, N,
 """
     FilterBank2D{T,M,W,MV}
 
-Complete 2D filter bank with oriented wavelets. Containers are type parameters (no hardcoded
-`Vector`): `M` the per-filter matrix type, `W` the wavelet collection, `MV` the metadata
-collection.
+Complete 2D filter bank with oriented wavelets. `M` is the per-filter matrix type, `W` the wavelet
+collection and `MV` the metadata collection.
 
 # Fields
 - `wavelets::W`: oriented wavelet filters (`W<:AbstractVector{M}`)
@@ -282,9 +271,9 @@ struct FilterBank2D{T, M<:AbstractMatrix{T}, W<:AbstractVector{M}, MV<:AbstractV
 end
 
 """
-    build_filter_bank2d(N::NTuple{2,Int}, J::Int; L::Int=8) -> FilterBank2D
+    build_filter_bank2d([T = Float64,] N, J; L = 8) -> FilterBank2D
 
-Build a 2D oriented Morlet filter bank.
+Build a 2D oriented Morlet filter bank, Littlewood–Paley normalized by [`lp_scale_2d`](@ref).
 
 # Arguments
 - `N::NTuple{2,Int}`: Image dimensions (Ny, Nx)
@@ -311,8 +300,8 @@ function build_filter_bank2d(::Type{T}, N::NTuple{2,Int}, J::Int; L::Int=8) wher
             ψ = Filters.frequency_response(morlet)
 
             push!(wavelets, ψ)
-            # j_eff = T(j): same-scale (different-orientation) pairs share j_eff and are therefore
-            # NOT admissible as second-order paths; only strictly coarser scales are.
+            # Same-scale pairs share `j_eff = j`, so a second-order path needs a strictly coarser
+            # scale.
             push!(meta, WaveletMeta{T}(j, 0, l, T(j), morlet.center_freq, theta))
         end
     end
@@ -324,22 +313,14 @@ end
 build_filter_bank2d(N::NTuple{2,Int}, J::Int; kwargs...) = build_filter_bank2d(Float64, N, J; kwargs...)
 
 """
-    ComputedFilterBank2D{T,M,MV}
+    ComputedFilterBank2D{T,M,MV,WV}
 
-A 2D bank that keeps its wavelets' *parameters* rather than their samples, and evaluates one into a
-single scratch array when it is asked for.
+A 2D bank that stores its wavelets' parameters and evaluates one, scaled by the Littlewood–Paley
+constant, into a single scratch array on each [`filter_at`](@ref) call.
 
-A bank of `J·L` wavelets is `J·L+1` arrays of the grid's size, and it is the largest object in a
-transform: 1056 MiB at `2048², J=4, L=8, Float64`, against 320 MiB for the whole cascade's working
-set. Evaluating instead of storing takes that to two arrays — the low-pass and the scratch — at the
-cost of two `exp` per grid point per application, measured 3.2x (N=1024) to 3.8x (N=2048) on the
-multiply, which is 9-14% of a cascade's time.
-
-The low-pass is stored, and each wavelet is scaled by the Littlewood–Paley constant as it is
-materialised.
-
-The scratch is mutable state, so unlike a stored bank this one cannot be shared between tasks —
-[`task_bank`](@ref) gives a task its own, which is one array rather than `J·L`.
+It holds two grid-sized arrays, the low-pass and the scratch, against `J·L+1` for a stored bank,
+and costs two `exp` per grid point per application. The scratch is mutable, so tasks cannot share
+one bank; [`task_bank`](@ref) gives each its own scratch.
 """
 struct ComputedFilterBank2D{T, M<:AbstractMatrix{T}, MV<:AbstractVector{WaveletMeta{T}},
                             WV<:AbstractVector{Filters.Morlet2D{T}}}
@@ -354,10 +335,10 @@ end
 
 
 """
-    build_filter_bank2d(T, N, J; L=8, cache=true)
+    build_filter_bank2d(T, N, J, ::Val{cache}; L = 8)
 
-`cache=false` returns a [`ComputedFilterBank2D`](@ref), which evaluates each wavelet on demand
-instead of holding the whole bank. Slower per multiply, and the only way a large grid fits.
+`Val(false)` returns a [`ComputedFilterBank2D`](@ref), which evaluates each wavelet on demand, for
+grids whose stored bank does not fit in memory; `Val(true)` returns the stored bank.
 """
 function build_filter_bank2d(::Type{T}, N::NTuple{2, Int}, J::Int, ::Val{false};
                              L::Int = 8) where {T <: Real}
@@ -371,11 +352,10 @@ build_filter_bank2d(::Type{T}, N::NTuple{2, Int}, J::Int, ::Val{true}; L::Int = 
     build_filter_bank2d(T, N, J; L = L)
 
 """
-    ComputedFilterBank1D{T,V,MV}
-    ComputedFilterBank3D{T,A,MV}
+    ComputedFilterBank1D{T,V,MV,WV}
+    ComputedFilterBank3D{T,A,MV,WV}
 
-The 1D and 3D counterparts of [`ComputedFilterBank2D`](@ref); the saving grows with dimension,
-since the bank is `J·n_orient+1` arrays of the grid either way.
+The 1D and 3D counterparts of [`ComputedFilterBank2D`](@ref).
 """
 struct ComputedFilterBank1D{T, V <: AbstractVector{T}, MV <: AbstractVector{WaveletMeta{T}},
                             WV <: AbstractVector{Filters.Morlet1D{T}}}
@@ -400,10 +380,11 @@ struct ComputedFilterBank3D{T, A <: AbstractArray{T, 3}, MV <: AbstractVector{Wa
 end
 
 """
-    build_filter_bank1d(T, N, J; Q=1, cache=true)
-    build_filter_bank3d(T, N, J; n_orient=6, cache=true)
+    build_filter_bank1d(T, N, J, ::Val{cache}; Q = 1)
+    build_filter_bank3d(T, N, J, ::Val{cache}; n_orient = 6)
 
-`cache=false` evaluates each wavelet on demand instead of storing the bank.
+`Val(false)` returns a computed bank, which evaluates each wavelet on demand; `Val(true)` returns
+the stored bank.
 """
 function build_filter_bank1d(::Type{T}, N::Int, J::Int, ::Val{false}; Q::Int = 1) where {T <: Real}
     morlets = [Filters.Morlet1D{T}(N, j * Q + q; Q = Q) for j in 0:(J - 1) for q in 0:(Q - 1)]
@@ -429,10 +410,11 @@ build_filter_bank3d(::Type{T}, N::NTuple{3, Int}, J::Int, ::Val{true};
     build_filter_bank3d(T, N, J; n_orient = n_orient)
 
 """
-    FilterBank3D{T,A<:AbstractArray{Complex{T},3}}
+    FilterBank3D{T,A,W,MV}
 
 Complete 3D oriented Morlet filter bank: `J` scales × `n_orient` sphere directions, plus a
-low-pass averaging filter.
+low-pass averaging filter. `A` is the per-filter array type, `W` the wavelet collection and `MV`
+the metadata collection.
 """
 struct FilterBank3D{T, A<:AbstractArray{T,3}, W<:AbstractVector{A}, MV<:AbstractVector{WaveletMeta{T}}}
     wavelets::W
@@ -443,10 +425,11 @@ struct FilterBank3D{T, A<:AbstractArray{T,3}, W<:AbstractVector{A}, MV<:Abstract
 end
 
 """
-    build_filter_bank3d(N::NTuple{3,Int}, J::Int; n_orient::Int=6, T=Float64) -> FilterBank3D
+    build_filter_bank3d([T = Float64,] N, J; n_orient = 6) -> FilterBank3D
 
 Build a 3D oriented Morlet filter bank with `J` dyadic scales and `n_orient` near-uniform
-orientations on the sphere (Fibonacci spiral).
+orientations on the sphere (Fibonacci spiral), Littlewood–Paley normalized by
+[`lp_scale_3d`](@ref).
 """
 function build_filter_bank3d(::Type{T}, N::NTuple{3,Int}, J::Int; n_orient::Int=6) where {T<:Real}
     dirs = Filters.fibonacci_directions(n_orient, T)
@@ -470,7 +453,7 @@ end
 build_filter_bank3d(N::NTuple{3,Int}, J::Int; kwargs...) = build_filter_bank3d(Float64, N, J; kwargs...)
 
 # ---------------------------------------------------------------------------
-# Bank accessors, defined here because they dispatch on all three stored banks
+# Bank accessors
 # ---------------------------------------------------------------------------
 
 const StoredBank = Union{FilterBank1D, FilterBank2D, FilterBank3D}
@@ -487,11 +470,8 @@ nwavelets(fb::ComputedBank) = length(fb.morlets)
 """
     filter_at(fb, j) -> AbstractArray
 
-The bank's `j`-th wavelet in the Fourier domain.
-
-For a stored bank this is an index. For a computed one it writes into shared scratch, so the result
-is valid only until the next call — every cascade here finishes one filter's multiply before asking
-for the next.
+The bank's `j`-th wavelet in the Fourier domain. For a computed bank this is its shared scratch,
+valid until the next call.
 """
 @inline filter_at(fb::StoredBank, j::Integer) = fb.wavelets[j]
 function filter_at(fb::ComputedBank, j::Integer)
@@ -503,8 +483,8 @@ end
 """
     iscomputed(fb) -> Bool
 
-Whether [`filter_at`](@ref) returns shared scratch rather than a stored array. A caller that needs
-two filters live at once, or a filter at a resolution the bank does not hold, must materialise.
+Whether [`filter_at`](@ref) returns the bank's shared scratch. A caller that then needs two filters
+live at once, or a filter at a resolution the bank does not hold, must copy it.
 """
 iscomputed(::StoredBank) = false
 iscomputed(::ComputedBank) = true
@@ -529,12 +509,10 @@ task_bank(fb::ComputedFilterBank3D) =
 """
     batch_views(fb, spatial) -> Vector
 
-The bank's filters reshaped to `(spatial…, 1)` so they broadcast over a batch axis, built once so
-the batched cascade never reshapes in its inner loop.
+The bank's filters reshaped to `(spatial…, 1)`, so they broadcast over a batch axis.
 
-A computed bank returns the same view `nwavelets` times — one view of the one scratch array. That
-is only sound because [`filter_at`](@ref) refills the scratch immediately before each use, which is
-what `Cascade._filter` does.
+For a computed bank every entry is the same view of its scratch, so a caller must call
+[`filter_at`](@ref)`(fb, j)` immediately before using entry `j`.
 """
 batch_views(fb::StoredBank, spatial::Tuple) =
     [reshape(ψ, (spatial..., 1)) for ψ in fb.wavelets]

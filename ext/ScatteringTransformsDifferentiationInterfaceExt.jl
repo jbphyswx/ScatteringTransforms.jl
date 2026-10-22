@@ -1,20 +1,5 @@
 module ScatteringTransformsDifferentiationInterfaceExt
 
-"""
-    ScatteringTransformsDifferentiationInterfaceExt — gradient-descent synthesis
-
-Provides [`ScatteringTransforms.synthesize`](@ref): reconstruct a field whose scattering
-coefficients match a target by minimizing `loss(scattering(st, x̂), target)` with Adam, the
-gradient supplied through DifferentiationInterface (DI). DI is backend-agnostic, so any `ADTypes`
-backend works — `AutoMooncake()`, `AutoEnzyme()`, `AutoZygote()`, … — the user picks one and
-loads the corresponding AD package.
-
-The differentiable forward is the non-mutating `ScatteringTransforms.ScatteringCore.scattering(st, x)`: with the
-in-core direct-sum spectral backend it is plain matmul/broadcast (differentiable by every
-backend); with the FFTW fast path it differentiates via `AbstractFFTs` ChainRules (Mooncake /
-Zygote). For reverse-mode synthesis the direct-sum backend is the most portable default.
-"""
-
 using DifferentiationInterface: DifferentiationInterface as DI
 using ScatteringTransforms: ScatteringTransforms
 
@@ -27,15 +12,12 @@ const _Gridded = Union{ScatteringTransforms.Scattering1D.ScatteringTransform1D,
 _target_coeffs(st, target::AbstractArray) = ScatteringTransforms.ScatteringCore.scattering(st, target)
 _target_coeffs(::Any, target) = target
 
-# Spatial shape of the transform input (the real modulus workspace carries it).
+# Spatial shape of the transform input.
 _field_shape(st) = st.dims
 
-# The differentiated function takes the transform, the target and the loss as arguments instead of
-# capturing them, so that they can be declared `DI.Constant` below. A closure over the transform is a
-# struct holding its filter bank and plan tables, and reverse mode cannot prove such an argument
-# read-only: Enzyme rejects it with `EnzymeMutabilityException` unless the caller thought to pass
-# `AutoEnzyme(; function_annotation = Enzyme.Const)`. Declared constants make the differentiated
-# function captureless, so the backend needs no special configuration to see that only `z` is active.
+# The transform, target and loss are arguments, declared `DI.Constant` below, so the differentiated
+# function captures nothing and only `z` is active; Enzyme rejects a closure over the transform with
+# `EnzymeMutabilityException`.
 _objective(z, st, tc, loss) = loss(ScatteringTransforms.ScatteringCore.scattering(st, z), tc)
 
 function ScatteringTransforms.synthesize(st::_Gridded, target;

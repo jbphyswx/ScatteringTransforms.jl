@@ -26,7 +26,7 @@ println("="^64)
 println("\n1. Scattered-planar scattering (NUFFT)")
 Ny, Nx, J, L = 24, 24, 3, 4
 f = randn(Ny, Nx)
-grid = ST.Scattering2D.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2, spectral=SB.FFTSpectralBackend())
+grid = ST.Scattering2D.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2, transform=SB.FFTSpectralBackend())
 n1 = vec([Float64(i) for i in 0:Ny-1, j in 0:Nx-1])
 n2 = vec([Float64(j) for i in 0:Ny-1, j in 0:Nx-1])
 sca = ST.scattered_planar_scattering(n1, n2, (Ny, Nx), J; L=L, max_order=2, period=(Ny, Nx))

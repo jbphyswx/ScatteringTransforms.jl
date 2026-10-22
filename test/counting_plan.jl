@@ -1,23 +1,11 @@
-# Count spectral-plan executions instead of timing them.
-#
-# A scattering transform's cost is dominated by how many forward/inverse spectral transforms its
-# cascade issues, so a complexity claim ("the second order no longer recomputes the first order")
-# is asserted exactly by counting those calls. Counting is deterministic and instant, which is why
-# it belongs in the test suite where a wall-clock assertion would be GC- and load-flaky.
-#
-# `CountingPlan` is immutable like every other plan in the package; only its two counters are
-# `Ref`s, since the tallies are the sole mutable state.
+# Counts spectral-plan executions. A scattering transform's cost is dominated by how many
+# forward/inverse spectral transforms its cascade issues.
 
 """
     CountingPlan(inner)
 
-Pass-through spectral plan that tallies `forward`/`inverse` executions of `inner`, and the
-butterflies those executions cost.
-
-An execution *count* is invariant to decimation — the periodized cascade issues exactly the same
-number of transforms as the undecimated one, just at smaller sizes — so counting calls alone cannot
-tell whether the cascade got cheaper. `work` tallies `n·⌈log₂n⌉` per execution, which is what
-actually shrinks, and is as deterministic as the call count.
+Pass-through spectral plan that tallies `forward`/`inverse` executions of `inner`, and in `work` the
+`n·⌈log₂n⌉` butterflies of each execution.
 """
 struct CountingPlan{P <: ScatteringTransforms.Plans.AbstractScatteringPlan,
                     R <: Base.RefValue{Int}} <: ScatteringTransforms.Plans.AbstractScatteringPlan
@@ -57,11 +45,11 @@ function ScatteringTransforms.Plans.inverse_transform(p::CountingPlan, x)
 end
 ScatteringTransforms.Plans.spectral_backend(p::CountingPlan) =
     ScatteringTransforms.Plans.spectral_backend(p.inner)
-# Must pass through: the cascade workspace aliases each resolution's inverse destination onto its
-# source based on this, and it decided that before being instrumented.
+# The cascade workspace aliases each resolution's inverse destination onto its source according to
+# the inner plan, before instrumentation.
 ScatteringTransforms.Plans.inplace_inverse(p::CountingPlan) =
     ScatteringTransforms.Plans.inplace_inverse(p.inner)
-# Tasks share the counters deliberately, so a threaded run reports the whole cascade's total.
+# Task-local copies share the counters, so a threaded run reports the whole cascade's total.
 ScatteringTransforms.Plans.task_local_plan(p::CountingPlan) =
     CountingPlan(ScatteringTransforms.Plans.task_local_plan(p.inner), p.forward, p.inverse, p.work)
 
@@ -70,13 +58,9 @@ reset_counts!(p::CountingPlan) = (p.forward[] = 0; p.inverse[] = 0; p.work[] = 0
 """
     with_counting_plan(st) -> (st′, plans)
 
-A copy of transform `st` with every spectral plan wrapped in a [`CountingPlan`](@ref) sharing one
-set of counters, plus one of those plans. Every other field — filter bank, tree, workspace buffers —
-is shared with `st`, so the copy costs nothing and runs the identical cascade.
-
-Wrapping the cascade workspace's plans and not just `st.plan` is the whole point: the cascade runs
-almost entirely through the per-resolution plans, so instrumenting `st.plan` alone tallies the
-input's forward transform and nothing else.
+A copy of transform `st` with `st.plan` and every per-resolution plan of the cascade workspace
+`st.pw` wrapped in a [`CountingPlan`](@ref) sharing one set of counters, plus one of those plans.
+Every other field is shared with `st`, so the copy runs the identical cascade.
 """
 function with_counting_plan(st)
     T = typeof(st)

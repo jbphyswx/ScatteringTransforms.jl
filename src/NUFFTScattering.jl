@@ -18,12 +18,13 @@
 
 Scattered-planar plan over FlowTransformBindings NUFFT plans on fixed points: a complex plan for
 synthesis and for complex samples, and a real plan for real samples and the real solve. `B` is the
-number of co-located fields each execution transforms.
+number of co-located fields each execution transforms, and `transform` the NUFFT library tag the
+plans run on.
 """
 struct NUFFTScatteringPlan{T, B, L, PC, PR, CV <: AbstractArray{Complex{T}}, HX <: AbstractArray{Complex{T}},
                            PT <: AbstractArray{T}, RV <: AbstractVector{T}, IV <: AbstractVector{Int},
                            DC <: AbstractArray{Complex{T}}, RS, CS} <: AbstractScatteringPlan
-    backend::L
+    transform::L
     cplan::PC
     rplan::PR
     ms::NTuple{2, Int}
@@ -32,7 +33,7 @@ struct NUFFTScatteringPlan{T, B, L, PC, PR, CV <: AbstractArray{Complex{T}}, HX 
     solve::Bool
     maxiter::Int
     rtol::T
-    damp::T                 # Tikhonov λ; 0 unless the mode grid is over-specified
+    damp::T                 # Tikhonov λ
     sx::RV                  # (M) points on the 2π-periodic domain, kept so a task can build its own
     sy::RV
     eps::T
@@ -59,25 +60,20 @@ function _like_ints(ref::AbstractArray, v::Vector{Int})
 end
 
 """
-    nufft_scattered_plan(backend, x, y, ms, T; period, solve, maxiter, rtol, damp, eps, ntrans,
-                         nufft_nthreads) -> NUFFTScatteringPlan
+    nufft_scattered_plan(backend, x, y, ms, T; period, origin = (0, 0), solve, maxiter, rtol, damp,
+                         eps, ntrans, nufft_nthreads) -> NUFFTScatteringPlan
 
 The scattered-planar plan over points `(x, y)` and mode grid `ms` on a FlowTransformBindings NUFFT
-`backend`. `nufft_nthreads = 0` takes the session's `Threads.nthreads()`.
+`backend`, on a domain of length `period` with lower corner `origin` (see
+[`make_scattered_plan`](@ref)). `nufft_nthreads = 0` takes the session's `Threads.nthreads()`.
 """
 function nufft_scattered_plan(backend::SB.AbstractNUFFTSpectralBackend, x, y, ms::NTuple{2, Int}, ::Type{T};
-                              period = nothing, solve::Bool = false, maxiter::Int = 100, eps = nothing,
-                              rtol::Real = default_solver_rtol(T, backend, eps), damp::Real = 0,
-                              ntrans::Int = 1, nufft_nthreads::Int = 0) where {T}
+                              period, origin = (0, 0), solve::Bool = false, maxiter::Int = 100,
+                              eps = nothing, rtol::Real = default_solver_rtol(T, backend, eps),
+                              damp::Real = 0, ntrans::Int = 1, nufft_nthreads::Int = 0) where {T}
     M = length(x)
-    length(y) == M || throw(DimensionMismatch("x and y must have equal length"))
+    sx, sy = _folded_points(x, y, period, origin, T)
     warn_underdetermined(M, ms, solve, damp)
-    xmin, ymin = T(minimum(x)), T(minimum(y))
-    # Default period so a uniform 0:m-1 grid (span m-1) maps to the exact DFT nodes 2π·(0:m-1)/m.
-    px = period === nothing ? (T(maximum(x)) - xmin) * ms[1] / (ms[1] - 1) : T(period[1])
-    py = period === nothing ? (T(maximum(y)) - ymin) * ms[2] / (ms[2] - 1) : T(period[2])
-    sx = T(2π) .* (T.(x) .- xmin) ./ px
-    sy = T(2π) .* (T.(y) .- ymin) ./ py
     tol = eps === nothing ? FTB.default_tolerance(T) : T(eps)
     return _nufft_plan_at(backend, ms, M, sx, sy, T(tol), T, solve, maxiter, T(rtol), ntrans, nufft_nthreads, T(damp))
 end
@@ -136,11 +132,11 @@ function FTB.lsmr_adjoint!(v, s::_HalfSolve, u, c, n)
 end
 
 Base.show(io::IO, p::NUFFTScatteringPlan{T, B}) where {T, B} =
-    print(io, "NUFFTScatteringPlan{", T, "}(", nameof(typeof(p.backend)), ", ms=", p.ms, ", M=", p.M,
+    print(io, "NUFFTScatteringPlan{", T, "}(", nameof(typeof(p.transform)), ", ms=", p.ms, ", M=", p.M,
           ", ntrans=", B, ", solve=", p.solve, ")")
 Base.show(io::IO, ::MIME"text/plain", p::NUFFTScatteringPlan) = show(io, p)
 
-spectral_backend(p::NUFFTScatteringPlan) = p.backend
+spectral_backend(p::NUFFTScatteringPlan) = p.transform
 plan_points(p::NUFFTScatteringPlan) = (p.sx, p.sy)
 plan_analysis(p::NUFFTScatteringPlan) =
     (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp, eps = p.eps, nufft_nthreads = p.nthreads)
@@ -148,7 +144,7 @@ plan_analysis(p::NUFFTScatteringPlan) =
 # The FlowTransformBindings plans hold the scratch every execution writes through, so a task builds its
 # own over the same points, at one thread unless one was asked for.
 task_local_plan(p::NUFFTScatteringPlan{T, B}) where {T, B} =
-    _nufft_plan_at(p.backend, p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol, B,
+    _nufft_plan_at(p.transform, p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol, B,
                    per_task_nthreads(p.nthreads), p.damp)
 
 close_plan!(p::NUFFTScatteringPlan) = (FTB.close!(p.cplan); FTB.close!(p.rplan); nothing)

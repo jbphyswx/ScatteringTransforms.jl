@@ -116,7 +116,7 @@ function gridded(label, st, x, X, spatial)
     B = size(X)[end]
 
     tser = bench(() -> ST.scattering_batch(st, X))
-    tthr = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), st, X))
+    tthr = bench(() -> ST.scattering_batch(st, X; execution = CB.ThreadedBackend()))
     floor_serial = ntr * tstep * B
     Printf.@printf("%-24s B=%-4d steps/slice=%-4d  step=%6.1f us (FFT is %2.0f%% of it)\n",
                    label, B, ntr, tstep * 1e6, 100 * tfft / tstep)
@@ -314,17 +314,17 @@ nufft_libraries() = filter(FTB.is_available, (FTB.NonuniformFFTsBackend(), FTB.F
 
 function solve_cascade(spectral, xs, ys, Xb, B)
     sp = ST.scattered_planar_scattering(xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
-                                        solve = true, spectral = spectral)
+                                        solve = true, transform = spectral)
     adj = ST.scattered_planar_scattering(xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
-                                         solve = false, spectral = spectral)
+                                         solve = false, transform = spectral)
     ta = bench(() -> ST.scattering_batch(sp, Xb))
     tadj = bench(() -> ST.scattering_batch(adj, Xb))
-    tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sp, Xb))
+    tt = bench(() -> ST.scattering_batch(sp, Xb; execution = CB.ThreadedBackend()))
     Printf.@printf("%-26s adjoint %8.1f ms  solve %8.1f ms  %.1fx  threaded %8.1f ms  %.2fx\n",
                    string(nameof(typeof(spectral))), tadj * 1e3, ta * 1e3, ta / tadj,
                    tt * 1e3, ta / tt)
     spb = ST.ScatteredPlanar.build(Float64, xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
-                                   solve = true, spectral = spectral, ntrans = B)
+                                   solve = true, transform = spectral, ntrans = B)
     if ST.Plans.batch_width(spb.plan) == B
         tb = bench(() -> ST.scattering_batch(spb, Xb))
         Printf.@printf("%-26s batched %8.1f ms  %.2fx over the per-field solve\n",
@@ -343,17 +343,17 @@ _alloc3(f::F, a, b, c) where {F} = (f(a, b, c); @allocated f(a, b, c))
 
 function allocations()
     header("Allocation (steady state, explicit serial + explicit spectral backend)")
-    st1 = ST.Scattering1D.ScatteringTransform1D(512, 5; Q = 1, spectral = FB)
+    st1 = ST.Scattering1D.ScatteringTransform1D(512, 5; Q = 1, transform = FB)
     c1 = ST.batch_coeffs(st1, Float64)
     Printf.@printf("  %-42s %6d B\n", "Scattering1D.scattering_transform!",
                    _alloc3(ST.Scattering1D.scattering_transform!, c1, st1, randn(512)))
 
-    st2 = ST.Scattering2D.ScatteringTransform2D((64, 64), 3; L = 4, spectral = FB)
+    st2 = ST.Scattering2D.ScatteringTransform2D((64, 64), 3; L = 4, transform = FB)
     c2 = ST.batch_coeffs(st2, Float64)
     Printf.@printf("  %-42s %6d B\n", "Scattering2D.scattering_transform2d!",
                    _alloc3(ST.Scattering2D.scattering_transform2d!, c2, st2, randn(64, 64)))
 
-    st3 = ST.Scattering3D.ScatteringTransform3D((16, 16, 16), 2; n_orient = 4, spectral = FB)
+    st3 = ST.Scattering3D.ScatteringTransform3D((16, 16, 16), 2; n_orient = 4, transform = FB)
     c3 = ST.batch_coeffs(st3, Float64)
     Printf.@printf("  %-42s %6d B\n", "Scattering3D.scattering_transform3d!",
                    _alloc3(ST.Scattering3D.scattering_transform3d!, c3, st3, randn(16, 16, 16)))
@@ -397,52 +397,52 @@ function main()
         ((1024, 6, 1, 64), (4096, 8, 1, 64), (4096, 8, 8, 16), (16384, 10, 1, 16)) :
         ((1024, 6, 1, 64), (4096, 8, 1, 32))
     for (N, J, Q, B) in grid
-        st = ST.Scattering1D.ScatteringTransform1D(N, J; Q = Q, spectral = FB)
+        st = ST.Scattering1D.ScatteringTransform1D(N, J; Q = Q, transform = FB)
         gridded("1D N=$N J=$J Q=$Q", st, randn(N), randn(N, B), (N,))
     end
     for (N, J, B) in (TIER == "full" ? ((128, 4, 16), (256, 4, 8), (512, 5, 4)) : ((128, 4, 8),))
-        st = ST.Scattering2D.ScatteringTransform2D((N, N), J; L = 8, spectral = FB)
+        st = ST.Scattering2D.ScatteringTransform2D((N, N), J; L = 8, transform = FB)
         gridded("2D $(N)^2 J=$J L=8", st, randn(N, N), randn(N, N, B), (N, N))
     end
     for (N, J, B) in (TIER == "full" ? ((64, 3, 4), (128, 4, 2)) : ((64, 3, 2),))
-        st = ST.Scattering3D.ScatteringTransform3D((N, N, N), J; n_orient = 6, spectral = FB)
+        st = ST.Scattering3D.ScatteringTransform3D((N, N, N), J; n_orient = 6, transform = FB)
         gridded("3D $(N)^3 J=$J", st, randn(N, N, N), randn(N, N, N, B), (N, N, N))
     end
 
     header("Periodized cascade — speedup vs the approximation it trades for")
     multires("1D N=4096 J=8",
-             ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, spectral = FB),
+             ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, transform = FB),
              ov -> ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, oversampling = ov,
-                                                         spectral = FB), randn(4096), 1:3)
+                                                         transform = FB), randn(4096), 1:3)
     multires("2D 128^2 J=4 L=8",
-             ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8, spectral = FB),
+             ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8, transform = FB),
              ov -> ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8,
-                                                         oversampling = ov, spectral = FB),
+                                                         oversampling = ov, transform = FB),
              randn(128, 128), 0:2)
     multires("3D 64^3 J=3",
-             ST.Scattering3D.ScatteringTransform3D((64, 64, 64), 3; n_orient = 6, spectral = FB),
+             ST.Scattering3D.ScatteringTransform3D((64, 64, 64), 3; n_orient = 6, transform = FB),
              ov -> ST.Scattering3D.ScatteringTransform3D((64, 64, 64), 3; n_orient = 6,
-                                                         oversampling = ov, spectral = FB),
+                                                         oversampling = ov, transform = FB),
              randn(64, 64, 64), 0:1)
 
     header("Nonuniform and spherical surfaces — batch reuse and threading")
     M = 2000
     Bp = 8
     px, py = rand(M), rand(M)
-    sp = ST.scattered_planar_scattering(px, py, (32, 32), 3; L = 4)
+    sp = ST.scattered_planar_scattering(px, py, (32, 32), 3; period = 1.0, L = 4)
     println("scattered planar plan: ", sp.plan)
     Xp = randn(M, Bp)
     ts = bench(() -> ST.scattering_batch(sp, Xp))
-    tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sp, Xp))
+    tt = bench(() -> ST.scattering_batch(sp, Xp; execution = CB.ThreadedBackend()))
     Printf.@printf("%-24s serial %8.1f ms   threaded %8.1f ms   %.2fx\n", "scattered planar M=$M",
                    ts * 1e3, tt * 1e3, ts / tt)
     # The batch axis is also a *transform* axis here: a plan built with `ntrans = B` runs the whole
     # stack through one NUFFT execution per cascade step instead of one per field. Reported against
     # the per-field loop above, since the two compose with threading rather than replacing it.
-    spb = ST.ScatteredPlanar.build(Float64, px, py, (32, 32), 3; L = 4, ntrans = Bp)
+    spb = ST.ScatteredPlanar.build(Float64, px, py, (32, 32), 3; period = 1.0, L = 4, ntrans = Bp)
     if ST.Plans.batch_width(spb.plan) == Bp
         tb = bench(() -> ST.scattering_batch(spb, Xp))
-        tbt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), spb, Xp))
+        tbt = bench(() -> ST.scattering_batch(spb, Xp; execution = CB.ThreadedBackend()))
         Printf.@printf("%-24s batched %8.1f ms   %.2fx over per-field   threaded %8.1f ms   %.2fx\n",
                        "  ntrans=$Bp", tb * 1e3, ts / tb, tbt * 1e3, tb / tbt)
     else
@@ -453,7 +453,7 @@ function main()
         Θ, Φ = ST.SphericalCore.structured_grid(lmax, Float64)
         Xg = randn(length(Θ), length(Φ), 8)
         ts = bench(() -> ST.scattering_batch(ss, Xg))
-        tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), ss, Xg))
+        tt = bench(() -> ST.scattering_batch(ss, Xg; execution = CB.ThreadedBackend()))
         Printf.@printf("%-24s serial %8.1f ms   threaded %8.1f ms   %.2fx\n",
                        "structured sphere lmax=$lmax", ts * 1e3, tt * 1e3, ts / tt)
     end
@@ -473,7 +473,7 @@ function main()
             tb = bench(() -> ST.scattering_batch(sc, Xc))
             tf = bench(() -> ST._spherical_batch_perfield!(
                 Matrix{Float64}(undef, ST.flat_rows(sc), size(Xc, 2)), sc, Xc))
-            tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sc, Xc))
+            tt = bench(() -> ST.scattering_batch(sc, Xc; execution = CB.ThreadedBackend()))
             Printf.@printf("%-24s per-field %8.1f ms   batched %8.1f ms   %.2fx   threaded %8.1f ms   %.2fx\n",
                            "scattered sphere lmax=$lmax", tf * 1e3, tb * 1e3, tf / tb, tt * 1e3, tb / tt)
         end
