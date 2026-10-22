@@ -1,26 +1,15 @@
 module ScatteringTransformsFFTWExt
 
-"""
-    ScatteringTransformsFFTWExt — FFTW fast path
-
-`O(N log N)` spectral plans backed by FFTW, supplying the sole method of
-`ScatteringTransforms.Plans.fftw_plan`. Loaded by `using FFTW`; selected by
-`spectral = SpectralBackends.FFTSpectralBackend()` (or `AutoSpectralBackend()`).
-
-Plans cover the leading `length(dims)` axes of a `(dims..., nbatch)` array, so one plan serves both
-a single field and a whole batch.
-"""
-
 using FFTW: FFTW
 using LinearAlgebra: LinearAlgebra
 using SpectralBackends: SpectralBackends as SB
 using ScatteringTransforms: ScatteringTransforms as ST
 
 """
-    FFTWScatteringPlan{T,FP,IP}
+    FFTWScatteringPlan{T,D,FP,IP,IPI}
 
-FFTW-backed spectral plan. Holds pre-planned forward/inverse transforms applied in place via `mul!`
-(no allocation). Plan objects are concrete type parameters.
+FFTW-backed spectral plan: forward and inverse FFTW plans executed through `mul!`, and an in-place
+inverse for `out === x`.
 """
 struct FFTWScatteringPlan{T, D, FP, IP, IPI} <: ST.Plans.AbstractScatteringPlan
     fwd::FP
@@ -30,8 +19,8 @@ struct FFTWScatteringPlan{T, D, FP, IP, IPI} <: ST.Plans.AbstractScatteringPlan
     nbatch::Int
 end
 
-# The default `show` of an FFTW plan calls `fftw_sprint_plan`, which can segfault — so every struct
-# owning one prints a one-line summary instead of its fields.
+# The default `show` of an FFTW plan calls `fftw_sprint_plan`, which can segfault, so a struct owning
+# one prints a one-line summary.
 Base.show(io::IO, p::FFTWScatteringPlan{T}) where {T} =
     print(io, "FFTWScatteringPlan{", T, "}(dims=", p.dims, ", nbatch=", p.nbatch, ")")
 Base.show(io::IO, ::MIME"text/plain", p::FFTWScatteringPlan) = show(io, p)
@@ -39,20 +28,15 @@ Base.show(io::IO, ::MIME"text/plain", p::FFTWScatteringPlan) = show(io, p)
 ST.Plans.spectral_backend(::FFTWScatteringPlan) = SB.FFTSpectralBackend()
 
 """
-    fftw_plan(T, dims; nbatch = 1, planning = FFTW.MEASURE, fft_nthreads = 1)
+    fftw_plan(T, dims; nbatch = 1, batched = false, planning = FFTW.MEASURE, fft_nthreads = 1)
 
 Plan complex transforms of element type `Complex{T}` over the leading `length(dims)` axes of a
-`(dims..., nbatch)` array.
+`(dims..., nbatch)` array, or of a `dims` array when `nbatch == 1` and `batched` is `false`.
 
-`planning` defaults to `FFTW.MEASURE` rather than `FFTW.ESTIMATE`: a scattering transform executes
-its plan `O(nw + paths)` times per field and is built once, so measured planning pays for itself
-immediately. Planning runs against scratch arrays, so no caller data is destroyed. Pass
-`FFTW.ESTIMATE` when build time dominates (many short-lived transforms).
-
-`fft_nthreads` is baked into the plan at construction (FFTW reads its global thread count when
-planning). It defaults to `1` because the parallel backends parallelise over the batch and wavelet
-axes themselves, and nesting FFTW's threads inside those would oversubscribe. Raise it only for a
-single large field on `SerialBackend`.
+A transform executes its plan `O(nw + paths)` times per field, so `planning` defaults to
+`FFTW.MEASURE`; pass `FFTW.ESTIMATE` when build time dominates. Planning runs on scratch arrays.
+`fft_nthreads` is fixed in the plan; leave it at `1` under a parallel backend, which already
+threads over the batch and wavelet axes.
 """
 function ST.Plans.fftw_plan(::Type{T}, dims::NTuple{D, Int}; nbatch::Int = 1,
                             batched::Bool = false,
@@ -60,14 +44,11 @@ function ST.Plans.fftw_plan(::Type{T}, dims::NTuple{D, Int}; nbatch::Int = 1,
                             fft_nthreads::Int = 1) where {T, D}
     nbatch >= 1 || throw(ArgumentError("nbatch must be positive, got $nbatch"))
     fft_nthreads >= 1 || throw(ArgumentError("fft_nthreads must be positive, got $fft_nthreads"))
-    # An FFTW plan is bound to an exact array shape, and a batch of one is genuinely ambiguous: the
-    # single-field path works on `dims` arrays while the batched path always carries the trailing
-    # axis. `batched` says which, so a chunk size of 1 plans `(dims…, 1)` rather than `dims`.
+    # An FFTW plan is bound to an exact array shape. The batched cascade carries a trailing axis even
+    # for a batch of one, so `batched` plans `(dims…, 1)`.
     scratch = zeros(Complex{T}, (batched || nbatch > 1) ? (dims..., nbatch) : dims)
     region = 1:D
-    # Serialised on the package-wide planner lock, which also makes the thread-count pin below safe:
-    # that count is a process global, so two unserialised builds would restore each other's value.
-    return Base.@lock ST.Plans.PLANNER_LOCK ST.Plans.with_fft_nthreads(fft_nthreads) do
+    return FFTW.set_num_threads(fft_nthreads) do
         fwd = FFTW.plan_fft(scratch, region; flags = planning)
         inv = FFTW.plan_ifft(scratch, region; flags = planning)
         invp = FFTW.plan_ifft!(scratch, region; flags = planning)
@@ -76,26 +57,10 @@ function ST.Plans.fftw_plan(::Type{T}, dims::NTuple{D, Int}; nbatch::Int = 1,
     end
 end
 
-# FFTW reads its global planner thread count when a plan is built and bakes it in, so the count only
-# has to hold for the duration of construction — but pinning it is not optional. FFTW.jl runs a
-# multi-threaded plan's parallel loop on Julia tasks, so a plan built while the count is above one
-# spawns a task per thread on *every* execution: measured at ~4 KiB per transform, which a cascade
-# pays once per wavelet and once per path. Lowering the count afterwards does not undo it, because the
-# count belongs to the plan, not to the process.
-#
-# So the pin is unconditional, including for `n == 1`. The count is one process global shared with
-# every other libfftw3 client, and loading FastSphericalHarmonics raises it from 1 to 4 on its own, so
-# "it is probably already 1" is never a safe assumption. Callers hold `Plans.PLANNER_LOCK` across
-# this: two builds pinning one global concurrently would each restore the other's value.
-function ST.Plans.with_fft_nthreads(f, n::Integer)
-    prev = FFTW.get_num_threads()
-    try
-        FFTW.set_num_threads(n)
-        return f()
-    finally
-        FFTW.set_num_threads(prev)
-    end
-end
+# A plan keeps the planner thread count it was built with, and FFTW.jl runs a multi-threaded plan's
+# parallel loop on Julia tasks spawned per execution. The count is process-global and loading
+# FastSphericalHarmonics raises it, so every plan names its own, `n == 1` included.
+ST.Plans.with_fft_nthreads(f, n::Integer) = FFTW.set_num_threads(f, n)
 ST.Plans.fftw_plan(::Type{T}, N::Int; kwargs...) where {T} = ST.Plans.fftw_plan(T, (N,); kwargs...)
 
 # FFTW plans are stateless under the new-array `mul!` execution path, so tasks share one plan.
@@ -108,9 +73,8 @@ ST.Plans.inverse_transform!(out::AbstractArray, p::FFTWScatteringPlan, x::Abstra
     out === x ? (p.inv! * x) : (LinearAlgebra.mul!(out, p.inv, x); out)
 ST.Plans.inplace_inverse(::FFTWScatteringPlan) = true
 
-# Non-mutating, autodiff-friendly fast path: `plan * x` allocates and is differentiable via the
-# `AbstractFFTs` ChainRules (reverse-mode Mooncake/Zygote). The primal must be the planned eltype,
-# so this serves reverse-mode synthesis; `Dual` inputs need the direct sum.
+# Non-mutating transforms for reverse-mode AD through the `AbstractFFTs` ChainRules. The input must
+# have the planned element type, so `Dual` inputs need the direct sum.
 ST.Plans.forward_transform(p::FFTWScatteringPlan, x::AbstractArray) = p.fwd * x
 ST.Plans.inverse_transform(p::FFTWScatteringPlan, x::AbstractArray) = p.inv * x
 

@@ -14,21 +14,23 @@ Planar (Cartesian) and spherical scattering, on uniform/structured and nonunifor
 
 | domain | uniform / structured | nonuniform / scattered |
 |---|---|---|
-| Cartesian | `ScatteringTransform{1,2,3}D` (FFT/direct sum; GPU via `GPUBackend`) | `scattered_planar_scattering` (exact direct NUDFT; FINUFFT fast path) |
+| Cartesian | `ScatteringTransform{1,2,3}D` (FFT/direct sum; GPU via `GPUBackend`) | `scattered_planar_scattering` (exact direct NUDFT; NonuniformFFTs or FINUFFT fast path) |
 | Sphere (S²) | `structured_spherical_scattering` (exact direct SHT; FastSphericalHarmonics fast path) | `spherical_scattering` (exact direct SHT; NUFSHT fast path) |
 
 **Every cell has an in-core, dependency-free default** (direct summation), with an optional fast path
-selected by the `spectral` keyword, which takes a
+selected by the `transform` keyword, which takes a
 [SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag. `DirectSumSpectralBackend`
 is the in-core default everywhere; the fast paths are `FFTSpectralBackend` (FFTW) on a grid,
-`NUFFTSpectralBackend` (FINUFFT or NonuniformFFTs) for scattered points, `NUFSHTSpectralBackend`
+[FlowTransformBindings.jl](https://github.com/jbphyswx/FlowTransformBindings.jl)'s
+`NonuniformFFTsBackend()` or `FINUFFTBackend()` for scattered points, `NUFSHTSpectralBackend`
 (NUFSHT) for the scattered sphere, and `FSHTSpectralBackend` (FastSphericalHarmonics) for the
 structured sphere. `AutoSpectralBackend` (the default) picks the fast path if its extension is
 loaded, else the direct sum — so nothing requires an external library. Naming a backend explicitly is
-honoured exactly: if its extension is absent it raises rather than silently downgrading.
+honoured exactly: if its extension is absent it throws.
 
-Monogenic (Riesz) variants exist on both sphere paths; see below (pointwise
-`spherical_monogenic_components` additionally needs the NUFSHT spin-1 synthesis).
+Monogenic (Riesz) variants exist on both sphere paths; see below. Pointwise
+`spherical_monogenic_components` takes a scattered-point transform, on the in-core or the NUFSHT
+plan.
 
 ## Transforms
 
@@ -112,11 +114,12 @@ ScatteringTransforms.Reductions.log_coefficients
 
 Where a transform runs is chosen with a backend from
 [ComputationalBackends.jl](https://github.com/jbphyswx/ComputationalBackends.jl) — `SerialBackend`,
-`ThreadedBackend`, `GPUBackend`, `DistributedBackend`, `MPIBackend`, `AutoBackend` — passed as the
-second argument to `scattering_batch`. Which spectral algorithm it uses is chosen with a
-[SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag passed as `spectral=` at
-construction. Each is honoured exactly: naming a backend whose extension is not loaded raises rather
-than falling back.
+`ThreadedBackend`, `GPUBackend`, `DistributedBackend`, `MPIBackend`, `AutoBackend` — passed as
+`execution=` to `scattering_batch` and `scattering_batch!`; the gridded `scattering_transform!`
+entries take `SerialBackend` or `ThreadedBackend` the same way. Which spectral algorithm it uses is
+chosen with a
+[SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl) tag passed as `transform=` at
+construction. Each is honoured exactly: naming a backend whose extension is not loaded throws.
 
 ```@docs
 ScatteringTransforms.scattering_batch
@@ -126,6 +129,7 @@ ScatteringTransforms.flat_rows
 ScatteringTransforms.batch_workspace
 ScatteringTransforms.Batched.BatchWorkspace
 ScatteringTransforms.Batched.batch_cascade!
+ScatteringTransforms.close_transform!
 ```
 
 ## The periodized cascade
@@ -137,6 +141,8 @@ undecimated cascade bit for bit; below that it trades accuracy for speed.
 ```@docs
 ScatteringTransforms.Cascade.decimation
 ScatteringTransforms.Cascade.PeriodizedWorkspace
+ScatteringTransforms.Cascade.DeviceMeans
+ScatteringTransforms.Cascade.gather_means!
 ScatteringTransforms.Cascade.build
 ScatteringTransforms.Cascade.cascade!
 ScatteringTransforms.Cascade.group!
@@ -177,6 +183,11 @@ ScatteringTransforms.FilterBanks.filter_at
 ScatteringTransforms.FilterBanks.iscomputed
 ScatteringTransforms.FilterBanks.task_bank
 ScatteringTransforms.FilterBanks.batch_views
+ScatteringTransforms.FilterBanks.littlewood_paley
+ScatteringTransforms.FilterBanks.lp_scale_1d
+ScatteringTransforms.FilterBanks.lp_scale_2d
+ScatteringTransforms.FilterBanks.lp_scale_3d
+ScatteringTransforms.FilterBanks.negated
 ScatteringTransforms.Filters.Morlet1D
 ScatteringTransforms.Filters.Morlet2D
 ScatteringTransforms.Filters.Morlet3D
@@ -207,11 +218,12 @@ ScatteringTransforms.Plans.task_local_plan
 ScatteringTransforms.Plans.batch_width
 ScatteringTransforms.Plans.plan_points
 ScatteringTransforms.Plans.plan_analysis
-ScatteringTransforms.Plans.nufft_guru_make
+ScatteringTransforms.Plans.DirectNUFFTPlan
+ScatteringTransforms.Plans.NUFFTScatteringPlan
+ScatteringTransforms.Plans.nufft_scattered_plan
 ScatteringTransforms.Plans.with_fft_nthreads
 ScatteringTransforms.Plans.per_task_nthreads
 ScatteringTransforms.Plans.close_plan!
-ScatteringTransforms.Plans.PLANNER_LOCK
 ScatteringTransforms.ScatteringCore.wavelet_convolve
 ScatteringTransforms.ScatteringCore.wavelet_convolve!
 ScatteringTransforms.ScatteringCore.apply_modulus
@@ -224,18 +236,12 @@ ScatteringTransforms.ScatteringCore.task_workspace
 
 ### Scattered least-squares solve
 
-`solve = true` on a scattered planar transform inverts the nonuniform transform by LSMR rather than
-applying its adjoint. These are the solver and the defaults that configure it.
+`solve = true` on a scattered planar transform fits the mode grid to the samples by least squares with
+`FlowTransformBindings.lsmr!`, as every scattered-sphere analysis does. These are the defaults that
+configure it.
 
 ```@docs
-ScatteringTransforms.Plans.lsmr_solve!
-ScatteringTransforms.Plans.lsmr_solve_batched!
-ScatteringTransforms.Plans.lsmr_init
-ScatteringTransforms.Plans.lsmr_step
-ScatteringTransforms.Plans.LSMRState
-ScatteringTransforms.Plans.BatchedLSMRWork
 ScatteringTransforms.Plans.default_solver_rtol
-ScatteringTransforms.Plans.default_nufft_eps
 ScatteringTransforms.Plans.warn_underdetermined
 ```
 
@@ -247,10 +253,6 @@ without its package loaded raises with the `using` line to run.
 ```@docs
 ScatteringTransforms.Plans.fftw_plan
 ScatteringTransforms.Plans.abstractffts_plan
-ScatteringTransforms.Plans.finufft_scattered_plan
-ScatteringTransforms.Plans.nonuniformffts_scattered_plan
-ScatteringTransforms.Plans.FINUFFTBackend
-ScatteringTransforms.Plans.NonuniformFFTsBackend
 ```
 
 ## Execution backends
@@ -285,6 +287,7 @@ FastSphericalHarmonics supply the fast ones.
 
 ```@docs
 ScatteringTransforms.SphericalCore.AbstractSphericalPlan
+ScatteringTransforms.SphericalCore.DirectSHTSphericalPlan
 ScatteringTransforms.SphericalCore.sphere_coeffs
 ScatteringTransforms.SphericalCore.sphere_coeffs!
 ScatteringTransforms.SphericalCore.sphere_coeffs_buffer
@@ -303,7 +306,11 @@ ScatteringTransforms.SphericalCore.spherical_scattering!
 ScatteringTransforms.SphericalCore.spherical_scattering_batch!
 ScatteringTransforms.SphericalCore.spherical_monogenic_scattering!
 ScatteringTransforms.SphericalCore.monogenic_amplitude!
+ScatteringTransforms.SphericalCore.sphere_riesz_energy!
+ScatteringTransforms.SphericalCore.riesz_scratch
+ScatteringTransforms.SphericalCore.sph_layout_riesz_energy!
 ScatteringTransforms.SphericalCore.task_local
+ScatteringTransforms.SphericalCore.close_task_local!
 ScatteringTransforms.SphericalCore.band_multiplier
 ScatteringTransforms.SphericalCore.dog_sigma2
 ScatteringTransforms.SphericalCore.structured_grid
@@ -317,7 +324,6 @@ ScatteringTransforms.SphericalCore.plan_nufft
 ScatteringTransforms.SphericalCore.plan_spin
 ScatteringTransforms.Plans.AnalysisNotConverged
 ScatteringTransforms.SphericalCore.default_rtol
-ScatteringTransforms.SphericalCore.with_serial_ft
 ScatteringTransforms.SphericalCore.make_spherical_plan
 ScatteringTransforms.SphericalCore.make_structured_plan
 ScatteringTransforms.SphericalCore.nusht_spherical_plan

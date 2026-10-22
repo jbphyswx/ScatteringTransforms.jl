@@ -1,20 +1,9 @@
 module Batched
 
-"""
-    Batched.jl — one batched cascade, shared by every backend
-
-Transforms a whole `(spatial…, B)` stack against a single spectral plan built over the leading
-spatial dimensions, so each convolution is one plan execution over all `B` slices rather than `B`
-executions of a single-slice plan. Filters broadcast over the batch axis by reshaping to
-`(spatial…, 1)`.
-
-Nothing here names a device: the buffers and the plan come from the caller, so the same code runs on
-CPU arrays with an FFTW (or in-core) plan and on device arrays with a cuFFT/rocFFT plan. The GPU
-extension therefore supplies allocation and a plan, not a second copy of the cascade.
-
-The cascade is the batched form of `Scattering*D.cascade!` — grouped by first-order wavelet, so a
-first-order field is computed once and reused by all of its children.
-"""
+# One batched cascade for every backend: a `(spatial…, B)` stack runs against a single spectral plan
+# over the leading spatial dimensions, with filters reshaped to `(spatial…, 1)` to broadcast over the
+# batch axis. The caller supplies the buffers and the plan, so the same code runs on host and device
+# arrays.
 
 using ..Plans: Plans
 using ..FilterBanks: FilterBanks
@@ -27,29 +16,17 @@ export BatchWorkspace, batch_cascade!
 
 # ---------------------------------------------------------------------------
 # Per-slice ⟨|c|⟩
-#
-# The cascade is memory-bandwidth bound, not FFT bound: every wavelet convolution moves roughly
-# `6N` words (multiply in, transform out, modulus, reduce) against an `N log N` transform, so a
-# redundant pass over the stack costs as much as a sizeable fraction of the FFT itself. These fuse
-# the modulus with its reduction so the stack is swept once, not twice.
 # ---------------------------------------------------------------------------
 
-# Leaf wavelets: the modulus field is never read again, so it is not written at all — the reduction
-# consumes the transform output directly.
+# Leaf wavelets: the reduction reads the transform output directly and writes no modulus field.
 function slice_modulus_mean!(red, redvec, c)
     fill!(red, zero(eltype(red)))
     Base.mapreducedim!(ScatteringCore._modulus, +, red, c)
     return redvec
 end
 
-# Per-slice sum of a real field — S0's reduction.
-slice_sum!(red, redvec, a) = (Base.sum!(red, a); redvec)
-
-# Wavelets with children: the modulus field *is* consumed downstream, so it must be written — but
-# the sum can ride along with the write, so the stack is swept once rather than twice. The generic
-# form cannot express that; the CPU method is measured at 1.31–1.49× the two-pass version. The leaf
-# case above needs no such method — it is already single-pass, and a hand-written loop measures
-# within noise of `mapreducedim!`.
+# Wavelets with children: write the modulus field into `rmod`, which order 2 reads, and reduce it.
+# The `Array` method does both in one sweep.
 function slice_modulus_mean!(red, redvec, rmod, c)
     @. rmod = ScatteringCore._modulus(c)
     Base.sum!(red, rmod)
@@ -81,10 +58,8 @@ workspace whose arrays all carry a trailing stack axis, the real staging and red
 the precomputed order-2 groups. Once built, a batched transform does no data-proportional allocation.
 
 `red` is the spatial-reduction target, shaped `(1…, 1, B)` so `sum!` contracts every axis but the
-batch; that one shape serves every resolution.
-
-`invN` is per level. A single `1/∏spatial` would leave every decimated row short by exactly `∏r` —
-a clean factor that no batched-versus-batched comparison can see.
+batch; that one shape serves every resolution. `invN[l]` is `1/∏(spatial ÷ r)` at level `l`, since
+each mean is over its own decimated grid.
 """
 struct BatchWorkspace{T, D, PW <: Cascade.PeriodizedWorkspace{T, D}, RA, CA,
                       MV <: AbstractVector{RA}, RV <: AbstractVector{T},
@@ -107,19 +82,50 @@ BatchWorkspace(pw::Cascade.PeriodizedWorkspace{T, D}, xr, xf, rmod, red, redvec,
                    typeof(invN), typeof(groups), typeof(bank)}(
         pw, xr, xf, rmod, red, redvec, invN, Int(n), groups, bank)
 
+Base.show(io::IO, ws::BatchWorkspace{T, D}) where {T, D} =
+    print(io, "BatchWorkspace{", T, ", ", D, "}(B=", length(ws.redvec), ", ", ws.pw, ")")
+
+# The batched workspace of transform `st` at batch size `B`. `zeros_like(S, dims)` allocates a zeroed
+# buffer and `makeplan(rd)` a plan over the leading axes of an `(rd…, B)` stack, both where the
+# workspace is to live; `shapefilter` gives a filter the trailing singleton that broadcasts it across
+# the stack.
+function build_workspace(st, B::Int, ::Type{T}; zeros_like, makeplan, shapefilter) where {T}
+    spatial = st.dims
+    D = length(spatial)
+    pw = Cascade.build(st.filter_bank, st.groups, spatial, T, st.pw.oversampling;
+                       alloc = rd -> zeros_like(Complex{T}, (rd..., B)), makeplan = makeplan,
+                       shapefilter = shapefilter)
+    rdims(l) = ntuple(d -> spatial[d] ÷ pw.resolutions[l][d], D)
+    # A level is a parent exactly where the cascade gave it a `Û₁` buffer, and only a parent's
+    # modulus is ever read again.
+    rmod = [isempty(pw.spec[l]) ? zeros_like(T, ntuple(_ -> 0, D + 1)) : zeros_like(T, (rdims(l)..., B))
+            for l in eachindex(pw.resolutions)]
+    invN = [T(1) / prod(rdims(l)) for l in eachindex(pw.resolutions)]
+    red = zeros_like(T, (ntuple(_ -> 1, D)..., B))
+    return BatchWorkspace(pw, zeros_like(T, (spatial..., B)), zeros_like(Complex{T}, (spatial..., B)),
+                          rmod, red, reshape(red, B), invN, FilterBanks.nwavelets(st.filter_bank),
+                          st.groups, st.filter_bank)
+end
+
+# The stack into the cascade's complex input buffer `c0`. A real stack crosses to the workspace's
+# device in its own element type, through `xr`.
+_stage!(c0, xr, X::AbstractArray{<:Real}) = (copyto!(xr, X); @. c0 = complex(xr); c0)
+_stage!(c0, xr, X::AbstractArray{<:Complex}) = copyto!(c0, X)
+
+# `S0` of every slice, the field's mean: the zero-frequency entry of its spectrum `dc` over its size,
+# whose imaginary part is rounding where the field is real.
+_put_s0!(row, dc, s, ::Type{<:Real}) = (@. row = real(dc) * s; row)
+_put_s0!(row, dc, s, ::Type{<:Complex}) = (@. row = dc * s; row)
+
 """
     batch_cascade!(out, ws, X) -> out
 
-Write the flattened scattering coefficients of every slice of `X` into the columns of `out`.
+Write the flattened scattering coefficients of every slice of `X` into the columns of `out`, which
+has `Coefficients.flat_length(n)` rows in the layout `flatten1d!`/`flatten2d!` produce. A complex `X`
+needs complex columns, for its complex `S0`.
 
-`out` has `Coefficients.flat_length(n)` rows; row assignment goes through
-`Coefficients.flat_row_*`, the same layout `flatten1d!`/`flatten2d!` produce, so batched and
-per-slice results are interchangeable.
-
-The batched form of [`Cascade.cascade!`](@ref) — same periodization and the same resolutions, with
-the scalar mean replaced by a per-slice reduction over the stack. Each decimation tuple gains a
-trailing `1` so the stack axis is never folded, and the filters carry a trailing singleton so they
-broadcast across it.
+The batched form of [`Cascade.cascade!`](@ref), with each mean replaced by a per-slice reduction and
+each decimation tuple extended by a `1` for the stack axis.
 """
 function batch_cascade!(out::AbstractMatrix, ws::BatchWorkspace{T, D}, X::AbstractArray) where {T, D}
     pw = ws.pw
@@ -128,14 +134,13 @@ function batch_cascade!(out::AbstractMatrix, ws::BatchWorkspace{T, D}, X::Abstra
     rv = ws.redvec
     Tout = eltype(out)
 
-    copyto!(ws.xr, X)
     c0 = pw.work[1]
-    @. c0 = complex(ws.xr)
+    _stage!(c0, ws.xr, X)
     Plans.forward_transform!(ws.xf, pw.plans[1], c0)
 
     # S0, and clear the S2 block so inadmissible pairs read as zero (matching `flatten*!`).
-    slice_sum!(ws.red, rv, ws.xr)
-    @views out[Coefficients.flat_row_s0(), :] .= rv .* Tout(ws.invN[1])
+    _put_s0!(view(out, Coefficients.flat_row_s0(), :), view(ws.xf, ntuple(_ -> 1, Val(D))..., :),
+             Tout(ws.invN[1]), Tout)
     @views out[(n + 2):end, :] .= zero(Tout)
 
     @inbounds for (j1, children, _) in ws.groups

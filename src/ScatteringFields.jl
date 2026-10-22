@@ -1,23 +1,13 @@
 module ScatteringFields
 
-"""
-    ScatteringFields.jl — Localized (Mallat) scattering field storage
-
-Unlike the globally-averaged coefficients (one scalar per path), the *localized* scattering
-transform returns, for each path `p`, the low-pass-smoothed, subsampled field
-
-    S_p x = (|U_p x| ⋆ φ_J) ↓ s
-
-at resolution `N / s` (`s` = subsample factor). Every path shares the same output resolution
-(set by the φ_J low-pass), so the natural storage is a single dense array with a trailing
-"path" axis indexed by the scattering tree's path ids (order-0 root first, then order 1, …).
-
-The globally-averaged coefficient of a path is the spatial mean of its localized field. Keeping that
-true under `↓ s` requires `φ̂_J(0) = 1` *and* `φ̂_J` to vanish on the subsampling lattice, which is why
-`φ_J` is [`Filters.gaussian_lowpass!`](@ref) and not the bank's `averaging`.
-
-A field owns the cascade workspace it was built for, so filling it repeatedly allocates nothing.
-"""
+# The localized scattering transform holds, for each path `p`, the low-passed and subsampled field
+#
+#     S_p x = (|U_p x| ⋆ φ_J) ↓ s
+#
+# at resolution `N / s`, in one array whose trailing axis is the scattering tree's path id. Its
+# spatial mean is the global coefficient of `p`, which under `↓ s` needs `φ̂_J(0) = 1` and `φ̂_J` to
+# vanish on the subsampling lattice; `φ_J` is `Filters.gaussian_lowpass!`, as is every bank's
+# `averaging`. A field owns the cascade workspace that fills it, so refilling it allocates nothing.
 
 using ..PathGraph: PathGraph
 

@@ -52,7 +52,7 @@ println("\n4. Batched transform (plan + workspace reused)")
 X = randn(N, 64)
 coeffs_batch = ST.scattering_batch(st, X)
 println("   scattering_batch(st, $(size(X))) → ", size(coeffs_batch), " (coeffs × batch)")
-threaded = ST.scattering_batch(CB.ThreadedBackend(), st, X)
+threaded = ST.scattering_batch(st, X; execution = CB.ThreadedBackend())
 println("   threaded == serial: ", threaded ≈ coeffs_batch)
 
 # ---------------------------------------------------------------------------

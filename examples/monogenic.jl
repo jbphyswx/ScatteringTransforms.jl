@@ -22,8 +22,8 @@ println("="^64)
 println("Monogenic (Riesz) scattering")
 println("="^64)
 
-# ── Riesz multipliers tile unity off the DC bin ───────────────────────────────
-R = ST.Monogenic.riesz_multipliers((32, 32), Float64)
+# ── Riesz multipliers tile unity off the DC bin (odd grid: no Nyquist bin) ────
+R = ST.Monogenic.riesz_multipliers((31, 31), Float64)
 partition = sum(abs2.(Rd) for Rd in R)
 println("\nRiesz partition Σ_d|R_d|² = 1 off-DC: ",
         maximum(abs.([partition[i] for i in CartesianIndices(partition) if i != CartesianIndex(1, 1)] .- 1)) < 1e-12)
@@ -43,7 +43,7 @@ M = 128
 cx = cy = (M + 1) / 2
 rr = [sqrt((i - cx)^2 + (j - cy)^2) for i in 1:M, j in 1:M]
 field = cos.(2π .* rr ./ (M / 16))
-st = ST.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1, spectral=SB.FFTSpectralBackend())
+st = ST.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1, transform=SB.FFTSpectralBackend())
 best = argmax([sum(abs2, ST.Monogenic.monogenic_components(st, field, j).bandpass) for j in 1:5])
 comp = ST.Monogenic.monogenic_components(st, field, best)
 

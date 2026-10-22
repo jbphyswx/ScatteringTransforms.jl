@@ -32,10 +32,11 @@ Run:  julia --project=benchmark -t<threads> benchmark/suite.jl [quick|full]
 using FFTW: FFTW
 using OhMyThreads: OhMyThreads
 using FastSphericalHarmonics: FastSphericalHarmonics
-# Loaded for their extensions, not called directly: without them the nonuniform surfaces resolve to
-# the in-core reference and the suite times that instead of the transform.
+# Loaded for their extensions: they give the nonuniform surfaces their fast paths.
 using FINUFFT: FINUFFT
+using NonuniformFFTs: NonuniformFFTs
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends as CB
 using SpectralBackends: SpectralBackends as SB
 using ScatteringTransforms: ScatteringTransforms as ST
@@ -115,7 +116,7 @@ function gridded(label, st, x, X, spatial)
     B = size(X)[end]
 
     tser = bench(() -> ST.scattering_batch(st, X))
-    tthr = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), st, X))
+    tthr = bench(() -> ST.scattering_batch(st, X; execution = CB.ThreadedBackend()))
     floor_serial = ntr * tstep * B
     Printf.@printf("%-24s B=%-4d steps/slice=%-4d  step=%6.1f us (FFT is %2.0f%% of it)\n",
                    label, B, ntr, tstep * 1e6, 100 * tfft / tstep)
@@ -157,9 +158,9 @@ end
 # `solve = true` replaces one adjoint application with an iterative solve, so its cost is two separate
 # numbers and they fail differently. How many iterations the geometry needs is a property of the
 # points. What one iteration costs *over* the two transforms inside it is a property of the solver:
-# LSMR carries `2M + 9·prod(ms)` flops of vector work per iteration on top of a type-2 and a type-1,
-# and that fraction is largest on small grids, where the transform has the least work to hide it
-# behind. Both are measured rather than counted, because the vector work is bandwidth bound where the
+# LSMR does vector work over the points and over the modes each iteration on top of a type-2 and a
+# type-1, and that fraction is largest on small grids, where the transform has the least work to hide
+# it behind. Both are measured rather than counted, because the vector work is bandwidth bound where the
 # FFT is cache blocked, and because `M` and `ms` are independent: the caller may hand over more modes
 # than samples, and the regime decides everything.
 #
@@ -171,20 +172,16 @@ end
 # synthesis `1/prod(ms)`, so the adjoint must carry the same scalar — a mismatched pair is not a
 # scaled problem, it is a different one, and LSMR then runs to `maxiter` on an operator whose exact
 # solution it should reach in a single step. With both scaled the factor cancels from every stopping
-# test (`normA` falls by it exactly as `normx` rises, `normar` and `normr` together), so the count is
-# the solve path's own.
+# test, each a ratio of the recurrence's own norms, so the count is the solve path's own.
 function solve_probe(::Type{T}, base, b, ms, M, tol, maxiter) where {T}
-    x = zeros(Complex{T}, ms)
     s = T(base.invN)
-    info = ST.Plans.lsmr_solve!(x,
-                                (dst, src) -> ST.Plans.inverse_transform!(dst, base, src),
-                                (dst, src) -> (ST.Plans.forward_transform!(dst, base, src);
-                                               dst .*= s),
-                                Complex{T}.(b), zeros(Complex{T}, M), zeros(Complex{T}, M),
-                                zeros(Complex{T}, ms), zeros(Complex{T}, ms), zeros(Complex{T}, ms),
-                                zeros(Complex{T}, ms);
-                                atol = tol, btol = tol, conlim = inv(eps(T)), maxiter = maxiter)
-    return (info.iters, info.istop)
+    op = FTB.FunctionOperator((dst, src) -> ST.Plans.inverse_transform!(dst, base, src),
+                              (dst, src) -> (ST.Plans.forward_transform!(dst, base, src); dst .*= s),
+                              zeros(Complex{T}, ms..., 1), zeros(Complex{T}, M, 1))
+    ws = FTB.LSMRWorkspace(op)
+    info = FTB.lsmr!(zeros(Complex{T}, ms..., 1), op, Complex{T}.(b), ws; atol = tol, btol = tol,
+                     rtol = 0, conlim = inv(eps(T)), maxiter = maxiter)
+    return (info.iterations, ws.status[1])
 end
 
 function solve_case(::Type{T}, label, xs, ys, ms, period, spec) where {T}
@@ -203,7 +200,7 @@ function solve_case(::Type{T}, label, xs, ys, ms, period, spec) where {T}
                                  ST.Plans.forward_transform!(X, base, b)))
 
     rtol = ST.Plans.default_solver_rtol(T, spec, nothing)
-    iters, istop = solve_probe(T, base, b, ms, M, rtol, 100)
+    iters, stop = solve_probe(T, base, b, ms, M, rtol, 100)
 
     # A solve the package refuses is a result, not a crash: at `conlim = 1/eps(T)` an operator whose
     # smallest singular direction carries nothing this precision can represent is rejected rather than
@@ -244,8 +241,8 @@ function solve_case(::Type{T}, label, xs, ys, ms, period, spec) where {T}
     end
     ST.Plans.close_plan!(base); ST.Plans.close_plan!(solved)
 
-    Printf.@printf("%-24s M=%-8d n=%-7d iters %3d (istop %d)  pair %7.3f ms  solve %8.3f ms  %6s  iter %s\n",
-                   label, M, prod(ms), iters, istop, t_pair * 1e3,
+    Printf.@printf("%-24s M=%-8d n=%-7d iters %3d (%s)  pair %7.3f ms  solve %8.3f ms  %6s  iter %s\n",
+                   label, M, prod(ms), iters, string(stop), t_pair * 1e3,
                    isnan(t_solve) ? NaN : t_solve * 1e3,
                    isnan(t_solve) ? "refused" :
                        Printf.@sprintf("%.2fx", t_solve / (max(iters, 1) * t_pair)),
@@ -260,9 +257,8 @@ function scattered_solve()
     # against a transform's `O(n log n)`, so the smallest grid is the hard case, not the afterthought.
     grids = TIER == "full" ? ((8, 8), (16, 16), (32, 32), (200, 200), (256, 256)) :
                              ((8, 8), (32, 32), (200, 200))
-    spec = ST.Plans.FINUFFTBackend()
-    for T in (TIER == "full" ? (Float64, Float32) : (Float64,))
-        println("\n", T, ":")
+    for spec in nufft_libraries(), T in (TIER == "full" ? (Float64, Float32) : (Float64,))
+        println("\n", nameof(typeof(spec)), " ", T, ":")
         for ms in grids
             n = prod(ms)
             # Well sampled: the regime where the solver's extra vector work is pure overhead, and the
@@ -289,11 +285,13 @@ function scattered_solve()
 
     # `M` at fixed `ms`: the point count enters the transform linearly and the solver's vector work
     # linearly too, so the ratio above should hold as `M` grows. This is where that is checked.
-    println("\nM sweep at 32^2, well sampled:")
-    for M in (TIER == "full" ? (100, 1_000, 10_000, 100_000, 1_000_000) : (100, 10_000, 1_000_000))
-        xs = [2π * mod(ga * k, 1.0) for k in 1:M]
-        ys = [2π * (k - 0.5) / M for k in 1:M]
-        solve_case(Float64, "M=$M", xs, ys, (32, 32), (2π, 2π), spec)
+    for spec in nufft_libraries()
+        println("\nM sweep at 32^2, well sampled, ", nameof(typeof(spec)), ":")
+        for M in (TIER == "full" ? (100, 1_000, 10_000, 100_000, 1_000_000) : (100, 10_000, 1_000_000))
+            xs = [2π * mod(ga * k, 1.0) for k in 1:M]
+            ys = [2π * (k - 0.5) / M for k in 1:M]
+            solve_case(Float64, "M=$M", xs, ys, (32, 32), (2π, 2π), spec)
+        end
     end
 
     # Threading and `ntrans` on the solve path, which is where a per-task plan or a per-column
@@ -304,30 +302,29 @@ function scattered_solve()
     xs = [2π * mod(ga * k, 1.0) for k in 1:M]
     ys = [2π * (k - 0.5) / M for k in 1:M]
     Xb = randn(M, B)
-    # Named explicitly and only when loaded: naming a backend whose extension is absent raises, and a
-    # missing library is a gap to report, not a reason to abandon the sweep.
-    _ext(:ScatteringTransformsFINUFFTExt) ?
-        solve_cascade(ST.Plans.FINUFFTBackend(), xs, ys, Xb, B) :
-        println("FINUFFT: not loaded")
-    _ext(:ScatteringTransformsNonuniformFFTsExt) ?
-        solve_cascade(ST.Plans.NonuniformFFTsBackend(), xs, ys, Xb, B) :
-        println("NonuniformFFTs: not loaded")
+    for spec in nufft_libraries()
+        solve_cascade(spec, xs, ys, Xb, B)
+    end
     return nothing
 end
 
+# The NUFFT libraries loaded here, each named explicitly: a library that is absent is reported as missing
+# by `loaded_fast_paths` and skipped.
+nufft_libraries() = filter(FTB.is_available, (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend()))
+
 function solve_cascade(spectral, xs, ys, Xb, B)
     sp = ST.scattered_planar_scattering(xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
-                                        solve = true, spectral = spectral)
+                                        solve = true, transform = spectral)
     adj = ST.scattered_planar_scattering(xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
-                                         solve = false, spectral = spectral)
+                                         solve = false, transform = spectral)
     ta = bench(() -> ST.scattering_batch(sp, Xb))
     tadj = bench(() -> ST.scattering_batch(adj, Xb))
-    tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sp, Xb))
+    tt = bench(() -> ST.scattering_batch(sp, Xb; execution = CB.ThreadedBackend()))
     Printf.@printf("%-26s adjoint %8.1f ms  solve %8.1f ms  %.1fx  threaded %8.1f ms  %.2fx\n",
                    string(nameof(typeof(spectral))), tadj * 1e3, ta * 1e3, ta / tadj,
                    tt * 1e3, ta / tt)
     spb = ST.ScatteredPlanar.build(Float64, xs, ys, (32, 32), 3; L = 4, period = (2π, 2π),
-                                   solve = true, spectral = spectral, ntrans = B)
+                                   solve = true, transform = spectral, ntrans = B)
     if ST.Plans.batch_width(spb.plan) == B
         tb = bench(() -> ST.scattering_batch(spb, Xb))
         Printf.@printf("%-26s batched %8.1f ms  %.2fx over the per-field solve\n",
@@ -346,17 +343,17 @@ _alloc3(f::F, a, b, c) where {F} = (f(a, b, c); @allocated f(a, b, c))
 
 function allocations()
     header("Allocation (steady state, explicit serial + explicit spectral backend)")
-    st1 = ST.Scattering1D.ScatteringTransform1D(512, 5; Q = 1, spectral = FB)
+    st1 = ST.Scattering1D.ScatteringTransform1D(512, 5; Q = 1, transform = FB)
     c1 = ST.batch_coeffs(st1, Float64)
     Printf.@printf("  %-42s %6d B\n", "Scattering1D.scattering_transform!",
                    _alloc3(ST.Scattering1D.scattering_transform!, c1, st1, randn(512)))
 
-    st2 = ST.Scattering2D.ScatteringTransform2D((64, 64), 3; L = 4, spectral = FB)
+    st2 = ST.Scattering2D.ScatteringTransform2D((64, 64), 3; L = 4, transform = FB)
     c2 = ST.batch_coeffs(st2, Float64)
     Printf.@printf("  %-42s %6d B\n", "Scattering2D.scattering_transform2d!",
                    _alloc3(ST.Scattering2D.scattering_transform2d!, c2, st2, randn(64, 64)))
 
-    st3 = ST.Scattering3D.ScatteringTransform3D((16, 16, 16), 2; n_orient = 4, spectral = FB)
+    st3 = ST.Scattering3D.ScatteringTransform3D((16, 16, 16), 2; n_orient = 4, transform = FB)
     c3 = ST.batch_coeffs(st3, Float64)
     Printf.@printf("  %-42s %6d B\n", "Scattering3D.scattering_transform3d!",
                    _alloc3(ST.Scattering3D.scattering_transform3d!, c3, st3, randn(16, 16, 16)))
@@ -379,8 +376,8 @@ _ext(name) = Base.get_extension(ST, name) !== nothing
 function loaded_fast_paths()
     have = String[]
     _ext(:ScatteringTransformsFFTWExt) && push!(have, "FFTW")
-    _ext(:ScatteringTransformsFINUFFTExt) && push!(have, "FINUFFT")
-    _ext(:ScatteringTransformsNonuniformFFTsExt) && push!(have, "NonuniformFFTs")
+    FTB.is_available(FTB.FINUFFTBackend()) && push!(have, "FINUFFT")
+    FTB.is_available(FTB.NonuniformFFTsBackend()) && push!(have, "NonuniformFFTs")
     _ext(:ScatteringTransformsFastSphericalHarmonicsExt) && push!(have, "FastSphericalHarmonics")
     _ext(:ScatteringTransformsNUFSHTExt) && push!(have, "NUFSHT")
     _ext(:ScatteringTransformsOhMyThreadsExt) && push!(have, "OhMyThreads")
@@ -400,52 +397,52 @@ function main()
         ((1024, 6, 1, 64), (4096, 8, 1, 64), (4096, 8, 8, 16), (16384, 10, 1, 16)) :
         ((1024, 6, 1, 64), (4096, 8, 1, 32))
     for (N, J, Q, B) in grid
-        st = ST.Scattering1D.ScatteringTransform1D(N, J; Q = Q, spectral = FB)
+        st = ST.Scattering1D.ScatteringTransform1D(N, J; Q = Q, transform = FB)
         gridded("1D N=$N J=$J Q=$Q", st, randn(N), randn(N, B), (N,))
     end
     for (N, J, B) in (TIER == "full" ? ((128, 4, 16), (256, 4, 8), (512, 5, 4)) : ((128, 4, 8),))
-        st = ST.Scattering2D.ScatteringTransform2D((N, N), J; L = 8, spectral = FB)
+        st = ST.Scattering2D.ScatteringTransform2D((N, N), J; L = 8, transform = FB)
         gridded("2D $(N)^2 J=$J L=8", st, randn(N, N), randn(N, N, B), (N, N))
     end
     for (N, J, B) in (TIER == "full" ? ((64, 3, 4), (128, 4, 2)) : ((64, 3, 2),))
-        st = ST.Scattering3D.ScatteringTransform3D((N, N, N), J; n_orient = 6, spectral = FB)
+        st = ST.Scattering3D.ScatteringTransform3D((N, N, N), J; n_orient = 6, transform = FB)
         gridded("3D $(N)^3 J=$J", st, randn(N, N, N), randn(N, N, N, B), (N, N, N))
     end
 
     header("Periodized cascade — speedup vs the approximation it trades for")
     multires("1D N=4096 J=8",
-             ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, spectral = FB),
+             ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, transform = FB),
              ov -> ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, oversampling = ov,
-                                                         spectral = FB), randn(4096), 1:3)
+                                                         transform = FB), randn(4096), 1:3)
     multires("2D 128^2 J=4 L=8",
-             ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8, spectral = FB),
+             ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8, transform = FB),
              ov -> ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8,
-                                                         oversampling = ov, spectral = FB),
+                                                         oversampling = ov, transform = FB),
              randn(128, 128), 0:2)
     multires("3D 64^3 J=3",
-             ST.Scattering3D.ScatteringTransform3D((64, 64, 64), 3; n_orient = 6, spectral = FB),
+             ST.Scattering3D.ScatteringTransform3D((64, 64, 64), 3; n_orient = 6, transform = FB),
              ov -> ST.Scattering3D.ScatteringTransform3D((64, 64, 64), 3; n_orient = 6,
-                                                         oversampling = ov, spectral = FB),
+                                                         oversampling = ov, transform = FB),
              randn(64, 64, 64), 0:1)
 
     header("Nonuniform and spherical surfaces — batch reuse and threading")
     M = 2000
     Bp = 8
     px, py = rand(M), rand(M)
-    sp = ST.scattered_planar_scattering(px, py, (32, 32), 3; L = 4)
+    sp = ST.scattered_planar_scattering(px, py, (32, 32), 3; period = 1.0, L = 4)
     println("scattered planar plan: ", sp.plan)
     Xp = randn(M, Bp)
     ts = bench(() -> ST.scattering_batch(sp, Xp))
-    tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sp, Xp))
+    tt = bench(() -> ST.scattering_batch(sp, Xp; execution = CB.ThreadedBackend()))
     Printf.@printf("%-24s serial %8.1f ms   threaded %8.1f ms   %.2fx\n", "scattered planar M=$M",
                    ts * 1e3, tt * 1e3, ts / tt)
     # The batch axis is also a *transform* axis here: a plan built with `ntrans = B` runs the whole
     # stack through one NUFFT execution per cascade step instead of one per field. Reported against
     # the per-field loop above, since the two compose with threading rather than replacing it.
-    spb = ST.ScatteredPlanar.build(Float64, px, py, (32, 32), 3; L = 4, ntrans = Bp)
+    spb = ST.ScatteredPlanar.build(Float64, px, py, (32, 32), 3; period = 1.0, L = 4, ntrans = Bp)
     if ST.Plans.batch_width(spb.plan) == Bp
         tb = bench(() -> ST.scattering_batch(spb, Xp))
-        tbt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), spb, Xp))
+        tbt = bench(() -> ST.scattering_batch(spb, Xp; execution = CB.ThreadedBackend()))
         Printf.@printf("%-24s batched %8.1f ms   %.2fx over per-field   threaded %8.1f ms   %.2fx\n",
                        "  ntrans=$Bp", tb * 1e3, ts / tb, tbt * 1e3, tb / tbt)
     else
@@ -456,7 +453,7 @@ function main()
         Θ, Φ = ST.SphericalCore.structured_grid(lmax, Float64)
         Xg = randn(length(Θ), length(Φ), 8)
         ts = bench(() -> ST.scattering_batch(ss, Xg))
-        tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), ss, Xg))
+        tt = bench(() -> ST.scattering_batch(ss, Xg; execution = CB.ThreadedBackend()))
         Printf.@printf("%-24s serial %8.1f ms   threaded %8.1f ms   %.2fx\n",
                        "structured sphere lmax=$lmax", ts * 1e3, tt * 1e3, ts / tt)
     end
@@ -476,7 +473,7 @@ function main()
             tb = bench(() -> ST.scattering_batch(sc, Xc))
             tf = bench(() -> ST._spherical_batch_perfield!(
                 Matrix{Float64}(undef, ST.flat_rows(sc), size(Xc, 2)), sc, Xc))
-            tt = bench(() -> ST.scattering_batch(CB.ThreadedBackend(), sc, Xc))
+            tt = bench(() -> ST.scattering_batch(sc, Xc; execution = CB.ThreadedBackend()))
             Printf.@printf("%-24s per-field %8.1f ms   batched %8.1f ms   %.2fx   threaded %8.1f ms   %.2fx\n",
                            "scattered sphere lmax=$lmax", tf * 1e3, tb * 1e3, tf / tb, tt * 1e3, tb / tt)
         end

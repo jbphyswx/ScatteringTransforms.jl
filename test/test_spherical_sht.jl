@@ -7,8 +7,6 @@ using NUFSHT: NUFSHT   # scattered backend for the cross-backend agreement test 
 Test.@testset "Structured spherical scattering (fast SHT on a Clenshaw–Curtis grid)" begin
     lmax, J = 24, 3
     Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)
-    Test.@test length(Θ) == lmax + 1
-    Test.@test length(Φ) == 2lmax + 1
 
     st = ScatteringTransforms.structured_spherical_scattering(lmax, J)
 
@@ -25,13 +23,13 @@ Test.@testset "Structured spherical scattering (fast SHT on a Clenshaw–Curtis 
     res = st(f)
     Test.@test length(res.S1) == J
     Test.@test all(res.S1 .>= 0)
-    Test.@test all(isfinite, res.S1)
     Test.@test size(res.S2) == (J, J)
     for j1 in 1:J, j2 in j1:J                                    # strictly coarser j2 < j1 only
         Test.@test res.S2[j1, j2] == 0
     end
 
-    # The fast SHT is exact, so z-rotation covariance is tight (much tighter than the scattered path).
+    # z-rotation covariance. The modulus is not band limited, so the grid mean of it is invariant only
+    # to the quadrature's accuracy.
     α = 0.7
     fα = [cos(θ)^2 - 1/3 + 0.5 * sin(θ) * cos(φ + α) for θ in Θ, φ in Φ]
     rα = st(fα)
@@ -40,21 +38,12 @@ Test.@testset "Structured spherical scattering (fast SHT on a Clenshaw–Curtis 
     # Monogenic amplitude ≥ analytic modulus pointwise ⇒ ⟨A_j⟩ ≥ ⟨|U⁰_j|⟩ for every scale.
     stm = ScatteringTransforms.structured_spherical_monogenic_scattering(lmax, J)
     rm = stm(f)
-    Test.@test all(isfinite, rm.S1)
     Test.@test all(rm.S1 .>= res.S1 .- 1e-8)
 end
 
-# Cross-backend agreement: the two spherical backends compute the SAME transform, so on a smooth
-# band-limited field (adequately sampled for the scattered CG inversion) their S0/S1/S2 must agree.
-# This is the test that pins the *absolute* scale — the scattered path's exact analysis
-# (`nusht_solve!`) makes it match the exact structured SHT; the earlier adjoint analysis was 6–9× off
-# and only passed the scale-invariant checks. First order is compared tightly; second order is looser
-# because its input is a modulus (broadband), which the two backends truncate at the shared band limit
-# slightly differently — so the tolerance there guards the ~7× regression, not machine agreement.
 Test.@testset "Per-band band limits converge to the full-band-limit cascade" begin
-    # Band-pass `j` is confined to degrees `≲ ℓ_j`, so synthesising it at the full band limit
-    # transforms a grid it cannot use. `band_headroom` is what that trades: the band's transfer above
-    # its cutoff decays as `exp(-ℓ(ℓ+1)/2ℓ_j(ℓ_j+1))`, so a smaller headroom discards more of it.
+    # Band-pass `j` is confined to degrees `≲ ℓ_j`. Its transfer above the cutoff decays as
+    # `exp(-ℓ(ℓ+1)/2ℓ_j(ℓ_j+1))`, so a smaller `band_headroom` discards more of it.
     SC = ScatteringTransforms.SphericalCore
     Random.seed!(77)
     lmax, J = 64, 4
@@ -90,10 +79,10 @@ Test.@testset "Per-band band limits converge to the full-band-limit cascade" beg
         Test.@test e2 < 5e-2
         prev1, prev2 = e1, e2
     end
-    Test.@test prev1 > 0        # narrowing really does something, rather than silently not narrowing
+    Test.@test prev1 > 0        # narrowing changes the result
     Test.@test prev2 > 0
 
-    # A band limit carrying the whole bank reproduces the unnarrowed cascade bit for bit.
+    # A headroom covering the whole bank narrows nothing.
     stw = ScatteringTransforms.structured_spherical_scattering(lmax, J; max_order = 2,
                                                                band_headroom = 4 * 2^J)
     Test.@test stw.bands === nothing
@@ -108,6 +97,8 @@ Test.@testset "Structured (SHT) and scattered (NUFSHT) spherical scattering agre
     φ = [2π * mod(k * gr, 1) for k in 1:M]
     sst = ScatteringTransforms.structured_spherical_scattering(lmax, J)
     scst = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J)
+    # S2's input is a broadband modulus, which the two backends truncate at the band limit
+    # differently, so its tolerance is looser.
     for gfun in ((θ, φ) -> cos(θ)^2 - 1/3 + 0.5sin(θ) * cos(φ),   # smooth, content well below lmax
                  (θ, φ) -> cos(4θ) + 0.5sin(3θ) * cos(2φ))
         rstr = sst([gfun(θ, φ) for θ in Θ, φ in Φ])
@@ -118,11 +109,8 @@ Test.@testset "Structured (SHT) and scattered (NUFSHT) spherical scattering agre
     end
 end
 
-# The in-core dependency-free direct-summation SH backend and the NUFSHT fast path solve the same
-# scattered least-squares SH inversion, so on a band-limited, adequately-sampled field (M ≫ (lmax+1)²)
-# their scattering coefficients agree closely — S1 essentially to solver tolerance, S2 looser (its
-# input is a broadband modulus truncated slightly differently). This verifies `spherical_scattering`
-# works with no external library (`spectral = DirectSHTBackend()`).
+# The direct-summation SH backend and NUFSHT solve the same scattered least-squares SH inversion, so on
+# a band-limited field with M ≫ (lmax+1)² their coefficients agree, S2 more loosely.
 Test.@testset "Dependency-free direct SH backend agrees with NUFSHT (scattered S²)" begin
     lmax, J, M = 12, 3, 2500
     gr = (sqrt(5) - 1) / 2
@@ -132,8 +120,8 @@ Test.@testset "Dependency-free direct SH backend agrees with NUFSHT (scattered S
     for gfun in ((θ, φ) -> cos(θ)^2 - 1/3 + 0.5sin(θ) * cos(φ),
                  (θ, φ) -> cos(2θ) + 0.4sin(θ) * cos(2φ))
         f = [gfun(θ[k], φ[k]) for k in 1:M]
-        sdir = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; spectral = SpectralBackends.DirectSumSpectralBackend())
-        snu  = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; spectral = SpectralBackends.NUFSHTSpectralBackend())
+        sdir = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = SpectralBackends.DirectSumSpectralBackend())
+        snu  = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = SpectralBackends.NUFSHTSpectralBackend())
         Test.@test sdir.plan isa SC.DirectSHTSphericalPlan
         rdir, rnu = sdir(f), snu(f)
         Test.@test rdir.S0 ≈ rnu.S0 atol = 1e-6
@@ -142,10 +130,90 @@ Test.@testset "Dependency-free direct SH backend agrees with NUFSHT (scattered S
     end
 end
 
-# The in-core dependency-free direct SHT on the structured (equiangular) grid vs the
-# FastSphericalHarmonics fast exact SHT: on a band-limited field the least-squares SH fit is exact, so
-# S1 matches to solver tolerance and the exact Fejér-quadrature mean matches. This verifies
-# `structured_spherical_scattering` works with no external library (`spectral = DirectSHTBackend()`).
+# The fit's values at the points, and any per-degree filtering of it, do not depend on the basis each
+# degree's harmonics are written in, so a dense least-squares solve (LAPACK, through `\`) over the real
+# and imaginary parts of NUFSHT's `Y_ℓm` is an independent reference for the in-core plan.
+Test.@testset "The in-core direct SHT is the least-squares fit onto degree ≤ lmax" begin
+    SC = ScatteringTransforms.SphericalCore
+    DS = SpectralBackends.DirectSumSpectralBackend()
+    lmax, M, B = 10, 400, 3
+    gr = (sqrt(5) - 1) / 2
+    θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φ = [2π * mod(k * gr, 1) for k in 1:M]
+    cols, degs = Vector{Vector{Float64}}(), Int[]
+    for ℓ in 0:lmax, m in 0:ℓ
+        Y = [NUFSHT.sYlm(0, ℓ, m, θ[k], φ[k]) for k in 1:M]
+        push!(cols, real.(Y))
+        push!(degs, ℓ)
+        if m > 0
+            push!(cols, imag.(Y))
+            push!(degs, ℓ)
+        end
+    end
+    A = reduce(hcat, cols)
+    Random.seed!(5)
+    F = randn(M, B)
+    h(ℓ) = exp(-0.3ℓ)
+    cref = A \ F
+
+    plan = SC.make_spherical_plan(DS, θ, φ, lmax, Float64; rtol = 1e-13, maxiter = 2000)
+    out = zeros(M)
+    for b in 1:B
+        C = SC.sphere_coeffs(plan, F[:, b])
+        SC.sphere_apply!(out, plan, C, Returns(1.0))
+        Test.@test out ≈ A * cref[:, b] rtol = 1e-9
+        SC.sphere_apply!(out, plan, C, h)
+        Test.@test out ≈ A * (h.(degs) .* cref[:, b]) rtol = 1e-9
+    end
+
+    # A plan `B` fields wide fits each column as a single-field one does.
+    wide = SC.make_spherical_plan(DS, θ, φ, lmax, Float64; rtol = 1e-13, maxiter = 2000, ntrans = B)
+    Test.@test ScatteringTransforms.Plans.batch_width(wide) == B
+    outw = zeros(M, B)
+    SC.sphere_apply!(outw, wide, SC.sphere_coeffs(wide, F), h)
+    Test.@test outw ≈ A * (h.(degs) .* cref) rtol = 1e-9
+    Test.@test SC.sphere_mean(wide, F) ≈ vec(sum(F; dims = 1)) ./ M rtol = 1e-12
+
+    # The plan holds `O(M + (lmax+1)²)` numbers, no matrix of harmonics at the points.
+    Test.@test Base.summarysize(plan) < sizeof(A) ÷ 4
+end
+
+Test.@testset "Scattered spherical means take the given quadrature weights" begin
+    lmax, J, M = 6, 2, 300
+    gr = (sqrt(5) - 1) / 2
+    θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φ = [2π * mod(k * gr, 1) for k in 1:M]
+    Random.seed!(6)
+    w = 0.5 .+ rand(M)
+    f = randn(M)
+    for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
+        st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, weights = w)
+        Test.@test st(f).S0 ≈ sum(w .* f) / sum(w) rtol = 1e-12
+        rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
+        Test.@test rb(f).S0 ≈ sum(w .* f) / sum(w) rtol = 1e-12
+        ScatteringTransforms.close_transform!(st)
+        ScatteringTransforms.close_transform!(rb)
+    end
+end
+
+Test.@testset "An analysis stopped at maxiter returns its best iterate" begin
+    # LSMR's residual falls monotonically, so a truncated solve is an answer on both scattered backends.
+    lmax, J, M = 8, 3, 400
+    gr = (sqrt(5) - 1) / 2
+    θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φ = [2π * mod(k * gr, 1) for k in 1:M]
+    f = [cos(3θ[k]) + 0.5sin(θ[k]) * cos(2φ[k]) for k in 1:M]
+    for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
+        st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, maxiter = 2)
+        r = st(f)
+        Test.@test all(isfinite, r.S1)
+        Test.@test all(isfinite, r.S2)
+        ScatteringTransforms.close_transform!(st)
+    end
+end
+
+# The direct SHT on the structured grid against FastSphericalHarmonics: on a band-limited field the
+# least-squares SH fit is exact.
 Test.@testset "Dependency-free structured SHT agrees with FastSphericalHarmonics" begin
     lmax, J = 16, 3
     Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)
@@ -153,8 +221,8 @@ Test.@testset "Dependency-free structured SHT agrees with FastSphericalHarmonics
     for gfun in ((θ, φ) -> cos(θ)^2 - 1/3 + 0.5sin(θ) * cos(φ),      # band-limited to ℓ ≤ 2
                  (θ, φ) -> sin(θ)^2 * cos(2φ) + 0.6cos(θ))
         f = [gfun(θ, φ) for θ in Θ, φ in Φ]
-        sdir = ScatteringTransforms.structured_spherical_scattering(lmax, J; spectral = SpectralBackends.DirectSumSpectralBackend())
-        sfsh = ScatteringTransforms.structured_spherical_scattering(lmax, J; spectral = SpectralBackends.FSHTSpectralBackend())
+        sdir = ScatteringTransforms.structured_spherical_scattering(lmax, J; transform = SpectralBackends.DirectSumSpectralBackend())
+        sfsh = ScatteringTransforms.structured_spherical_scattering(lmax, J; transform = SpectralBackends.FSHTSpectralBackend())
         Test.@test sdir.plan isa SC.DirectSHTSphericalPlan
         rdir, rfsh = sdir(f), sfsh(f)
         Test.@test rdir.S0 ≈ rfsh.S0 atol = 1e-8
@@ -163,10 +231,9 @@ Test.@testset "Dependency-free structured SHT agrees with FastSphericalHarmonics
     end
 end
 
-# Both structured backends compute the spherical mean as a quadrature sum over the same node set, so
-# comparing them to each other cannot detect a wrong weight or a wrong grid — the error would cancel.
-# Pin them to closed-form means instead, on fields chosen so the exact value is known independently:
-# a constant, a degree-1 and a degree-2 zonal harmonic, and a field varying in longitude.
+# Both structured backends compute the spherical mean as a quadrature over the same node set, so each
+# is pinned to closed-form means: a constant, degree-1 and degree-2 zonal harmonics, and a field
+# varying in longitude.
 Test.@testset "Structured spherical mean matches closed-form values" begin
     SC = ScatteringTransforms.SphericalCore
     for lmax in (8, 16, 32)

@@ -25,31 +25,34 @@ Fast, generic wavelet scattering transforms in Julia.
   `AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`).
 - **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
   monogenic amplitude + continuous orientation/phase (`monogenic_components`); on S²,
-  `spherical_monogenic_scattering` (amplitude via the spin-0 Bochner identity) plus
+  `spherical_monogenic_scattering` (amplitude from the exact surface-gradient energy) plus
   `spherical_monogenic_components` for pointwise orientation/phase (spin-1 Riesz vector, dependency-free
   via the surface gradient, or NUFSHT's spin-weighted synthesis when loaded).
 - **Grid-support matrix**: Cartesian × spherical, on uniform/structured and nonuniform/scattered
   sampling — gridded `ScatteringTransform{1,2,3}D` (FFT), scattered-planar `scattered_planar_scattering`
   (exact direct NUDFT), structured-sphere `structured_spherical_scattering` (exact direct SHT), and
   scattered-sphere `spherical_scattering` (exact direct SHT). **Every cell has an in-core,
-  dependency-free default**; `using FINUFFT` / `using NUFSHT` / `using FastSphericalHarmonics` add
-  faster paths selected via the `spectral` keyword.
+  dependency-free default**; `using NonuniformFFTs` or `using FINUFFT` / `using NUFSHT` /
+  `using FastSphericalHarmonics` add faster paths selected via the `transform` keyword.
 - **Pluggable spectral backend**: dependency-free direct-sum default; `using FFTW` switches on
   an `O(N log N)` fast path automatically
-  (`spectral = AutoSpectralBackend() | DirectSumSpectralBackend() | FFTSpectralBackend()`).
+  (`transform = AutoSpectralBackend() | DirectSumSpectralBackend() | FFTSpectralBackend()`).
 - **Batching & threading**: `scattering_batch` reuses one plan/workspace across the batch, on every
   surface — gridded 1D/2D/3D, scattered planar, and the sphere; `using OhMyThreads` enables
-  `scattering_batch(ThreadedBackend(), …)`, which is bit-identical to serial.
+  `scattering_batch(…; execution = ThreadedBackend())`, equal to serial bit for bit on the gridded
+  surfaces and to the solve tolerance on the scattered ones.
 - **Periodized cascade**: every convolution is produced directly on the decimated grid its band
   needs (`oversampling` keyword), exactly — `oversampling ≥ J` reproduces the undecimated cascade
   bit for bit, and lower values trade accuracy for speed.
 - **Vendor-neutral GPU**: `using KernelAbstractions, AbstractFFTs` + a device backend (e.g.
   `using CUDA`) gives a device-resident transform via `GPUBackend(CUDA.CUDABackend())` and a
-  batched-throughput `scattering_batch(gpu, st, X)` — CUDA/ROCm/oneAPI/Metal, validated on `KA.CPU()`.
-  Covers the gridded 1D/2D/3D surfaces and the scattered-planar one. On scattered points everything
-  downstream of the points follows their array type — bank, buffers, cascade — so there is one
-  cascade rather than a device copy of it, and only the NUFFT is bound per vendor: `NonuniformFFTs`
-  is KernelAbstractions-native and runs on any of them, `cuFINUFFT` is bound for CUDA. The
+  batched-throughput `scattering_batch(st, X; execution = gpu)` — CUDA/ROCm/oneAPI/Metal, validated
+  on `KA.CPU()`.
+  Covers the gridded 1D/2D/3D surfaces (with their localized fields and the wavelet-frame inverse),
+  `MonogenicScattering`, and the scattered-planar surface. On scattered points everything
+  downstream of the points follows their array type — bank, buffers, cascade — so the same cascade
+  runs on the device, and only the NUFFT is bound per vendor: `NonuniformFFTs` is
+  KernelAbstractions-native and runs on any of them, `cuFINUFFT` is bound for CUDA. The
   vendor-neutral chain is exercised on `KA.CPU()`; the CUDA bindings themselves are not covered by
   CI, which has no device. Structured-grid spherical scattering is host-only, since
   `FastSphericalHarmonics` has no device path.
@@ -59,34 +62,36 @@ Fast, generic wavelet scattering transforms in Julia.
 ## Quick Start
 
 ```julia
-using ScatteringTransforms
+using ScatteringTransforms: ScatteringTransforms as ST
+using ComputationalBackends: ComputationalBackends as CB
+using FFTW: FFTW                # → automatic O(N log N) fast path
+using OhMyThreads: OhMyThreads  # → ST.scattering_batch(st, X; execution = CB.ThreadedBackend())
 
 # 1D Scattering
 N = 1024
 signal = randn(N)
-st = ScatteringTransform1D(N, 8; Q=1, max_order=2)
+st = ST.Scattering1D.ScatteringTransform1D(N, 8; Q=1, max_order=2)
 coeffs = st(signal)
 
-@show coeffs.S0  # 0th order (average)
-@show coeffs.S1  # 1st order (scale amplitudes)
-@show coeffs.S2  # 2nd order (scale interactions)
+ST.Coefficients.zeroth_order(coeffs)   # 0th order (average)
+ST.Coefficients.first_order(coeffs)    # 1st order (scale amplitudes)
+ST.Coefficients.second_order(coeffs)   # 2nd order (scale interactions)
 
 # 2D Scattering
 image = randn(256, 256)
-st2d = ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
+st2d = ST.Scattering2D.ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
 coeffs_2d = st2d(image)
 
 # 3D volumetric scattering
-st3d = ScatteringTransform3D((32, 32, 32), 3; n_orient=6, max_order=2)
+st3d = ST.Scattering3D.ScatteringTransform3D((32, 32, 32), 3; n_orient=6, max_order=2)
 coeffs_3d = st3d(randn(32, 32, 32))
 
 # Localized (Mallat) field, reduced descriptors, batching
-field  = scattering_field(st, signal)              # per-path low-passed, subsampled maps
-norm   = normalized_coefficients(coeffs)           # s1 = S1/S0, s2 = S2/S1
-batch  = scattering_batch(st, randn(N, 100))       # (coeffs × 100), one plan reused
-
-using FFTW         # → automatic O(N log N) fast path
-using OhMyThreads  # → scattering_batch(ThreadedBackend(), st, X)
+field  = ST.ScatteringFields.scattering_field(st, signal)   # per-path low-passed, subsampled maps
+norm   = ST.Reductions.normalized_coefficients(coeffs)      # s1 = S1/S0, s2 = S2/S1
+X      = randn(N, 100)
+batch  = ST.scattering_batch(st, X)                         # (coeffs × 100), one plan reused
+ST.scattering_batch(st, X; execution = CB.ThreadedBackend()) == batch
 ```
 
 ## Why scattering? (the headline result)
@@ -100,9 +105,10 @@ power spectra (and first-order `S₁`) are the same.
 
 ## Visualizations
 
-### Filter bank — a tight frame
-1D Morlet filter bank in the frequency domain. The Littlewood–Paley sum `|φ|² + Σⱼ|ψⱼ|²` is
-flat at **1** (a tight frame ⇒ the transform is non-expansive — no frequency is amplified).
+### Filter bank and its Littlewood–Paley sum
+1D Morlet filter bank in the frequency domain. For a real field the Littlewood–Paley sum
+`A(ω) = |φ̂|² + ½Σⱼ(|ψ̂ⱼ(ω)|² + |ψ̂ⱼ(−ω)|²)` lies in `(0, 1]`, so the wavelet layer amplifies no
+frequency and is invertible (Andén & Mallat 2014).
 
 ![Morlet Filter Bank](docs/src/assets/filter_bank.png)
 
@@ -148,31 +154,34 @@ not quantized orientation bins.
 
 ### Nonuniform / scattered planar grids
 Off-lattice / gappy planar data (scattered `(x, y)` points) is scattered onto a uniform Fourier mode
-grid by a nonuniform DFT (`scattered_planar_scattering`), where the ordinary Morlet wavelet bank lives;
-on a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` recovers the
+grid by a nonuniform DFT (`scattered_planar_scattering`), where the ordinary Morlet wavelet bank lives.
+The caller gives the domain's size, `period`, which sets every mode's wavelength, or a FlowGeometries
+grid that carries it. On a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` recovers the
 band-limited coefficients for irregular sampling by LSMR least squares — minimum-norm where the
 samples do not determine the modes, with `damp` for explicit Tikhonov regularisation. The default is
-an in-core exact direct NUDFT (no dependencies); `using FINUFFT` enables the faster NUFFT path.
+an in-core exact direct NUDFT (no dependencies); `using NonuniformFFTs` or `using FINUFFT` enables the
+nonuniform FFT, and with both loaded `transform = FlowTransformBindings.NonuniformFFTsBackend()` or
+`FlowTransformBindings.FINUFFTBackend()` names one.
 
 ![Scattered planar scattering](docs/src/assets/scattered_planar.png)
 
 ### Spherical scattering
 On S², both **scattered points** (`spherical_scattering`; in-core direct SHT by default, NUFSHT fast
-path with `using NUFSHT`) and a **structured** Clenshaw–Curtis grid (`structured_spherical_scattering`,
+path with `using NUFSHT`) and a **structured** equiangular grid (`structured_spherical_scattering`,
 via the fast SHT in FastSphericalHarmonics) give matching multi-scale coefficients:
 
 ![Spherical scattering](docs/src/assets/spherical_scattering.png)
 ![Structured spherical scattering](docs/src/assets/structured_spherical.png)
 
-The monogenic *amplitude* computes the spin-1 Riesz energy from spin-0 transforms via a Bochner
-identity (no spin-1 synthesis needed); pointwise orientation/phase (`spherical_monogenic_components`)
-synthesizes the actual spin-1 Riesz tangent vector on S².
+The monogenic *amplitude* takes the spin-1 Riesz energy `|∇_S g|²` from three scalar syntheses of
+`g`'s coefficients, exact at the band limit; pointwise orientation/phase
+(`spherical_monogenic_components`) synthesizes the spin-1 Riesz tangent vector on S².
 
 ![Spherical monogenic components](docs/src/assets/spherical_monogenic.png)
 
 ### Spectral backends
 The in-core direct-sum default is dependency-free but `O(N²)`; loading `FFTW` switches on an
-`O(N log N)` fast path automatically (≈100–1000× faster), with identical results.
+`O(N log N)` fast path automatically, with the same results to rounding.
 
 ![Backend performance](docs/src/assets/backend_performance.png)
 
@@ -201,14 +210,14 @@ julia --project=. basic_usage.jl
 
 ## Zero-Allocation Streaming
 
-For large datasets (e.g., ocean data), use the in-place API:
+For large datasets, use the in-place API:
 
 ```julia
-st = ScatteringTransform1D(N, 8; Q=1, max_order=2)
-coeffs = ScatteringCoefficients1D(length(st.filter_bank.wavelets), Float64)
+st = ST.Scattering1D.ScatteringTransform1D(N, 8; Q=1, max_order=2)
+coeffs = ST.Coefficients.ScatteringCoefficients1D(length(st.filter_bank.wavelets), Float64)
 
 for slice in dataset
-    coeffs = scattering_transform!(coeffs, st, slice)
+    coeffs = ST.Scattering1D.scattering_transform!(coeffs, st, slice)
     process(coeffs)
 end
 ```

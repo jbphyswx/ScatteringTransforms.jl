@@ -1,23 +1,11 @@
 module Execution
 
-"""
-    Execution.jl — execution-backend resolution
-
-Execution backends themselves come from `ComputationalBackends` (`SerialBackend`,
-`ThreadedBackend`, `GPUBackend{B}`, `DistributedBackend{Inner}`, `MPIBackend{Inner,C}`,
-`AutoBackend`); this module only decides what `AutoBackend` resolves to and answers which
-execution extensions are loaded.
-
-`ComputationalBackends.resolve_backend(::AbstractAutoBackend)` deliberately errors so that each
-consumer states its own policy, and defining a method on it here would be type piracy — so
-[`resolve_backend`](@ref) below is a distinct function owned by this package.
-"""
+# What `AutoBackend` resolves to, and which execution extensions are loaded. The backends come from
+# `ComputationalBackends`, which leaves resolving `AbstractAutoBackend` to each consumer; this
+# package's policy is its own `resolve_backend`.
 
 using ComputationalBackends: ComputationalBackends as CB
 
-# Which execution extensions are loaded. Reached only from [`resolve_backend`](@ref) on an
-# `AutoBackend` and from [`check_available`](@ref), which the batch entry points call only after
-# dispatch has already failed to find a backend method — so an honoured request never asks.
 _ext_loaded(name::Symbol) = Base.get_extension(parentmodule(@__MODULE__), name) !== nothing
 
 "`true` when the OhMyThreads extension is loaded, i.e. `ThreadedBackend` can actually run."
@@ -46,8 +34,8 @@ resolve_backend(::CB.AbstractAutoBackend) =
 """
     check_available(backend) -> backend
 
-Throw unless `backend` can actually execute, naming the package that would enable it. Called by the
-batch entry points so an unloadable request fails immediately instead of at a `MethodError`.
+Return `backend` if its extension is loaded, and otherwise throw an `ArgumentError` naming the
+package to load. An `AutoBackend` must go through [`resolve_backend`](@ref) first.
 """
 check_available(b::CB.AbstractSerialBackend) = b
 function check_available(b::CB.AbstractThreadedBackend)

@@ -4,8 +4,8 @@
 Reconstruction from the scattering representation, the three levels the literature uses:
 
   1. **Exact linear wavelet-frame inverse** — `iwavelet ∘ wavelet_transform` recovers the field
-     to machine precision (the bank is a tight frame; no information is lost *before* the
-     modulus).
+     to machine precision through the canonical dual frame (the Littlewood–Paley sum is positive,
+     so no information is lost *before* the modulus).
   2. **Phase retrieval** — recover a field from the first-order moduli `|x ⋆ ψ_λ|` alone
      (Gerchberg–Saxton alternating projections); determined up to a global sign.
   3. **Gradient-descent synthesis** — from noise, descend `‖S(x̂) − S(x)‖²` so the *scattering
@@ -39,7 +39,7 @@ end
 N, J = 256, 6
 sig = spectral_signal(N, -5/3)
 # FFTW fast path for the (AD-free) exact inverse and phase retrieval.
-st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.FFTSpectralBackend())
+st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, transform=SB.FFTSpectralBackend())
 
 # ── 1. exact linear inverse ───────────────────────────────────────────────────
 wt = ST.Inverse.wavelet_transform(st, sig)            # complex (pre-modulus) wavelet + low-pass fields
@@ -59,7 +59,7 @@ println("2. phase retrieval:        modulus rel. err = ", round(mod_relerr; sigd
 # ── 3. gradient-descent synthesis from scattering coefficients ────────────────
 # Use the in-core direct-sum forward: it is differentiable by *every* AD backend with no special
 # rules (FFTW-fast-path reverse-mode AD needs the backend's FFT rules — see the docs).
-st_ad = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, spectral=SB.DirectSumSpectralBackend())
+st_ad = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, transform=SB.DirectSumSpectralBackend())
 # Runtime activity is required, not optional: the cascade maps a closure over the filter bank, so
 # every closure holds constant filters next to the active input and Enzyme's static activity analysis
 # cannot tell them apart. Without it, `AutoEnzyme()` raises `EnzymeRuntimeActivityError`.
