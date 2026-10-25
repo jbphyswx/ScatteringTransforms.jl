@@ -101,6 +101,7 @@ ST.SphericalCore.sphere_coeffs_buffer(plan::SHTSphericalPlan) =
 
 # A structured plan is defined by its band limit alone, so narrowing is just building a smaller one.
 ST.SphericalCore.sphere_plan_at(::SHTSphericalPlan, lmax::Integer) = SHTSphericalPlan(Int(lmax))
+ST.SphericalCore.sphere_lmax(p::SHTSphericalPlan) = p.lmax
 
 # A coefficient's position encodes `(l, m)` the same way at every grid size (column `m`, row
 # `l - |m|`), so the coefficients a narrower grid represents are its leading sub-block, degrees above

@@ -1,7 +1,7 @@
 """
     suite.jl — the performance gate
 
-Three scale-free criteria, because an absolute millisecond target says nothing without the machine
+Four scale-free criteria, because an absolute millisecond target says nothing without the machine
 it was measured on:
 
  1. **Roofline ratio** — achieved time against the cost of the same cascade's steps done back to
@@ -9,10 +9,9 @@ it was measured on:
     modulus+mean; the cascade issues `(1 + nparents) + (nw + npaths)` of them. A ratio near `1`
     means everything except the transform itself is free.
 
-    The floor is deliberately a *full step*, not just the FFT. Measured here, the FFT is only
-    ~a quarter of a step: the multiply and the modulus each move `O(N)` words against the
-    transform's `O(N log N)` of compute, so the cascade is memory-bandwidth bound and an FFT-only
-    roofline is optimistic by ~4x.
+    The floor is a full step: the multiply and the modulus each move `O(N)` words against the
+    transform's `O(N log N)` of compute, so the cascade is memory-bandwidth bound, and a floor of
+    FFTs alone sits below what any cascade reaches. The FFT's share of a step is printed beside it.
 
  2. **Parallel efficiency** — `t_serial / t_threaded`, against the *physical* core count. Threads
     beyond that share one memory controller, so on a bandwidth-bound kernel they do not scale.
@@ -48,10 +47,9 @@ const FB = SB.FFTSpectralBackend()
 
 bench(f, r = 3) = (f(); minimum(@elapsed(f()) for _ in 1:r))
 
-# For the micro-kernels the floor is built from. A single 20 us kernel timed on its own is mostly
-# timer and call overhead — enough to put the reported floor an order of magnitude over the truth,
-# which shows up as a transform "beating" its own floor. Repeat inside the timed region until the
-# measurement is well clear of that.
+# For the micro-kernels the floor is built from. A kernel of tens of microseconds timed on its own is
+# mostly timer and call overhead, which inflates the floor until a transform appears to beat it; the
+# kernel repeats inside the timed region until the measurement is well clear of that.
 function bench_kernel(f, target = 5.0e-3)
     f()
     t1 = minimum(@elapsed(f()) for _ in 1:3)
@@ -66,7 +64,7 @@ function bench_kernel(f, target = 5.0e-3)
     return best
 end
 
-# Spectral-plan executions one cascade must issue, read off the tree rather than assumed.
+# Spectral-plan executions one cascade issues, read off its path tree.
 function transform_count(st)
     nw = length(st.filter_bank.wavelets)
     npaths = length(ST.PathGraph.order_range(st.tree, 2))
@@ -160,9 +158,9 @@ end
 # points. What one iteration costs *over* the two transforms inside it is a property of the solver:
 # LSMR does vector work over the points and over the modes each iteration on top of a type-2 and a
 # type-1, and that fraction is largest on small grids, where the transform has the least work to hide
-# it behind. Both are measured rather than counted, because the vector work is bandwidth bound where the
-# FFT is cache blocked, and because `M` and `ms` are independent: the caller may hand over more modes
-# than samples, and the regime decides everything.
+# it behind. Both are measured: the vector work is bandwidth bound where the FFT is cache blocked, and
+# `M` and `ms` are independent — the caller may hand over more modes than samples, and the regime
+# decides both.
 #
 # Reported per regime: `M`, `prod(ms)`, iterations to tolerance, the cost of one type-2 plus one
 # type-1, the measured cost of one solver iteration, and their ratio — the number that says whether
@@ -202,9 +200,9 @@ function solve_case(::Type{T}, label, xs, ys, ms, period, spec) where {T}
     rtol = ST.Plans.default_solver_rtol(T, spec, nothing)
     iters, stop = solve_probe(T, base, b, ms, M, rtol, 100)
 
-    # A solve the package refuses is a result, not a crash: at `conlim = 1/eps(T)` an operator whose
-    # smallest singular direction carries nothing this precision can represent is rejected rather than
-    # answered, and in `Float32` on a gappy set that is reachable. Reported, and the sweep goes on.
+    # A solve the package refuses is reported and the sweep goes on: at `conlim = 1/eps(T)` an operator
+    # whose smallest singular direction carries nothing this precision can represent is rejected, which
+    # a gappy set reaches in `Float32`.
     solved = mk(true, 100, rtol)
     t_solve = try
         bench(() -> ST.Plans.forward_transform!(X, solved, b))
@@ -217,15 +215,12 @@ function solve_case(::Type{T}, label, xs, ys, ms, period, spec) where {T}
     # `prod(ms)` rescale and the timer all cancel. Only meaningful while both budgets are actually
     # spent: `atol`/`btol` can be driven to zero but LSMR's machine-precision tests cannot, so on a
     # well-conditioned operator both runs stop at the same converged iterate and their difference is
-    # noise rather than `k2 - k1` iterations. That case is reported as converged instead of quoting a
-    # per-iteration cost the measurement cannot see.
+    # noise; that case is reported as converged, with no per-iteration cost.
     k1, k2 = 8, 24
     forced_iters, _ = solve_probe(T, base, b, ms, M, zero(T), k2)
     t_iter = if forced_iters == k2
         p1, p2 = mk(true, k1, zero(T)), mk(true, k2, zero(T))
-        # More repetitions than elsewhere because differencing two nearby times amplifies their
-        # scatter: at three reps this disagreed with `solve/(iters·pair)` by 25%, which is the
-        # measurement's noise and not a property of the solver.
+        # Nine repetitions: differencing two nearby times amplifies their scatter.
         d = try
             t1 = bench(() -> ST.Plans.forward_transform!(X, p1, b), 9)
             t2 = bench(() -> ST.Plans.forward_transform!(X, p2, b), 9)
@@ -253,8 +248,8 @@ end
 
 function scattered_solve()
     ga = π * (3 - sqrt(5.0))
-    # Sizes span the range where the overhead fraction is predicted to move: the vector work is `O(n)`
-    # against a transform's `O(n log n)`, so the smallest grid is the hard case, not the afterthought.
+    # The vector work is `O(n)` against a transform's `O(n log n)`, so the overhead fraction is largest on
+    # the smallest grid.
     grids = TIER == "full" ? ((8, 8), (16, 16), (32, 32), (200, 200), (256, 256)) :
                              ((8, 8), (32, 32), (200, 200))
     for spec in nufft_libraries(), T in (TIER == "full" ? (Float64, Float32) : (Float64,))
@@ -269,13 +264,12 @@ function scattered_solve()
             solve_case(T, "well sampled $(ms[1])^2", xs, ys, ms, (2π, 2π), spec)
 
             # The exact DFT nodes: `A†A = n·I`, so any least-squares method is done in one iteration.
-            # A count above 1 here means a scaling or convention has drifted, not that the solve is slow.
+            # A count above 1 here means a scaling or convention has drifted.
             gx = T[2π * (i - 1) / ms[1] for i in 1:ms[1], j in 1:ms[2]]
             gy = T[2π * (j - 1) / ms[2] for i in 1:ms[1], j in 1:ms[2]]
             solve_case(T, "  exact nodes $(ms[1])^2", vec(gx), vec(gy), ms, (2π, 2π), spec)
 
-            # Fewer samples than modes, with a void — the geometry that made the old solver diverge.
-            # Iterations here are the honest cost of the fix.
+            # Fewer samples than modes, with a void: an underdetermined, ill-conditioned fit.
             Mg = n ÷ 2
             xg = [2π * mod(ga * k, 1.0) for k in 1:Mg]
             yg = [π * mod(sqrt(2.0) * k, 1.0) for k in 1:Mg]   # samples confined to half the domain
@@ -294,9 +288,8 @@ function scattered_solve()
         end
     end
 
-    # Threading and `ntrans` on the solve path, which is where a per-task plan or a per-column
-    # recurrence would show up: the batched solve runs `B` LSMR recurrences through one execution per
-    # transform, so its iteration count is the worst column's, not the average.
+    # Threading and `ntrans` on the solve path: the batched solve runs `B` LSMR recurrences through one
+    # execution per transform, so its iteration count is the worst column's.
     println("\nSolve under a full cascade — threading and batching:")
     M, B = 4000, 8
     xs = [2π * mod(ga * k, 1.0) for k in 1:M]
@@ -336,6 +329,47 @@ function solve_cascade(spectral, xs, ys, Xb, B)
 end
 
 # ---------------------------------------------------------------------------
+# Scattered surfaces with every setting at their defaults, against their own plan's transforms
+# ---------------------------------------------------------------------------
+
+# Planar: the cascade issues `1 + nparents` analyses and `nw + npaths` syntheses, each one NUFFT on the
+# plan's library at its thread count. The unit is one synthesis and one analysis of the plan itself.
+function scattered_planar_defaults(M, m, J)
+    xs, ys = rand(M), rand(M)
+    st = ST.scattered_planar_scattering(xs, ys, (m, m), J; period = 1.0)
+    f = randn(M)
+    t = bench(() -> st(f), 2)
+    nw = ST.FilterBanks.nwavelets(st.filter_bank)
+    nan = 1 + count(g -> !isempty(g[2]), st.groups)
+    nsy = nw + length(ST.PathGraph.order_range(st.tree, 2))
+    X = zeros(ComplexF64, m, m)
+    pts = zeros(ComplexF64, M)
+    ST.Plans.forward_transform!(X, st.plan, f)
+    t_pair = bench_kernel(() -> (ST.Plans.inverse_transform!(pts, st.plan, X); ST.Plans.forward_transform!(X, st.plan, f)))
+    Printf.@printf("%-30s %8.1f ms = %6.1f synthesis+analysis pairs (one %.2f ms); it issues %d analyses and %d syntheses\n",
+                   "scattered planar M=$M $(m)^2 J=$J", t * 1e3, t / t_pair, t_pair * 1e3, nan, nsy)
+    return nothing
+end
+
+# Sphere: the cascade analyses the field and every first-order field with children (`J` of them) and
+# synthesises `J + J(J−1)/2` bands; an analysis is the least-squares fit, a synthesis one transform.
+function scattered_sphere_defaults(M, lmax, J)
+    θ = acos.(1 .- 2 .* rand(M))
+    φ = 2π .* rand(M)
+    st = ST.spherical_scattering(θ, φ, lmax, J)
+    f = randn(M)
+    t = bench(() -> st(f), 2)
+    C = ST.SphericalCore.sphere_coeffs_buffer(st.plan)
+    out = similar(f)
+    ta = bench(() -> ST.SphericalCore.sphere_coeffs!(C, st.plan, f), 2)
+    ts = bench_kernel(() -> ST.SphericalCore.sphere_apply!(out, st.plan, C, Returns(1.0)))
+    Printf.@printf("%-30s %8.1f ms; one analysis (fit) %.1f ms, one synthesis %.2f ms: %d analyses + %d syntheses = %.1f ms\n",
+                   "scattered sphere M=$M lmax=$lmax J=$J", t * 1e3, ta * 1e3, ts * 1e3, J, J + J * (J - 1) ÷ 2,
+                   (J * ta + (J + J * (J - 1) ÷ 2) * ts) * 1e3)
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
 # 5. Allocation: every `!` path, zero in steady state
 # ---------------------------------------------------------------------------
 
@@ -368,9 +402,8 @@ end
 
 # ---------------------------------------------------------------------------
 
-# A timing that does not name the backend it resolved to is not a measurement. Every `Auto*` backend
-# falls back to the in-core reference — `O(N²)` gridded, `O(M·K)` nonuniform — when its extension is
-# absent, and that reads as a slow transform rather than as a missing dependency.
+# A timing names the backend it resolved to: every `Auto*` backend falls back to the in-core reference —
+# `O(N²)` gridded, `O(M·K)` nonuniform — when its extension is absent.
 _ext(name) = Base.get_extension(ST, name) !== nothing
 
 function loaded_fast_paths()
@@ -391,8 +424,8 @@ function main()
     println("loaded fast paths: ", join(loaded_fast_paths(), ", "))
 
     header("Gridded surfaces — roofline and parallel efficiency")
-    # `Q` is swept as well as `N`/`J`: it multiplies the wavelet count without changing the grid, so
-    # it moves the transform along the work-per-byte axis rather than the size axis.
+    # `Q` is swept as well as `N`/`J`: it multiplies the wavelet count at a fixed grid, moving the
+    # transform along the work-per-byte axis.
     grid = TIER == "full" ?
         ((1024, 6, 1, 64), (4096, 8, 1, 64), (4096, 8, 8, 16), (16384, 10, 1, 16)) :
         ((1024, 6, 1, 64), (4096, 8, 1, 32))
@@ -436,9 +469,9 @@ function main()
     tt = bench(() -> ST.scattering_batch(sp, Xp; execution = CB.ThreadedBackend()))
     Printf.@printf("%-24s serial %8.1f ms   threaded %8.1f ms   %.2fx\n", "scattered planar M=$M",
                    ts * 1e3, tt * 1e3, ts / tt)
-    # The batch axis is also a *transform* axis here: a plan built with `ntrans = B` runs the whole
-    # stack through one NUFFT execution per cascade step instead of one per field. Reported against
-    # the per-field loop above, since the two compose with threading rather than replacing it.
+    # The batch axis is also a transform axis here: a plan built with `ntrans = B` runs the whole stack
+    # through one NUFFT execution per cascade step. Reported against the per-field loop above; the two
+    # compose with threading.
     spb = ST.ScatteredPlanar.build(Float64, px, py, (32, 32), 3; period = 1.0, L = 4, ntrans = Bp)
     if ST.Plans.batch_width(spb.plan) == Bp
         tb = bench(() -> ST.scattering_batch(spb, Xp))
@@ -480,6 +513,12 @@ function main()
     else
         println("scattered sphere: skipped — NUFSHT not loaded (its in-core O(M·K) reference would " *
                 "be reported as the transform's speed)")
+    end
+
+    header("Scattered surfaces at their defaults — cost in their own plan's transforms")
+    TIER == "full" ? scattered_planar_defaults(100_000, 128, 5) : scattered_planar_defaults(10_000, 64, 4)
+    if _ext(:ScatteringTransformsNUFSHTExt)
+        TIER == "full" ? scattered_sphere_defaults(33_282, 128, 5) : scattered_sphere_defaults(8_450, 64, 4)
     end
 
     header("Scattered least-squares solve — cost per iteration against the transforms in it")
