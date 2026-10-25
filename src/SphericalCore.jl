@@ -179,6 +179,13 @@ form of decimation: band-pass wavelet `j` is confined to degrees `≲ ℓ_j`.
 sphere_plan_at(::Any, ::Integer) = nothing
 
 """
+    sphere_lmax(plan) -> Int
+
+The band limit of `plan`. Every backend that defines [`sphere_plan_at`](@ref) defines this.
+"""
+function sphere_lmax end
+
+"""
     sphere_restrict!(Cdst, pdst, Csrc, psrc) -> Cdst
 
 Copy the spherical-harmonic coefficients of degree `≤ pdst`'s band limit out of `Csrc` (laid out for
@@ -230,10 +237,11 @@ too: the in-core structured plan's Fejér weights are not uniform.
 function plan_weights end
 
 """
-    plan_solver(plan) -> (; rtol, maxiter)
+    plan_solver(plan) -> (; rtol, maxiter, solve)
 
-The iterative-solver settings a plan analyses with, as its constructor takes them, or `nothing` for
-a plan whose analysis is an exact transform.
+The analysis settings of a scattered-sphere plan, as its constructor takes them: `solve`, whether it
+fits the coefficients by least squares or takes the weighted adjoint, and the fit's tolerances. `nothing`
+for a plan whose analysis is an exact transform.
 """
 function plan_solver end
 
@@ -340,16 +348,15 @@ Base.show(io::IO, st::SphericalScattering{T}) where {T} =
           ", ", st.plan, st.bands === nothing ? "" : ", per-scale band limits", ")")
 
 """
-    band_plans(plan, lmax, J, headroom) -> Vector or nothing
+    band_plans(plan, lmax, ls) -> Vector or nothing
 
-One narrowed plan per scale, or `nothing` if this backend cannot narrow or no band needs narrowing.
-A scale whose band needs the full band limit reuses `plan`.
+One plan per scale, scale `j` at band limit `ls[j]`, or `nothing` if this backend cannot narrow or
+no band needs narrowing. A scale at the full band limit `lmax` reuses `plan`.
 """
-function band_plans(plan, lmax::Integer, J::Integer, headroom::Real)
-    ls = [band_lmax(lmax, J, j, headroom) for j in 1:J]
+function band_plans(plan, lmax::Integer, ls::AbstractVector{<:Integer})
     all(>=(lmax), ls) && return nothing
-    sphere_plan_at(plan, lmax) === nothing && return nothing
-    return map(l -> l >= lmax ? plan : sphere_plan_at(plan, l), ls)
+    bands = map(l -> l >= lmax ? plan : sphere_plan_at(plan, l), ls)
+    return any(isnothing, bands) ? nothing : bands
 end
 
 """
@@ -876,10 +883,12 @@ FTB.lsmr_adjoint!(v, op::_SHTOperator, u, c, n) =
 
 The in-core scattered-sphere plan over `M` points at band limit `lmax`, transforming `B` co-located
 fields per call. Analysis is the least-squares fit of the real spherical harmonics of degree
-`≤ lmax` by LSMR (`FlowTransformBindings.lsmr!`), synthesis their direct sum at the points; neither
-forms the `M × (lmax+1)²` matrix of harmonics, so memory is `O(M + (lmax+1)²)`.
+`≤ lmax` by LSMR (`FlowTransformBindings.lsmr!`), weighted by the quadrature weights `w`, which sum to 1:
+`min Σⱼ wⱼ (fⱼ − Σ a_ℓm Y_ℓm(xⱼ))²`. With `solve = false` it is the weighted adjoint
+`a_ℓm = Σⱼ wⱼ fⱼ Y_ℓm(xⱼ)` over harmonics of mean square 1. Synthesis is their direct sum at the points;
+neither forms the `M × (lmax+1)²` matrix of harmonics, so memory is `O(M + (lmax+1)²)`.
 """
-struct DirectSHTSphericalPlan{T, B, VV <: AbstractVector{T}, R, LT, OP, WS, HA} <: AbstractSphericalPlan
+struct DirectSHTSphericalPlan{T, B, VV <: AbstractVector{T}, R, LT, OP, FO, WS, HA} <: AbstractSphericalPlan
     lmax::Int
     M::Int
     K::Int
@@ -888,27 +897,30 @@ struct DirectSHTSphericalPlan{T, B, VV <: AbstractVector{T}, R, LT, OP, WS, HA} 
     weights::VV      # (M) spatial-mean quadrature weights, summing to 1
     rtol::T
     maxiter::Int
+    solve::Bool      # the least-squares fit, or the weighted adjoint
     rings::R         # read-only, shared with every copy
     tab::LT          # read-only, shared with every copy
     op::OP           # the transforms' operator and scratch
-    ls::WS           # its `FTB.LSMRWorkspace`
+    fit::FO          # `op` under the weights, the operator the fit runs on
+    ls::WS           # the fit's `FTB.LSMRWorkspace`
     ha::HA           # (K[, B]) coefficients times a degree multiplier, for `sphere_apply!`
 end
 
-function _direct_sht_plan(θ::V, φ::V, w::V, rtol::T, maxiter::Int, rings, tab, lmax::Int,
+function _direct_sht_plan(θ::V, φ::V, w::V, rtol::T, maxiter::Int, solve::Bool, rings, tab, lmax::Int,
                           B::Int) where {T, V <: AbstractVector{T}}
     M, K = length(θ), (lmax + 1)^2
     op = _SHTOperator(rings, tab, _SHTScratch(T, lmax, B), B, Matrix{T}(undef, M, B),
                       Matrix{T}(undef, K, B))
-    ls = FTB.LSMRWorkspace(op)
+    fit = FTB.RangeWeighted(op, w)
+    ls = FTB.LSMRWorkspace(fit)
     ha = B == 1 ? Vector{T}(undef, K) : Matrix{T}(undef, K, B)
-    return DirectSHTSphericalPlan{T, B, V, typeof(rings), typeof(tab), typeof(op), typeof(ls),
-                                  typeof(ha)}(lmax, M, K, θ, φ, w, rtol, maxiter, rings, tab, op, ls, ha)
+    return DirectSHTSphericalPlan{T, B, V, typeof(rings), typeof(tab), typeof(op), typeof(fit), typeof(ls),
+                                  typeof(ha)}(lmax, M, K, θ, φ, w, rtol, maxiter, solve, rings, tab, op, fit, ls, ha)
 end
 
 function DirectSHTSphericalPlan(θ::AbstractVector, φ::AbstractVector, lmax::Int, ::Type{T};
                                 rtol::Real = 1.0e-8, maxiter::Int = 500, weights = nothing,
-                                ntrans::Int = 1) where {T}
+                                ntrans::Int = 1, solve::Bool = true) where {T}
     M = length(θ)
     length(φ) == M || throw(DimensionMismatch("θ and φ must have equal length"))
     lmax >= 0 || throw(ArgumentError("lmax must be nonnegative; got $lmax"))
@@ -916,7 +928,7 @@ function DirectSHTSphericalPlan(θ::AbstractVector, φ::AbstractVector, lmax::In
     # Host arrays: the transforms visit the points one at a time.
     θT, φT = collect(T, θ), collect(T, φ)
     w = weights === nothing ? fill(one(T) / M, M) : collect(T, T.(weights) ./ sum(weights))
-    return _direct_sht_plan(θT, φT, w, T(rtol), maxiter, _SHTRings(θT, φT), _LegendreTable(T, lmax),
+    return _direct_sht_plan(θT, φT, w, T(rtol), maxiter, solve, _SHTRings(θT, φT), _LegendreTable(T, lmax),
                             lmax, ntrans)
 end
 
@@ -927,30 +939,40 @@ Base.show(io::IO, p::DirectSHTSphericalPlan{T, B}) where {T, B} =
 # operator scratch and solver workspace, which analysis writes its result through.
 plan_points(p::DirectSHTSphericalPlan) = (p.theta, p.phi)
 plan_weights(p::DirectSHTSphericalPlan) = p.weights
-plan_solver(p::DirectSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter)
+plan_solver(p::DirectSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter, solve = p.solve)
 Plans.spectral_backend(::DirectSHTSphericalPlan) = SB.DirectSumSpectralBackend()
 Plans.batch_width(::DirectSHTSphericalPlan{T, B}) where {T, B} = B
 
 Plans.task_local_plan(p::DirectSHTSphericalPlan{T, B}) where {T, B} =
-    _direct_sht_plan(p.theta, p.phi, p.weights, p.rtol, p.maxiter, p.rings, p.tab, p.lmax, B)
+    _direct_sht_plan(p.theta, p.phi, p.weights, p.rtol, p.maxiter, p.solve, p.rings, p.tab, p.lmax, B)
 
 supports_batch(::DirectSHTSphericalPlan) = true
 batch_plan(p::DirectSHTSphericalPlan{T, B}, n::Integer) where {T, B} =
-    n == B ? p : _direct_sht_plan(p.theta, p.phi, p.weights, p.rtol, p.maxiter, p.rings, p.tab,
+    n == B ? p : _direct_sht_plan(p.theta, p.phi, p.weights, p.rtol, p.maxiter, p.solve, p.rings, p.tab,
                                   p.lmax, Int(n))
 
-# Analysis: the least-squares coefficients of `field`, one column per field of a `(M, B)` stack. A
-# field may be a length-`M` vector (scattered) or the `(Nθ, Nφ)` grid matrix (structured), read in the
-# order the plan's points were built. LSMR stops on `‖A†r‖ ≤ rtol ‖A†b‖` and returns its best iterate
-# at `maxiter`.
+# Analysis of `field`, one column per field of a `(M, B)` stack. A field may be a length-`M` vector
+# (scattered) or the `(Nθ, Nφ)` grid matrix (structured), read in the order the plan's points were
+# built. The fit's LSMR stops on `‖A†r‖ ≤ rtol ‖A†b‖` and returns its best iterate at `maxiter`.
 sphere_coeffs(plan::DirectSHTSphericalPlan, field::AbstractArray) =
     sphere_coeffs!(sphere_coeffs_buffer(plan), plan, field)
 
-function sphere_coeffs!(a::AbstractArray, plan::DirectSHTSphericalPlan{T}, field::AbstractArray) where {T}
-    FTB.lsmr!(a, plan.op, field, plan.ls; rtol = plan.rtol, maxiter = plan.maxiter,
-              conlim = inv(eps(T)))
-    check_sphere_solve(plan.ls, plan.M, plan.lmax, plan.rtol, plan.maxiter)
-    return a
+function sphere_coeffs!(a::AbstractArray, plan::DirectSHTSphericalPlan{T, B}, field::AbstractArray) where {T, B}
+    if plan.solve
+        FTB.lsmr!(a, plan.fit, field, plan.ls; rtol = plan.rtol, maxiter = plan.maxiter,
+                  conlim = inv(eps(T)))
+        check_sphere_solve(plan.ls, plan.M, plan.lmax, plan.rtol, plan.maxiter)
+        return a
+    end
+    # The adjoint of `w ⊙ f`, through the fit's range buffer, which the adjoint does not use; a point of
+    # zero weight contributes nothing whatever `f` holds there.
+    t, M = plan.op.t, plan.M
+    @inbounds for b in 1:B, n in 1:M
+        i = (b - 1) * M + n
+        wn = plan.weights[n]
+        t[i] = iszero(wn) ? zero(T) : wn * field[i]
+    end
+    return _sht_adjoint!(a, plan.rings, plan.tab, plan.op.scr, t, B)
 end
 
 sphere_coeffs_buffer(plan::DirectSHTSphericalPlan{T, B}) where {T, B} =
@@ -1007,7 +1029,7 @@ end
 _have_nufsht() = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsNUFSHTExt) !== nothing
 
 """
-    nusht_spherical_plan(θ, φ, lmax, T; rtol, maxiter, weights, ntrans, spin, nufft)
+    nusht_spherical_plan(θ, φ, lmax, T; rtol, maxiter, weights, ntrans, spin, nufft, solve)
 
 Scattered-sphere plan on NUFSHT, a method the NUFSHT extension defines; this fallback throws an
 `ArgumentError` naming `using NUFSHT`.
@@ -1038,7 +1060,7 @@ working state, so concurrent use needs `Plans.task_local_plan`.
 plan_spin(::Any) = nothing
 
 """
-    make_spherical_plan(spectral, θ, φ, lmax, T; rtol, maxiter, weights, ntrans, spin, nufft)
+    make_spherical_plan(spectral, θ, φ, lmax, T; rtol, maxiter, weights, ntrans, spin, nufft, solve)
         -> AbstractSphericalPlan
 
 Build the scattered-sphere plan selected by `spectral` over points `(θ, φ)` and band limit `lmax`.
@@ -1047,7 +1069,8 @@ Build the scattered-sphere plan selected by `spectral` over points `(θ, φ)` an
 extension is loaded) uses the NUFSHT fast path.
 
 `ntrans = B` builds a plan that transforms `B` co-located fields per call, and `weights` are the
-quadrature weights of the spherical mean. `spin = true` asks for what
+quadrature weights of the spherical mean. `solve = true` analyses by the least-squares fit weighted by
+them, `false` by the adjoint weighted by them (uniform without them). `spin = true` asks for what
 [`spherical_monogenic_components`](@ref ScatteringTransforms.spherical_monogenic_components) needs:
 the NUFSHT plan builds its spin pair (see [`plan_spin`](@ref)), and the in-core plan, which takes the
 surface gradient of `(−Δ_S)^{-1/2}U⁰`, needs nothing more. The in-core plan runs no NUFFT and throws
@@ -1056,12 +1079,13 @@ for a named `nufft`.
 function make_spherical_plan(s::SB.AbstractDirectSumSpectralBackend, θ, φ, lmax, ::Type{T};
                              rtol::Real = default_rtol(s), maxiter::Int = 500, weights = nothing,
                              ntrans::Int = 1, spin::Bool = false,
-                             nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {T}
+                             nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
+                             solve::Bool = true) where {T}
     nufft isa SB.AbstractAutoSpectralBackend || throw(ArgumentError(
         "the in-core spherical plan performs no NUFFT, so `nufft = $nufft` cannot be honoured; " *
         "pass transform = SpectralBackends.NUFSHTSpectralBackend() for a NUFFT-backed transform."))
     return DirectSHTSphericalPlan(θ, φ, lmax, T; rtol = rtol, maxiter = maxiter, weights = weights,
-                                  ntrans = ntrans)
+                                  ntrans = ntrans, solve = solve)
 end
 make_spherical_plan(::SB.AbstractNUFSHTSpectralBackend, θ, φ, lmax, ::Type{T}; kwargs...) where {T} =
     nusht_spherical_plan(θ, φ, lmax, T; kwargs...)

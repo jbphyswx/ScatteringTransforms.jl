@@ -14,18 +14,21 @@ using ScatteringTransforms: ScatteringTransforms as ST
 # ---------------------------------------------------------------------------
 
 """
-    NUSHTSphericalPlan{P,V,T,NB,SP,W,SW,WV} <: SphericalCore.AbstractSphericalPlan
+    NUSHTSphericalPlan{P,V,T,NB,SP,W,SW,WV,QW} <: SphericalCore.AbstractSphericalPlan
 
 Scattered-point spherical plan over a `NUFSHT.NUSHTplan` on the points `(theta, phi)`, which it
-retains so a task or another process can rebuild on them. Analysis is a band-limited least-squares
-solve to `rtol` within `maxiter` iterations, which needs roughly `M ≳ (lmax+1)²` well-distributed
-points; `ws` is its LSMR workspace, so an analysis allocates none. `weights`, summing to 1, are the
-quadrature of the spherical mean, or `nothing` for the sample mean. A plan built by the monogenic
-constructors also holds `spin`, the spin-weighted plan pair `spherical_monogenic_components`
-synthesises with, and `spin_ws`, its solve's workspace.
+retains so a task or another process can rebuild on them. With `solve`, analysis is a band-limited
+least-squares solve to `rtol` within `maxiter` iterations on `fit`, the plan under `weights` where they are
+given, which needs roughly `M ≳ (lmax+1)²` well-distributed points, and `ws` is its LSMR workspace, so an
+analysis allocates none; without, it is one adjoint transform weighted by `qweights`, the mean's weights
+times `4π`. `weights`, summing to 1, are the quadrature of the spherical mean and the fit, or `nothing`
+for the sample mean and the unweighted fit. A plan built by the monogenic constructors also holds
+`spin`, the spin-weighted plan pair `spherical_monogenic_components` synthesises with, and `spin_ws`, its
+solve's workspace.
 """
-struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, NB, SP, W, SW, WV} <: ST.SphericalCore.AbstractSphericalPlan
+struct NUSHTSphericalPlan{P, F, V<:AbstractVector, T<:Real, NB, SP, W, SW, WV, QW} <: ST.SphericalCore.AbstractSphericalPlan
     plan::P
+    fit::F           # `plan`, or `plan` under `weights`: the operator of the fit
     M::Int
     lmax::Int
     theta::V
@@ -34,19 +37,27 @@ struct NUSHTSphericalPlan{P, V<:AbstractVector, T<:Real, NB, SP, W, SW, WV} <: S
     maxiter::Int
     nufft::NB        # the *resolved* NUFFT backend driving `plan`, never an `Auto` request
     spin::SP         # (spin-0, spin-1) plan pair for `spherical_monogenic_components`, or `nothing`
-    ws::W
-    spin_ws::SW      # the spin-0 solve's workspace, or `nothing` alongside `spin`
+    ws::W            # the fit's workspace, or `nothing` for the weighted adjoint
+    spin_ws::SW      # the spin-0 solve's workspace, or `nothing`
     weights::WV
+    solve::Bool
+    qweights::QW     # the adjoint's weights over orthonormal harmonics, or `nothing` for the fit
 end
 
 function NUSHTSphericalPlan(plan, M, lmax, theta, phi, rtol, maxiter, nufft, spin = nothing;
-                            weights = nothing)
-    ws = FTB.LSMRWorkspace(plan)
-    sws = spin === nothing ? nothing : FTB.LSMRWorkspace(spin[1])
-    return NUSHTSphericalPlan{typeof(plan), typeof(theta), typeof(rtol), typeof(nufft), typeof(spin),
-                              typeof(ws), typeof(sws), typeof(weights)}(
-        plan, M, lmax, theta, phi, rtol, maxiter, nufft, spin, ws, sws, weights)
+                            weights = nothing, solve::Bool = true)
+    fit = weights === nothing ? plan : FTB.RangeWeighted(plan, weights)
+    ws = solve ? FTB.LSMRWorkspace(fit) : nothing
+    sws = (solve && spin !== nothing) ? FTB.LSMRWorkspace(spin[1]) : nothing
+    qw = solve ? nothing : _quadrature_weights(theta, weights, M)
+    return NUSHTSphericalPlan{typeof(plan), typeof(fit), typeof(theta), typeof(rtol), typeof(nufft), typeof(spin),
+                              typeof(ws), typeof(sws), typeof(weights), typeof(qw)}(
+        plan, fit, M, lmax, theta, phi, rtol, maxiter, nufft, spin, ws, sws, weights, solve, qw)
 end
+
+# The mean's weights, summing to 1, times the sphere's area `4π`; uniform without them.
+_quadrature_weights(θ::AbstractVector, ::Nothing, M::Int) = fill!(similar(θ), 4 * eltype(θ)(π) / M)
+_quadrature_weights(θ::AbstractVector, w::AbstractVector, ::Int) = (4 * eltype(θ)(π)) .* w
 
 # `show` names the batch width and the resolved NUFFT backend, which is direct summation when no fast
 # NUFFT extension is loaded.
@@ -68,7 +79,7 @@ function ST.SphericalCore.batch_plan(p::NUSHTSphericalPlan, B::Integer)
     # The spin pair holds the buffers its synthesis writes through, so the widened plan gets its own:
     # one task may use it while another uses `p`.
     return NUSHTSphericalPlan(plan, p.M, p.lmax, p.theta, p.phi, p.rtol, p.maxiter, p.nufft,
-                              _rebuild_spin(p); weights = p.weights)
+                              _rebuild_spin(p); weights = p.weights, solve = p.solve)
 end
 
 ST.SphericalCore.plan_nufft(p::NUSHTSphericalPlan) = p.nufft
@@ -83,7 +94,7 @@ end
 ST.SphericalCore.plan_spin(p::NUSHTSphericalPlan) = p.spin
 ST.SphericalCore.plan_points(p::NUSHTSphericalPlan) = (p.theta, p.phi)
 ST.SphericalCore.plan_weights(p::NUSHTSphericalPlan) = p.weights
-ST.SphericalCore.plan_solver(p::NUSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter)
+ST.SphericalCore.plan_solver(p::NUSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter, solve = p.solve)
 ST.Plans.spectral_backend(::NUSHTSphericalPlan) = SB.NUFSHTSpectralBackend()
 
 function ST.Plans.task_local_plan(p::NUSHTSphericalPlan)
@@ -92,7 +103,7 @@ function ST.Plans.task_local_plan(p::NUSHTSphericalPlan)
     plan = NUFSHT.make_plan(eltype(p.theta), p.theta, p.phi, p.lmax;
                             ntrans = p.plan.B, nufft = p.nufft, tol = p.plan.tol)
     return NUSHTSphericalPlan(plan, p.M, p.lmax, p.theta, p.phi, p.rtol, p.maxiter, p.nufft,
-                              _rebuild_spin(p); weights = p.weights)
+                              _rebuild_spin(p); weights = p.weights, solve = p.solve)
 end
 
 # One spin plan per spin weight over the plan's own points, on the scalar plan's NUFFT library, or
@@ -117,15 +128,24 @@ function ST.SphericalCore.sphere_coeffs(plan::NUSHTSphericalPlan, field::Abstrac
     return ST.SphericalCore.sphere_coeffs!(NUFSHT.allocate_coefficients(plan.plan), plan, field)
 end
 
-# Analysis is the band-limited least-squares solve; NUFSHT projects onto the valid `(l, m)` modes
-# inside its own iteration, so the coefficients come back in the degree-`<= lmax` span. A solve that
-# stops at `maxiter` keeps its best iterate; one with no usable answer throws.
+# Analysis is the band-limited least-squares solve, or the weighted adjoint; NUFSHT projects onto the
+# valid `(l, m)` modes, so the coefficients come back in the degree-`<= lmax` span. A solve that stops
+# at `maxiter` keeps its best iterate; one with no usable answer throws.
 #
 # `field` is an `(M,)` field or an `(M, B)` stack matching the plan's `ntrans`.
 function ST.SphericalCore.sphere_coeffs!(C, plan::NUSHTSphericalPlan, field::AbstractVecOrMat)
     fill!(C, zero(eltype(C)))
-    NUFSHT.nusht_solve!(C, field, plan.plan; ws = plan.ws, rtol = plan.rtol, maxiter = plan.maxiter)
-    ST.SphericalCore.check_sphere_solve(plan.ws, plan.M, plan.lmax, plan.rtol, plan.maxiter)
+    return _analyze!(C, plan, field, plan.ws)
+end
+
+function _analyze!(C, plan::NUSHTSphericalPlan, field, ws::FTB.LSMRWorkspace)
+    NUFSHT.nusht_solve!(C, field, plan.fit; ws = ws, rtol = plan.rtol, maxiter = plan.maxiter)
+    ST.SphericalCore.check_sphere_solve(ws, plan.M, plan.lmax, plan.rtol, plan.maxiter)
+    return C
+end
+
+function _analyze!(C, plan::NUSHTSphericalPlan, field, ::Nothing)
+    NUFSHT.nusht_analyze!(C, field, plan.plan; weights = plan.qweights)
     return C
 end
 
@@ -163,11 +183,12 @@ _mean(w::AbstractVector, field::AbstractMatrix, ::Int) = transpose(field) * w
 
 """
     nusht_spherical_plan(θ, φ, lmax, T; rtol, maxiter = 500, weights = nothing, ntrans = 1,
-                         spin = false, nufft = AutoSpectralBackend())
+                         spin = false, nufft = AutoSpectralBackend(), solve = true)
 
 `ntrans` is NUFSHT's batch size: the plan transforms `ntrans` fields sampled at the same points per
 call. `nufft` names the NUFFT library, resolved before the plan is built. `weights` are the
-quadrature weights of the spherical mean, normalized to sum to 1.
+quadrature weights of the spherical mean and of the least-squares fit, normalized to sum to 1.
+`solve = false` analyses by the adjoint weighted by them.
 
 `spin = true` also builds the spin-0/spin-1 plan pair `spherical_monogenic_components` synthesises
 with (see `SphericalCore.plan_spin`). Only the monogenic constructors ask for it.
@@ -177,7 +198,8 @@ function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_ph
                                                rtol::Real = ST.SphericalCore.default_rtol(SB.NUFSHTSpectralBackend()),
                                                maxiter::Int = 500, weights = nothing,
                                                ntrans::Int = 1, spin::Bool = false,
-                                               nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend()) where {T<:Real}
+                                               nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
+                                               solve::Bool = true) where {T<:Real}
     # The plan owns copies of the points, in their own array type, so a device-resident transform
     # stays on its device.
     θ = T.(pts_theta)
@@ -191,7 +213,7 @@ function ST.SphericalCore.nusht_spherical_plan(pts_theta::AbstractVector, pts_ph
     # NUFSHT's positional argument is the field element type: a real one selects
     # its folded real layout, and the spin field is complex.
     sp = spin ? _spin_plans(Complex{T}, θ, φ, lmax, nb) : nothing
-    return NUSHTSphericalPlan(plan, length(θ), lmax, θ, φ, T(rtol), maxiter, nb, sp; weights = w)
+    return NUSHTSphericalPlan(plan, length(θ), lmax, θ, φ, T(rtol), maxiter, nb, sp; weights = w, solve = solve)
 end
 
 # Weights `w`, one per point, on the array type of the points `θ`.
@@ -220,11 +242,15 @@ function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogen
     # without them gets a pair built here.
     p0, p1 = ST.SphericalCore.plan_spin(p) === nothing ?
              _spin_plans(Complex{T}, p.theta, p.phi, lmax, p.nufft) : ST.SphericalCore.plan_spin(p)
-    ws0 = p.spin_ws === nothing ? FTB.LSMRWorkspace(p0) : p.spin_ws
-    # Complex spin-0 coefficients of the field in NUFSHT's dense spin layout, by least-squares
-    # inversion, so the band-pass and Riesz fields below share one set of coefficients.
+    # Complex spin-0 coefficients of the field in NUFSHT's dense spin layout, by the plan's analysis, so
+    # the band-pass and Riesz fields below share one set of coefficients.
     a = zeros(Complex{T}, lmax + 1, 2lmax + 1)
-    NUFSHT.nusht_solve_spin!(a, Complex{T}.(field), p0; ws = ws0)
+    if p.solve
+        ws0 = p.spin_ws === nothing ? FTB.LSMRWorkspace(p0) : p.spin_ws
+        NUFSHT.nusht_solve_spin!(a, Complex{T}.(field), p0; ws = ws0, weights = p.weights)
+    else
+        NUFSHT.nusht_analyze!(a, Complex{T}.(field), p0; weights = p.qweights)
+    end
 
     # sf = b_j(ℓ)·a  (b_j(0)=0, so the ℓ=0 term vanishes as the Riesz operator requires).
     bfn = ST.SphericalCore.band_multiplier(st.sigma2[j + 1], st.sigma2[j])

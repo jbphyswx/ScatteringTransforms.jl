@@ -78,6 +78,8 @@ Test.@testset "Per-band band limits converge to the full-band-limit cascade" beg
         Test.@test e1 < 1e-2
         Test.@test e2 < 5e-2
         prev1, prev2 = e1, e2
+        # A transform rebuilt from its spec, as on a Distributed worker, computes the same coefficients.
+        Test.@test ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))(field).S2 == c.S2
     end
     Test.@test prev1 > 0        # narrowing changes the result
     Test.@test prev2 > 0
@@ -176,6 +178,34 @@ Test.@testset "The in-core direct SHT is the least-squares fit onto degree ≤ l
 
     # The plan holds `O(M + (lmax+1)²)` numbers, no matrix of harmonics at the points.
     Test.@test Base.summarysize(plan) < sizeof(A) ÷ 4
+end
+
+# `solve = false` analyses by the weighted adjoint. Fejér's first rule on `2lmax + 1` midpoint colatitudes
+# and `2lmax + 1` equispaced longitudes integrate the product of two degree-`lmax` harmonics, so on their
+# product grid the adjoint is the expansion of a degree-`lmax` field.
+Test.@testset "Scattered analysis by the weighted adjoint" begin
+    SC = ScatteringTransforms.SphericalCore
+    lmax, J = 8, 3
+    N = 2lmax + 1
+    fw = SC._fejer1_weights(N, Float64)
+    θ = vec([π * (j - 0.5) / N for j in 1:N, _ in 1:N])
+    φ = vec([2π * (k - 1) / N for _ in 1:N, k in 1:N])
+    w = vec([fw[j] for j in 1:N, _ in 1:N])
+    A = reduce(hcat, [c(NUFSHT.sYlm(0, ℓ, m, θ[k], φ[k])) for k in eachindex(θ)] for ℓ in 0:lmax for m in 0:ℓ
+                      for c in (m == 0 ? (real,) : (real, imag)))
+    Random.seed!(8)
+    F = A * randn(size(A, 2), 3)
+    for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
+        plan = SC.make_spherical_plan(spec, θ, φ, lmax, Float64; weights = w, solve = false, ntrans = 3)
+        out = similar(F)
+        SC.sphere_apply!(out, plan, SC.sphere_coeffs(plan, F), Returns(1.0))
+        Test.@test out ≈ F rtol = (plan isa SC.DirectSHTSphericalPlan ? 1e-12 : 2 * plan.plan.tol)
+        # A transform rebuilt from its spec, as on a Distributed worker, computes the same coefficients.
+        st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, weights = w, solve = false)
+        rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
+        Test.@test rb(F[:, 1]).S1 ≈ st(F[:, 1]).S1 rtol = 1e-8
+        foreach(ScatteringTransforms.close_transform!, (st, rb))
+    end
 end
 
 Test.@testset "Scattered spherical means take the given quadrature weights" begin
