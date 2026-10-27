@@ -44,13 +44,18 @@ ScatteringTransforms.SphericalCore.riesz_scratch(p::LifecyclePlan, f) =
     ScatteringTransforms.SphericalCore.riesz_scratch(p.inner, f)
 ScatteringTransforms.SphericalCore.sphere_riesz_energy!(out, p::LifecyclePlan, C, h, scr) =
     ScatteringTransforms.SphericalCore.sphere_riesz_energy!(out, p.inner, C, h, scr)
+ScatteringTransforms.SphericalCore.plan_points(p::LifecyclePlan) =
+    ScatteringTransforms.SphericalCore.plan_points(p.inner)
+ScatteringTransforms.SphericalCore.coeffs_mean(p::LifecyclePlan, C, b::Int = 1) =
+    ScatteringTransforms.SphericalCore.coeffs_mean(p.inner, C, b)
 
-# `st` with its plan wrapped in a `LifecyclePlan`, everything else shared.
+# `st` with its plan, and its grid where it has one, wrapped in a `LifecyclePlan`, everything else
+# shared.
 function with_lifecycle(st)
     T = typeof(st)
-    args = ntuple(i -> fieldname(T, i) === :plan ? LifecyclePlan(st.plan) : getfield(st, i),
-                  fieldcount(T))
-    return T.name.wrapper(args...)
+    wrap(i) = (fieldname(T, i) in (:plan, :grid) && getfield(st, i) !== nothing) ?
+              LifecyclePlan(getfield(st, i)) : getfield(st, i)
+    return T.name.wrapper(ntuple(wrap, fieldcount(T))...)
 end
 
 Test.@testset "Every plan a batch builds for itself is closed" begin
@@ -87,6 +92,8 @@ Test.@testset "Every plan a batch builds for itself is closed" begin
                 Test.@test ScatteringTransforms.scattering_batch(stc, F; execution = backend) ≈ serial rtol = 1e-8
             end
             Test.@test stc.plan.closed[] == stc.plan.built[]
+            Test.@test stc.grid.built[] >= 1
+            Test.@test stc.grid.closed[] == stc.grid.built[]
             ScatteringTransforms.close_transform!(st)
         end
     end

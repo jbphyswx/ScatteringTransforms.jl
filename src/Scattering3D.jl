@@ -33,20 +33,20 @@ struct ScatteringTransform3D{T, M<:AbstractArray{Complex{T},3},
 end
 
 """
-    ScatteringTransform3D([T=Float64,] N, J; n_orient=6, max_order=2, cache=true, oversampling=J,
-                          transform=AutoSpectralBackend())
+    ScatteringTransform3D([T=Float64,] N, J; n_orient=6, max_order=2, filters=StoredFilters(),
+                          oversampling=J, transform=AutoSpectralBackend())
 
 Build a 3D volumetric scattering transform for `N = (Nz, Ny, Nx)` volumes over `J` scales and
 `n_orient` sphere directions. The element type is positional, as for `zeros(T, …)`; omit it for
-`Float64`. `cache`, `oversampling` and `transform` are as for `Scattering1D.ScatteringTransform1D`.
+`Float64`. `filters`, `oversampling` and `transform` are as for `Scattering1D.ScatteringTransform1D`.
 """
 function ScatteringTransform3D(::Type{T}, N::NTuple{3,Int}, J::Int;
                                n_orient::Int=6,
                                max_order::Int=2,
-                               cache::Bool=true,
+                               filters::FilterBanks.AbstractFilterStorage=FilterBanks.StoredFilters(),
                                oversampling::Int=J,
                                transform::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T}
-    filter_bank = FilterBanks.build_filter_bank3d(T, N, J, Val(cache); n_orient=n_orient)
+    filter_bank = FilterBanks.build_filter_bank3d(T, N, J, filters; n_orient=n_orient)
     tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
     nw = FilterBanks.nwavelets(filter_bank)
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :

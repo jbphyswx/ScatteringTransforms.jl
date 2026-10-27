@@ -83,9 +83,9 @@ Test.@testset "Allocation discipline" begin
     end
 
     Test.@testset "batched scattered-planar cascade allocates nothing per field" begin
-        # The batched cascade multiplies a `(ms…, B)` mode array by `(ms…, 1)` filter views built once
-        # with the transform. FINUFFT runs its FFT through the libfftw3 that FFTW.jl gives a
-        # Julia-task thread callback; at `nufft_nthreads = 1` the library allocates nothing.
+        # The analysis transforms the `(M, B)` stack in one execution, and each field's cascade runs on
+        # the mode grid. FINUFFT runs its FFT through the libfftw3 that FFTW.jl gives a Julia-task
+        # thread callback; at `nufft_nthreads = 1` the library allocates nothing.
         SP = ScatteringTransforms.ScatteredPlanar
         M, ms = 500, (16, 16)
         px, py = rand(M), rand(M)

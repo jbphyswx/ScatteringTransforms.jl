@@ -268,15 +268,14 @@ function ST._scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend
     ST._spherical_batches(st.plan, X) || return _spherical_threaded_perfield!(out, st, X)
     B = size(X, 2)
     chunks = _column_chunks(B, Threads.nthreads())
-    _with_task_items(i -> ST.SphericalCore.task_local_batch_plan(st.plan, length(chunks[i])),
-                     p -> (p === st.plan || ST.Plans.close_plan!(p)), length(chunks)) do plans
+    _with_task_items(i -> ST.SphericalCore.task_local_batch(st, length(chunks[i])),
+                     stb -> ST.SphericalCore.close_task_local!(stb, st), length(chunks)) do stbs
         _spherical_farm() do
             OMT.@tasks for i in eachindex(chunks)
                 cols = chunks[i]
                 k = length(cols)
                 Xc = view(X, :, cols)
-                stb = ST.SphericalCore.SphericalScattering(st.lmax, st.J, st.max_order, plans[i],
-                                                           st.sigma2)
+                stb = stbs[i]
                 ws = ST.SphericalCore.SphericalWorkspace(stb, Xc)
                 S1 = zeros(T, st.J, k)
                 S2 = st.max_order >= 2 ? zeros(T, st.J, st.J, k) : Array{T, 3}(undef, 0, 0, 0)

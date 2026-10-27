@@ -1,7 +1,6 @@
-# Nonuniform / scattered planar scattering via NUFFT. On a uniform grid the NUFFT
-# analysis/synthesis reduce to fft/ifft, so scattered-planar scattering must reproduce the gridded
-# ScatteringTransform2D exactly (to NUFFT tolerance); on irregular points the least-squares solve
-# recovers a band-limited field.
+# Nonuniform / scattered planar scattering via NUFFT. On a uniform grid the analysis reduces to the
+# fft, so scattered-planar scattering reproduces the gridded ScatteringTransform2D exactly (to NUFFT
+# tolerance); on irregular points the least-squares solve recovers a band-limited field.
 using Random: Random
 
 Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
@@ -138,7 +137,8 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         sc = ScatteringTransforms.scattered_planar_scattering(px, py, (Ny, Nx), J;
             L=L, max_order=2, period=(2π, 2π), solve=true)
         r = sc(b)
-        Test.@test ScatteringTransforms.Coefficients.zeroth_order(r) ≈ sum(b) / M rtol=1e-6
+        # `S0` is the mean of the fitted field, `g`'s own mean.
+        Test.@test ScatteringTransforms.Coefficients.zeroth_order(r) ≈ 1.0 rtol=1e-6
         Test.@test all(ScatteringTransforms.Coefficients.first_order(r) .>= 0)
         # Planar admissible (scale-increasing) pairs populate the strict upper triangle (j2 > j1,
         # matching `flatten2d`); the diagonal and lower triangle stay exactly zero.

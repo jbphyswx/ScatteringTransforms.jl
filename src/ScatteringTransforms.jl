@@ -104,8 +104,7 @@ function batch_workspace(st, B::Int; transform = nothing, fft_nthreads::Int = 1,
     makeplan = transform === nothing ?
         (rd -> Plans.plan_like(st.plan, zeros_like(Complex{T}, (rd..., B)), length(rd);
                                fft_nthreads = fft_nthreads, kwargs...)) :
-        (rd -> Plans.make_plan(transform, T, rd; nbatch = B, batched = true,
-                               fft_nthreads = fft_nthreads, kwargs...))
+        (rd -> Plans.make_plan(transform, T, rd; batch = B, fft_nthreads = fft_nthreads, kwargs...))
     return Batched.build_workspace(st, B, T; zeros_like = zeros_like, makeplan = makeplan,
                                    shapefilter = f -> reshape(f, (size(f)..., 1)))
 end
@@ -325,7 +324,7 @@ function _PlanarStage(st::ScatteredPlanar.ScatteredPlanarScattering, ::Type{TO},
     pad = zeros_like(TX <: Complex ? Complex{T} : T, (M, W))
     S0 = zeros_like(TO, (W,))
     S1 = zeros_like(T, (nw, W))
-    S2 = st.max_order >= 2 ? zeros_like(T, (nw, nw, W)) : zeros_like(T, (0, 0, 0))
+    S2 = zeros_like(T, st.max_order >= 2 ? (nw, nw, W) : (0, 0, W))
     return _PlanarStage(pad, S0, S1, S2, _host_copy(S0), _host_copy(S1), _host_copy(S2))
 end
 
@@ -427,11 +426,9 @@ function _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
     B = size(X)[end]
     _spherical_batches(st.plan, X) || return _spherical_batch_perfield!(out, st, X)
 
-    # `batch_plan` hands back `st.plan` at its own width and otherwise a plan this call owns.
-    bp = SphericalCore.batch_plan(st.plan, B)
-    owned = Plans.batch_width(st.plan) != B
+    # The plans `batch_transform` builds at another width belong to this call.
+    stb = SphericalCore.batch_transform(st, B)
     try
-        stb = SphericalCore.SphericalScattering(st.lmax, st.J, st.max_order, bp, st.sigma2)
         ws = SphericalCore.SphericalWorkspace(stb, X)
         S1 = zeros(T, st.J, B)
         S2 = st.max_order >= 2 ? zeros(T, st.J, st.J, B) : Array{T, 3}(undef, 0, 0, 0)
@@ -442,7 +439,7 @@ function _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
             _flatten_spherical!(view(out, :, b), r.S0[b], view(r.S1, :, b), S2b, st.J)
         end
     finally
-        owned && Plans.close_plan!(bp)
+        SphericalCore.close_task_local!(stb, st)
     end
     return out
 end
@@ -457,6 +454,12 @@ close_transform!(st) = (Plans.close_plan!(st.plan); nothing)
 function close_transform!(st::SphericalCore.SphericalScattering)
     Plans.close_plan!(st.plan)
     st.bands === nothing || foreach(Plans.close_plan!, st.bands)
+    st.grid === nothing || Plans.close_plan!(st.grid)
+    return nothing
+end
+function close_transform!(st::SphericalCore.SphericalMonogenicScattering)
+    Plans.close_plan!(st.plan)
+    st.grid === nothing || Plans.close_plan!(st.grid)
     return nothing
 end
 
@@ -477,7 +480,7 @@ rebuild_transform(spec::TransformSpec) = spec.build(spec.args...; spec.kwargs...
 _gridded_spec(build, st, N, bank::NamedTuple) =
     TransformSpec(build, (real(eltype(st.filter_bank.averaging)), N, st.filter_bank.J),
                   (; bank..., max_order = st.max_order, oversampling = st.pw.oversampling,
-                   cache = !FilterBanks.iscomputed(st.filter_bank),
+                   filters = FilterBanks.filter_storage(st.filter_bank),
                    transform = Plans.spectral_backend(st.plan)))
 
 transform_spec(st::Scattering1D.ScatteringTransform1D) =
@@ -499,7 +502,9 @@ function transform_spec(st::ScatteredPlanar.ScatteredPlanarScattering)
                          (L = st.filter_bank.L, max_order = st.max_order,
                           transform = Plans.spectral_backend(st.plan), weights = st.weights,
                           period = (2π, 2π), solve = a.solve, maxiter = a.maxiter, rtol = a.rtol,
-                          damp = a.damp, eps = a.eps, nufft_nthreads = a.nufft_nthreads))
+                          damp = a.damp, eps = a.eps, nufft_nthreads = a.nufft_nthreads,
+                          oversampling = st.pw.oversampling,
+                          filters = FilterBanks.filter_storage(st.filter_bank)))
 end
 
 function transform_spec(st::Union{SphericalCore.SphericalScattering,
@@ -515,7 +520,8 @@ function transform_spec(st::Union{SphericalCore.SphericalScattering,
                          (max_order = st.max_order, transform = Plans.spectral_backend(st.plan),
                           weights = w === nothing ? nothing : copy(w), rtol = solver.rtol,
                           maxiter = solver.maxiter, solve = solver.solve,
-                          nufft = SphericalCore.plan_nufft(st.plan)))
+                          nufft = SphericalCore.plan_nufft(st.plan),
+                          grid_lmax = SphericalCore.grid_band(st.grid)))
 end
 
 _scattered_build(::SphericalCore.SphericalScattering) = spherical_scattering
@@ -550,15 +556,14 @@ _scattering_batch!(out, b::CB.AbstractExecutionBackend, st, X; kwargs...) =
                                 transform=SpectralBackends.AutoSpectralBackend(), solve=false,
                                 weights=nothing, eps=nothing, maxiter=100,
                                 rtol=Plans.default_solver_rtol(T, transform, eps), damp=0,
-                                ntrans=1, nufft_nthreads=0, cache=true)
+                                ntrans=1, nufft_nthreads=0, filters=StoredFilters(), oversampling=J)
     scattered_planar_scattering([T,] grid, ms, J; kwargs...)
 
-Build a 2D planar scattering transform for a scalar field sampled at scattered points `(x, y)`, using
-the same oriented Morlet wavelet bank as the gridded `Scattering2D.ScatteringTransform2D` but
-computing the wavelet convolutions on a uniform Fourier **mode grid** of size `ms = (m1, m2)` via a
-nonuniform DFT: analysis maps the scattered points to the mode grid, the wavelet multiply happens
-there, and synthesis evaluates the filtered field back at the points. Apply it to a length-`M`
-vector of samples.
+Build a 2D planar scattering transform for a scalar field sampled at scattered points `(x, y)`. A
+nonuniform DFT analyses the samples onto a uniform Fourier **mode grid** of size `ms = (m1, m2)`, and
+the cascade of the gridded `Scattering2D.ScatteringTransform2D`, with its oriented Morlet bank and
+`oversampling`, runs on that grid: each coefficient is the domain mean of a modulus of the field the
+analysis recovers. Apply it to a length-`M` vector of samples.
 
 `period` is the length of the domain the points sample along each axis and `origin` its lower
 corner (a number for both axes, or a 2-tuple): mode `k` has wavelength `period/k`, so the wavelets'
@@ -573,13 +578,14 @@ dependency-free exact NUDFT (always available, `O(M·prod(ms))`);
 `FlowTransformBindings.NonuniformFFTsBackend()` and `FlowTransformBindings.FINUFFTBackend()` select a
 nonuniform-FFT library (`using NonuniformFFTs` / `using FINUFFT`);
 and `SpectralBackends.AutoSpectralBackend` (the default) takes NonuniformFFTs when it is loaded, FINUFFT
-when only it is, and the direct sum otherwise. `solve=false` uses the fast adjoint (type-1) — exact
-for adequately-sampled band-limited fields, approximate on gappy/irregular data; `solve=true`
-recovers the true band-limited coefficients by least squares (slower, needed for irregular
-sampling). `weights` (length `M`, summing to 1) sets the quadrature for the spatial mean; the default
-is the uniform sample mean. `eps` is the NUFFT tolerance (ignored by the exact direct sum).
+when only it is, and the direct sum otherwise. `solve=false` takes the adjoint (type-1) weighted by
+`weights`, the quadrature of each Fourier coefficient's domain integral: exact on the nodes of the
+DFT, an estimate elsewhere. `solve=true` fits the band-limited coefficients by least squares (slower,
+for irregular sampling). `weights` (length `M`, normalized to sum to 1) are uniform by default; `S0` is
+the mean of the analysed field. `eps` is the NUFFT tolerance (ignored by the exact direct sum).
 `ntrans = B` builds a transform that runs `B` fields per call through one execution per cascade step
-(see [`scattering_batch`](@ref)). `cache = false` evaluates the wavelets on demand.
+(see [`scattering_batch`](@ref)). `filters = FilterBanks.ComputedFilters()` evaluates the wavelets on
+demand.
 
 The solve is LSMR (`FlowTransformBindings.lsmr!`), which costs one type-2 and one type-1 per
 iteration and keeps both `‖b - Af‖` and `‖A†(b - Af)‖` monotone, so stopping at `maxiter` returns the
@@ -613,7 +619,7 @@ scattered_planar_scattering(x::AbstractVector, y::AbstractVector, ms::NTuple{2, 
     spherical_scattering(pts_theta, pts_phi, lmax, J; max_order=2,
                          transform=SpectralBackends.AutoSpectralBackend(), solve=true,
                          rtol=SphericalCore.default_rtol(transform), maxiter=500, weights=nothing,
-                         ntrans=1, nufft=SpectralBackends.AutoSpectralBackend())
+                         ntrans=1, nufft=SpectralBackends.AutoSpectralBackend(), grid_lmax=2lmax)
 
 Build a spherical scattering transform for a scalar field at scattered points `(θ, φ)` on S², using
 smooth difference-of-Gaussians band-pass wavelets. `transform` names the spherical-harmonic transform:
@@ -623,13 +629,19 @@ NUFSHT fast path (needs `using NUFSHT`); `SpectralBackends.AutoSpectralBackend` 
 NUFSHT if its extension is loaded, else the direct transform. Accurate analysis
 needs the sampling to resolve the band limit, i.e. roughly `M ≳ (lmax+1)²` well-distributed points.
 
+The samples are analysed once, onto the harmonics of degree `≤ lmax`. Every band, modulus, mean and
+second analysis after that runs on the Gauss–Legendre grid of band limit `grid_lmax`
+([`SphericalCore.gauss_legendre_grid`](@ref)): each coefficient is the spherical mean of a modulus of the
+field the analysis recovers, and `S0` is that field's mean. A modulus is not band limited, and the grid's
+analysis of it onto degree `≤ lmax` is exact for its content up to degree `2grid_lmax + 1 − lmax`.
+
 `solve = true` analyses by the least-squares fit, by LSMR, which `rtol` and `maxiter` configure and
 which returns its best iterate at `maxiter`. `solve = false` takes the adjoint weighted by `weights`
-instead, one transform per analysis: the expansion of a degree-`lmax` field where the weights integrate
-the product of two degree-`lmax` harmonics exactly, and an approximation elsewhere. `weights`
-(length `M`, normalized to sum to 1) are the quadrature of the spherical mean and of that adjoint,
-uniform by default. `ntrans = B` builds a plan that transforms `B` co-located fields per call. `nufft`
-names the NUFFT library NUFSHT runs on; the in-core plan runs none and accepts only an `Auto` `nufft`.
+instead, one transform: the expansion of a degree-`lmax` field where the weights integrate the
+product of two degree-`lmax` harmonics exactly, and an approximation elsewhere. `weights` (length `M`,
+normalized to sum to 1) are the quadrature of that adjoint and the weights of the fit, uniform by
+default. `ntrans = B` builds a plan that transforms `B` co-located fields per call. `nufft` names the
+NUFFT library NUFSHT runs on; the in-core plan runs none and accepts only an `Auto` `nufft`.
 """
 function spherical_scattering(pts_theta::AbstractVector{TT}, pts_phi::AbstractVector, lmax::Int, J::Int;
                               max_order::Int = 2,
@@ -637,27 +649,33 @@ function spherical_scattering(pts_theta::AbstractVector{TT}, pts_phi::AbstractVe
                               rtol::Real = SphericalCore.default_rtol(transform),
                               maxiter::Int = 500, weights = nothing, ntrans::Int = 1,
                               nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
-                              solve::Bool = true) where {TT<:Real}
+                              solve::Bool = true, grid_lmax::Int = 2lmax) where {TT<:Real}
     T = float(TT)
     plan = SphericalCore.make_spherical_plan(transform, pts_theta, pts_phi, lmax, T;
                                              rtol = rtol, maxiter = maxiter, weights = weights,
                                              ntrans = ntrans, nufft = nufft, solve = solve)
     return SphericalCore.SphericalScattering(lmax, J, max_order, plan,
-                                             SphericalCore.dog_sigma2(lmax, J, T))
+                                             SphericalCore.dog_sigma2(lmax, J, T), nothing,
+                                             SphericalCore.grid_plan(plan, _grid_lmax(grid_lmax, lmax)))
 end
+
+_grid_lmax(L::Int, lmax::Int) =
+    L >= lmax ? L : throw(ArgumentError("grid_lmax = $L is below the band limit lmax = $lmax"))
 
 """
     spherical_monogenic_scattering(pts_theta, pts_phi, lmax, J; max_order=2,
                                    transform=SpectralBackends.AutoSpectralBackend(), solve=true,
                                    rtol=SphericalCore.default_rtol(transform), maxiter=500,
-                                   weights=nothing, nufft=SpectralBackends.AutoSpectralBackend())
+                                   weights=nothing, nufft=SpectralBackends.AutoSpectralBackend(),
+                                   grid_lmax=2lmax)
 
 Build a **monogenic** spherical scattering transform for a scalar field at scattered points
 `(θ, φ)` on S². The nonlinearity is the spherical monogenic amplitude
 `A_j = √(U⁰_j² + |U^R_j|²)`, where `U⁰_j` is the difference-of-Gaussians band-pass and `U^R_j` is
 the spin-1 Riesz field `R = ð∘(−Δ_S)^{-1/2}`. The Riesz energy `|U^R_j|² = |∇_S g_j|²` (with
 `g_j = (−Δ_S)^{-1/2} U⁰_j`) is synthesised exactly from `g_j`'s coefficients
-(`SphericalCore.sphere_riesz_energy!`). The keywords are as in [`spherical_scattering`](@ref).
+(`SphericalCore.sphere_riesz_energy!`). The cascade runs on the Gauss–Legendre grid and the keywords
+are as in [`spherical_scattering`](@ref).
 """
 function spherical_monogenic_scattering(pts_theta::AbstractVector{TT}, pts_phi::AbstractVector,
                                         lmax::Int, J::Int; max_order::Int = 2,
@@ -665,7 +683,7 @@ function spherical_monogenic_scattering(pts_theta::AbstractVector{TT}, pts_phi::
                                         rtol::Real = SphericalCore.default_rtol(transform),
                                         maxiter::Int = 500, weights = nothing,
                                         nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
-                                        solve::Bool = true) where {TT<:Real}
+                                        solve::Bool = true, grid_lmax::Int = 2lmax) where {TT<:Real}
     T = float(TT)
     # `spin = true` builds the spin-weighted plan pair `spherical_monogenic_components` synthesises
     # through on a NUFSHT plan.
@@ -673,7 +691,8 @@ function spherical_monogenic_scattering(pts_theta::AbstractVector{TT}, pts_phi::
                                              rtol = rtol, maxiter = maxiter, weights = weights,
                                              nufft = nufft, spin = true, solve = solve)
     return SphericalCore.SphericalMonogenicScattering(lmax, J, max_order, plan,
-                                                      SphericalCore.dog_sigma2(lmax, J, T))
+                                                      SphericalCore.dog_sigma2(lmax, J, T),
+                                                      SphericalCore.grid_plan(plan, _grid_lmax(grid_lmax, lmax)))
 end
 
 """

@@ -96,6 +96,7 @@ ST.SphericalCore.plan_points(p::NUSHTSphericalPlan) = (p.theta, p.phi)
 ST.SphericalCore.plan_weights(p::NUSHTSphericalPlan) = p.weights
 ST.SphericalCore.plan_solver(p::NUSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter, solve = p.solve)
 ST.Plans.spectral_backend(::NUSHTSphericalPlan) = SB.NUFSHTSpectralBackend()
+ST.Plans.available(::SB.NUFSHTSpectralBackend) = true
 
 function ST.Plans.task_local_plan(p::NUSHTSphericalPlan)
     # `ntrans` and the resolved backend are carried over, so the task's plan takes the batch the
@@ -175,6 +176,22 @@ _mean(::Nothing, field::AbstractVector, M::Int) = sum(field) / M
 _mean(::Nothing, field::AbstractMatrix, M::Int) = vec(sum(field; dims = 1)) ./ M
 _mean(w::AbstractVector, field::AbstractVector, ::Int) = LinearAlgebra.dot(w, field)
 _mean(w::AbstractVector, field::AbstractMatrix, ::Int) = transpose(field) * w
+
+# `Y₀₀ = 1/√(4π)` in the orthonormal `sph_mode` layout. A sum over the one slot reads a device array
+# without scalar indexing.
+ST.SphericalCore.coeffs_mean(p::NUSHTSphericalPlan, C, b::Int = 1) =
+    sum(view(C, 1:1, 1:1, b:b)) / sqrt(4 * eltype(p.theta)(π))
+
+# The weighted adjoint on the Gauss–Legendre grid of band limit `L`, on the plan's band limit, batch width,
+# NUFFT library and tolerance, its nodes in the array type of the plan's points.
+function ST.SphericalCore.grid_plan(p::NUSHTSphericalPlan, L::Integer)
+    T = eltype(p.theta)
+    θh, φh, wh = ST.SphericalCore.gauss_legendre_grid(Int(L), T)
+    θ, φ, w = (copyto!(similar(p.theta, length(a)), a) for a in (θh, φh, wh))
+    plan = NUFSHT.make_plan(T, θ, φ, p.lmax; ntrans = p.plan.B, nufft = p.nufft, tol = p.plan.tol)
+    return NUSHTSphericalPlan(plan, length(θ), p.lmax, θ, φ, p.rtol, p.maxiter, p.nufft;
+                              weights = w, solve = false)
+end
 
 # ---------------------------------------------------------------------------
 # The plan `spherical_scattering` / `spherical_monogenic_scattering` build when `transform` selects

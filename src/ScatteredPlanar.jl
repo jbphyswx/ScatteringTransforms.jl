@@ -6,36 +6,32 @@ using ..FilterBanks: FilterBanks
 using ..PathGraph: PathGraph
 using ..Coefficients: Coefficients
 using ..ScatteringCore: ScatteringCore
-using LinearAlgebra: LinearAlgebra
+using ..Cascade: Cascade
 
 """
-    ScatteredPlanarScattering{T,FB,Tree,G,P,WV,WB,CV,MM,RV}
+    ScatteredPlanarScattering{T,FB,Tree,G,P,WV,RS,CS,MM,PW}
 
 Scattering transform of a field sampled at scattered planar points, as built by
-`scattered_planar_scattering`: an oriented Morlet bank on the `ms` mode grid, the spectral plan
-between the points and that grid, and the buffers the cascade runs in.
+`scattered_planar_scattering`: the samples analysed onto the `ms` mode grid by the spectral plan, then
+the cascade of the gridded `Scattering2D` transform on that grid, with its oriented Morlet bank.
 
-A transform built with `ntrans = B > 1` holds `(M, B)` and `(ms…, B)` buffers and transforms exactly
-`B` fields per call; a single-field one holds `(M)` and `(ms)` buffers.
+A transform built with `ntrans = B > 1` analyses `B` fields per call: its sample and mode buffers are
+`(M, B)` and `(ms…, B)`; a single-field one holds `(M)` and `(ms)` buffers.
 """
 struct ScatteredPlanarScattering{T, FB, Tree, G<:AbstractVector, P, WV<:AbstractVector{T},
-                                 WB<:AbstractVector, CV<:AbstractArray{Complex{T}},
-                                 MM<:AbstractArray{Complex{T}}, RV<:AbstractArray{T}}
+                                 RS<:AbstractArray{T}, CS<:AbstractArray{Complex{T}},
+                                 MM<:AbstractArray{Complex{T}}, PW}
     filter_bank::FB          # oriented Morlet bank on the `ms` fftfreq lattice
     tree::Tree               # admissible scattering paths
     groups::G                # (j1, children, path ids) from the tree, longest-first
     max_order::Int
     plan::P                  # scattered spectral plan: `DirectNUFFTPlan` or `NUFFTScatteringPlan`
-    weights::WV              # (M) spatial-mean quadrature weights, summing to 1
-    # The bank's filters viewed as `(ms…, 1)`, sharing its memory, so they broadcast across a batch
-    # axis.
-    wav_b::WB
-    X_modes::MM              # (ms) signal mode coefficients
-    buf_modes::MM            # (ms) wavelet-multiply scratch
-    buf_conv_pts::CV         # (M) synthesis output at points
-    buf_mod_pts::RV          # (M) modulus at points
-    buf_u1_pts::RV           # (M) first-order modulus of the current j1
-    buf_u1_modes::MM         # (ms) its mode coefficients, reused across that j1's children
+    weights::WV              # (M) quadrature weights of the domain mean, summing to 1
+    wreal::RS                # (M[, B]) weighted real samples, the adjoint's input
+    wcplx::CS                # (M[, B]) weighted complex samples
+    X_modes::MM              # (ms[, B]) the analysed field's spectrum, fft convention
+    dims::NTuple{2, Int}     # the mode grid `ms`
+    pw::PW                   # the gridded cascade's workspace on the mode grid
 end
 
 # A copy of `A` on the array type of `ref`.
@@ -54,15 +50,29 @@ _to_points(ref::AbstractArray, fb::FilterBanks.ComputedFilterBank2D) =
     FilterBanks.ComputedFilterBank2D(fb.morlets, fb.rescale, _like(ref, fb.averaging),
                                      _like(ref, fb.scratch), fb.meta, fb.J, fb.L)
 
+# The gridded cascade on the mode grid, in the memory of the mode buffer `modes`: on the host with the
+# FFT the gridded transform takes, on a device with the device's FFT library and the means summed there.
+_mode_cascade(::Array, fb, groups, ms::NTuple{2, Int}, ::Type{T}, α::Int) where {T} =
+    Cascade.build(fb, groups, ms, T, α, Plans.make_plan(SB.AutoSpectralBackend(), T, ms))
+
+function _mode_cascade(modes::AbstractArray, fb, groups, ms::NTuple{2, Int}, ::Type{T}, α::Int) where {T}
+    alloc(rd) = fill!(similar(modes, Complex{T}, rd), zero(Complex{T}))
+    return Cascade.build(fb, groups, ms, T, α; alloc = alloc,
+                         makeplan = rd -> Plans.abstractffts_plan(alloc(rd)),
+                         device_zeros = (S, d) -> fill!(similar(modes, S, d), zero(S)))
+end
+
 function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, J::Int;
                period, origin = (0, 0), L::Int = 8, max_order::Int = 2,
                transform::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
                solve::Bool = false, weights = nothing,
                eps = nothing, maxiter::Int = 100,
                rtol::Real = Plans.default_solver_rtol(T, transform, eps), damp::Real = 0,
-               ntrans::Int = 1, nufft_nthreads::Int = 0, cache::Bool = true) where {T}
+               ntrans::Int = 1, nufft_nthreads::Int = 0,
+               filters::FilterBanks.AbstractFilterStorage = FilterBanks.StoredFilters(),
+               oversampling::Int = J) where {T}
     M = length(x)
-    cpu_fb = FilterBanks.build_filter_bank2d(T, ms, J, Val(cache); L = L)
+    cpu_fb = FilterBanks.build_filter_bank2d(T, ms, J, filters; L = L)
     # Every array is `similar` to `x`, so device points give a device-resident transform.
     fb = _to_points(x, cpu_fb)
     tree = PathGraph.build_tree([m.j_eff for m in fb.meta], max_order)
@@ -77,42 +87,52 @@ function build(::Type{T}, x::AbstractVector, y::AbstractVector, ms::NTuple{2, In
     nw = FilterBanks.nwavelets(fb)
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :
              [(j, Int[], Int[]) for j in 1:nw]
-    # One first-order field and one mode array suffice: the cascade finishes every child of a
-    # wavelet before starting the next.
-    cpts() = B == 1 ? similar(x, Complex{T}, M) : similar(x, Complex{T}, M, B)
-    rpts() = B == 1 ? similar(x, T, M) : similar(x, T, M, B)
-    modes() = B == 1 ? similar(x, Complex{T}, ms) : similar(x, Complex{T}, (ms..., B))
-    wav_b = FilterBanks.batch_views(fb, ms)
-    # `buf_mod_pts` and `buf_u1_pts` are one array: `U₁` is dead once its analysis has read it, which
-    # is before any child writes its own modulus.
-    u1pts = rpts()
-    return ScatteredPlanarScattering(
-        fb, tree, groups, max_order, plan, w, wav_b,
-        modes(), modes(), cpts(), u1pts, u1pts, modes())
+    pts(S) = B == 1 ? similar(x, S, M) : similar(x, S, M, B)
+    modes = B == 1 ? similar(x, Complex{T}, ms) : similar(x, Complex{T}, (ms..., B))
+    pw = _mode_cascade(modes, fb, groups, ms, T, oversampling)
+    return ScatteredPlanarScattering(fb, tree, groups, max_order, plan, w, pts(T), pts(Complex{T}), modes,
+                                     ms, pw)
 end
 build(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, J::Int; kwargs...) =
     build(Float64, x, y, ms, J; kwargs...)
 
 Base.show(io::IO, st::ScatteredPlanarScattering{T}) where {T} =
-    print(io, "ScatteredPlanarScattering{", T, "}(M=", length(st.weights), ", ms=", size(st.X_modes)[1:2],
-          ", J=", st.filter_bank.J, ", L=", st.filter_bank.L, ", max_order=", st.max_order, ", ",
-          st.plan, ")")
+    print(io, "ScatteredPlanarScattering{", T, "}(M=", length(st.weights), ", ms=", st.dims,
+          ", J=", st.filter_bank.J, ", L=", st.filter_bank.L, ", max_order=", st.max_order,
+          ", oversampling=", st.pw.oversampling, ", ", st.plan, ")")
 
-_wmean(st::ScatteredPlanarScattering, v::AbstractVector) = LinearAlgebra.dot(st.weights, v)
-
-# Shares the read-only bank, tree, work list and weights; copies only the buffers and the plan's
-# scratch.
+# Shares the read-only bank, tree, work list and weights; copies only the buffers and the plans' scratch.
 function ScatteringCore.task_workspace(st::ScatteredPlanarScattering)
     fb = FilterBanks.task_bank(st.filter_bank)
-    # A computed bank gives the task its own scratch, so its batch views are rebuilt against it.
-    ms = size(st.X_modes)[1:2]
-    wav_b = fb === st.filter_bank ? st.wav_b : FilterBanks.batch_views(fb, ms)
-    u1pts = similar(st.buf_u1_pts)   # shared with `buf_mod_pts`, as in the original
     return ScatteredPlanarScattering(
-        fb, st.tree, st.groups, st.max_order, Plans.task_local_plan(st.plan), st.weights, wav_b,
-        similar(st.X_modes), similar(st.buf_modes),
-        similar(st.buf_conv_pts), u1pts, u1pts, similar(st.buf_u1_modes))
+        fb, st.tree, st.groups, st.max_order, Plans.task_local_plan(st.plan), st.weights,
+        similar(st.wreal), similar(st.wcplx), similar(st.X_modes), st.dims, Cascade.task_copy(st.pw, fb))
 end
+
+# The spectrum of the field the samples `x` determine, in `st.X_modes`: the least-squares fit, or the
+# adjoint weighted by the quadrature, `X_k = N Σ_n w_n x_n e^{−ik·s_n}`, the domain integral of
+# `x e^{−ik·s}` scaled to the fft convention, `N = prod(ms)`.
+function _analyse!(st::ScatteredPlanarScattering{T}, x::AbstractArray) where {T}
+    st.plan.solve && return Plans.forward_transform!(st.X_modes, st.plan, x)
+    wx = _weighted!(_samples(st, x), st.weights, x)
+    Plans.forward_transform!(st.X_modes, st.plan, wx)
+    st.X_modes .*= T(prod(st.dims))
+    return st.X_modes
+end
+
+_samples(st::ScatteredPlanarScattering, ::AbstractArray{<:Real}) = st.wreal
+_samples(st::ScatteredPlanarScattering, ::AbstractArray{<:Complex}) = st.wcplx
+
+# The samples copied to the transform's memory, then weighted.
+_weighted!(buf, w, x) = (copyto!(buf, x); buf .*= w; buf)
+
+# The mean of the analysed field, `X_0/N`; real for a real field, whose `X_0` is real up to rounding.
+_field_mean(::AbstractArray{<:Real}, X0) = real(X0)
+_field_mean(::AbstractArray{<:Complex}, X0) = X0
+
+# Every field's mean into `S0`, from the `X_0` row `X0` of its spectrum and `s = 1/N`.
+_put_means!(S0, ::AbstractArray{<:Real}, X0, s) = (S0 .= real.(X0) .* s; S0)
+_put_means!(S0, ::AbstractArray{<:Complex}, X0, s) = (S0 .= X0 .* s; S0)
 
 """
     (st::ScatteredPlanarScattering)(x) -> ScatteringCoefficients2D
@@ -134,72 +154,30 @@ Allocation-free when `coeffs` carries a 1-element `S0`, which [`Coefficients.upd
 writes in place.
 """
 function scattered_planar_scattering!(coeffs::Coefficients.ScatteringCoefficients2D,
-                                      st::ScatteredPlanarScattering, x::AbstractVector)
-    fb, plan = st.filter_bank, st.plan
-
-    # `x` reaches the plan unconverted: a real field has a Hermitian spectrum, which a NUFFT plan
-    # analyses on half the mode grid.
-    Plans.forward_transform!(st.X_modes, plan, x)                        # signal mode coeffs
-
-    # Both orders in one grouped pass, as in the gridded `cascade!`.
-    isempty(coeffs.S2) || fill!(coeffs.S2, zero(eltype(coeffs.S2)))
-    @inbounds for (j1, children, _) in st.groups
-        ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.X_modes, FilterBanks.filter_at(fb, j1),
-                                         plan, st.buf_modes)
-        ScatteringCore.apply_modulus!(st.buf_u1_pts, st.buf_conv_pts)
-        coeffs.S1[j1] = _wmean(st, st.buf_u1_pts)
-        isempty(children) && continue
-        # A modulus, so real whatever the input was — and passed as such.
-        Plans.forward_transform!(st.buf_u1_modes, plan, st.buf_u1_pts)
-        for j2 in children
-            ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.buf_u1_modes, FilterBanks.filter_at(fb, j2),
-                                             plan, st.buf_modes)
-            ScatteringCore.apply_modulus!(st.buf_mod_pts, st.buf_conv_pts)
-            coeffs.S2[j1, j2] = _wmean(st, st.buf_mod_pts)
-        end
-    end
-
-    return Coefficients.update_S0(coeffs, _wmean(st, x))
+                                      st::ScatteredPlanarScattering{T}, x::AbstractVector) where {T}
+    X = _analyse!(st, x)
+    Cascade.cascade!(coeffs.S1, coeffs.S2, st.pw, st.filter_bank, st.groups, X)
+    return Coefficients.update_S0(coeffs, _field_mean(x, sum(view(X, 1:1, 1:1))) / T(prod(st.dims)))
 end
-
-# Weighted spatial mean of every column at once: `dst[b] = Σ_m w[m]·V[m, b]`, i.e. `Vᵀw`.
-_wmean_batch!(dst::AbstractVector, st::ScatteredPlanarScattering, V::AbstractMatrix) =
-    LinearAlgebra.mul!(dst, transpose(V), st.weights)
 
 """
     scattered_planar_scattering_batch!(S0, S1, S2, st, X) -> (; S0, S1, S2)
 
 Cascade over a stack of `B` fields sampled at the same points: `X` is `(M, B)`, `S0` is `(B)`, `S1`
-is `(nw, B)` and `S2` is `(nw, nw, B)`.
+is `(nw, B)` and `S2` is `(nw, nw, B)`, `(0, 0, B)` without a second order.
 
-Each transform covers the whole stack in one execution; `st` must have been built with
-`ntrans = B`.
+The analysis covers the whole stack in one execution, and each field's cascade then runs on the mode
+grid; `st` must have been built with `ntrans = B`.
 """
 function scattered_planar_scattering_batch!(S0::AbstractVector, S1::AbstractMatrix,
                                             S2::AbstractArray{<:Any, 3},
-                                            st::ScatteredPlanarScattering, X::AbstractMatrix)
-    plan = st.plan
-    Plans.forward_transform!(st.X_modes, plan, X)
-
-    isempty(S2) || fill!(S2, zero(eltype(S2)))
-    @inbounds for (j1, children, _) in st.groups
-        FilterBanks.filter_at(st.filter_bank, j1)
-        ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.X_modes, st.wav_b[j1], plan,
-                                         st.buf_modes)
-        ScatteringCore.apply_modulus!(st.buf_u1_pts, st.buf_conv_pts)
-        _wmean_batch!(view(S1, j1, :), st, st.buf_u1_pts)
-        isempty(children) && continue
-        # A modulus, so real whatever the input was — and passed as such.
-        Plans.forward_transform!(st.buf_u1_modes, plan, st.buf_u1_pts)
-        for j2 in children
-            FilterBanks.filter_at(st.filter_bank, j2)
-            ScatteringCore.wavelet_convolve!(st.buf_conv_pts, st.buf_u1_modes, st.wav_b[j2],
-                                             plan, st.buf_modes)
-            ScatteringCore.apply_modulus!(st.buf_mod_pts, st.buf_conv_pts)
-            _wmean_batch!(view(S2, j1, j2, :), st, st.buf_mod_pts)
-        end
+                                            st::ScatteredPlanarScattering{T}, X::AbstractMatrix) where {T}
+    Xm = _analyse!(st, X)
+    @inbounds for b in axes(X, 2)
+        Cascade.cascade!(view(S1, :, b), view(S2, :, :, b), st.pw, st.filter_bank, st.groups,
+                         view(Xm, :, :, b))
     end
-    _wmean_batch!(S0, st, X)
+    _put_means!(S0, X, view(Xm, 1, 1, :), inv(T(prod(st.dims))))
     return (S0 = S0, S1 = S1, S2 = S2)
 end
 

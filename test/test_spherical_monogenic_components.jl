@@ -126,17 +126,19 @@ Test.@testset "Riesz energy |∇_S g|² equals the finite-difference gradient on
         ScatteringTransforms.Plans.close_plan!(plan)
     end
 
-    # The cascade's first order is the mean monogenic amplitude, which the spin-1 synthesis of
-    # `spherical_monogenic_components` computes independently.
+    # The cascade's first order is the mean of the monogenic amplitude under its grid's quadrature, which
+    # the spin-1 synthesis of `spherical_monogenic_components` at the grid's nodes computes independently.
+    # `g` is band limited, so the fit at the points and the adjoint on the grid recover the same field.
     J = 3
     st = ScatteringTransforms.spherical_monogenic_scattering(θs, φs, lmax, J; rtol = 1e-9)
-    field = g.(θs, φs)
-    S1 = st(field).S1
+    S1 = st(g.(θs, φs)).S1
+    θq, φq, wq = SC.gauss_legendre_grid(SC.grid_band(st.grid), Float64)
+    stq = ScatteringTransforms.spherical_monogenic_scattering(θq, φq, lmax, J; weights = wq, solve = false)
     for j in 1:J
-        amp = ScatteringTransforms.spherical_monogenic_components(st, field, j).amplitude
-        Test.@test S1[j] ≈ sum(amp) / M rtol = 1e-6
+        amp = ScatteringTransforms.spherical_monogenic_components(stq, g.(θq, φq), j).amplitude
+        Test.@test S1[j] ≈ sum(wq .* amp) rtol = 1e-6
     end
-    ScatteringTransforms.close_transform!(st)
+    foreach(ScatteringTransforms.close_transform!, (st, stq))
 end
 
 Test.@testset "Riesz components equal the surface gradient (finite-difference ground truth)" begin

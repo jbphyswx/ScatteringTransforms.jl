@@ -153,8 +153,9 @@ not quantized orientation bins.
 ![Monogenic analysis](docs/src/assets/monogenic.png)
 
 ### Nonuniform / scattered planar grids
-Off-lattice / gappy planar data (scattered `(x, y)` points) is scattered onto a uniform Fourier mode
-grid by a nonuniform DFT (`scattered_planar_scattering`), where the ordinary Morlet wavelet bank lives.
+Off-lattice / gappy planar data (scattered `(x, y)` points) is analysed onto a uniform Fourier mode
+grid by a nonuniform DFT (`scattered_planar_scattering`), and the gridded transform's cascade, with its
+Morlet wavelet bank, runs on that grid.
 The caller gives the domain's size, `period`, which sets every mode's wavelength, or a FlowGeometries
 grid that carries it. On a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` recovers the
 band-limited coefficients for irregular sampling by LSMR least squares — minimum-norm where the
@@ -168,7 +169,9 @@ nonuniform FFT, and with both loaded `transform = FlowTransformBindings.Nonunifo
 ### Spherical scattering
 On S², both **scattered points** (`spherical_scattering`; in-core direct SHT by default, NUFSHT fast
 path with `using NUFSHT`) and a **structured** equiangular grid (`structured_spherical_scattering`,
-via the fast SHT in FastSphericalHarmonics) give matching multi-scale coefficients:
+via the fast SHT in FastSphericalHarmonics) give matching multi-scale coefficients. Scattered samples
+are analysed once, and the cascade runs on the Gauss–Legendre grid of the band limit, so each
+coefficient is that grid's mean of a modulus of the field the analysis recovers:
 
 ![Spherical scattering](docs/src/assets/spherical_scattering.png)
 ![Structured spherical scattering](docs/src/assets/structured_spherical.png)

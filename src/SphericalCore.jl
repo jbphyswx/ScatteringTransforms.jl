@@ -4,8 +4,9 @@ module SphericalCore
 # implements analysis (`sphere_coeffs`, `sphere_coeffs!`), per-degree multiplier and synthesis
 # (`sphere_apply!`) and the spherical mean (`sphere_mean`); the difference-of-Gaussians bank and the
 # S0/S1/S2 cascade are built on those, and the monogenic amplitude also uses `sphere_riesz_energy!`.
-# The in-core plans are defined here; the NUFSHT (scattered points) and FastSphericalHarmonics
-# (structured grid) extensions supply fast ones.
+# A scattered transform analyses its samples once and runs the cascade on a plan of the same kind on
+# the Gauss–Legendre grid of its band limit (`grid_plan`). The in-core plans are defined here; the
+# NUFSHT (scattered points) and FastSphericalHarmonics (structured grid) extensions supply fast ones.
 
 export AbstractSphericalPlan, SphericalScattering, SphericalMonogenicScattering
 export SphericalWorkspace, SphericalMonogenicWorkspace
@@ -35,9 +36,9 @@ abstract type AbstractSphericalPlan end
     sphere_coeffs(plan, field) -> C
 
 Spherical-harmonic analysis: the coefficients `C` of `field` up to the plan's band limit. For a
-structured grid this is the forward SHT; for scattered points it is the least-squares inversion of
-synthesis. `C` is opaque and valid only with the same `plan`'s interface functions, such as
-[`sphere_apply!`](@ref).
+structured grid this is the forward SHT; for scattered points it is the least-squares fit or the
+weighted adjoint. `C` is opaque and valid only with the interface functions of `plan` or of a plan of
+its kind at its band limit, such as [`sphere_apply!`](@ref).
 """
 function sphere_coeffs end
 
@@ -204,6 +205,31 @@ coefficients and samples share a layout.
 sphere_field_buffer(plan) = sphere_coeffs_buffer(plan)
 
 """
+    grid_plan(plan, L) -> plan or nothing
+
+A plan of `plan`'s kind, band limit and batch width on the Gauss–Legendre grid of band limit `L ≥ lmax`
+([`gauss_legendre_grid`](@ref)), analysing by that grid's quadrature, or `nothing` for a backend with
+none. Its coefficients are laid out as `plan`'s. Its analysis of a field holding degrees up to
+`2L + 1 − lmax` is exact. A scattered transform analyses its samples with `plan` and runs every later
+step of its cascade on this one.
+"""
+grid_plan(::Any, ::Integer) = nothing
+
+"""
+    grid_band(grid) -> Int
+
+The band limit `L` of a [`grid_plan`](@ref)'s Gauss–Legendre grid, from its `(L + 1)(2L + 1)` nodes.
+"""
+grid_band(grid) = (isqrt(1 + 8 * length(first(plan_points(grid)))) - 3) ÷ 4
+
+"""
+    coeffs_mean(plan, C, b = 1)
+
+The spherical mean of the field whose coefficients under `plan` are field `b` of `C`.
+"""
+function coeffs_mean end
+
+"""
     band_lmax(lmax, J, j, headroom) -> Int
 
 Band limit that carries wavelet `j`: `headroom · ℓ_j`, clamped to `lmax`; `headroom = Inf` keeps
@@ -322,14 +348,15 @@ riesz_potential_multiplier(σ²hi::T, σ²lo::T) where {T} =
 # ---------------------------------------------------------------------------
 
 """
-    SphericalScattering{T,P,V,BV}
+    SphericalScattering{T,P,V,BV,G}
 
 Spherical scattering transform over a backend `plan::P`. `sigma2[k+1]` is the Gaussian-transfer
 variance for the dyadic low-pass cutoff `ℓ_k` (`k=0..J`); band-pass wavelet `j` is
 `lowpass(ℓ_j) − lowpass(ℓ_{j-1})`. `bands` holds one narrowed plan per scale
-([`band_plans`](@ref)), or `nothing`.
+([`band_plans`](@ref)), or `nothing`. `grid` is the plan the cascade runs on after `plan` analyses the
+field ([`grid_plan`](@ref)), or `nothing` for a transform whose cascade runs on `plan`.
 """
-struct SphericalScattering{T, P, V <: AbstractVector{T}, BV}
+struct SphericalScattering{T, P, V <: AbstractVector{T}, BV, G}
     lmax::Int
     J::Int
     max_order::Int
@@ -338,14 +365,54 @@ struct SphericalScattering{T, P, V <: AbstractVector{T}, BV}
     # Per-scale narrowed plans, or `nothing` when the backend cannot narrow (or the caller asked for
     # no narrowing). `nothing` runs the full-band-limit cascade unchanged.
     bands::BV
+    grid::G
 end
 
-SphericalScattering(lmax::Int, J::Int, max_order::Int, plan, sigma2) =
-    SphericalScattering(lmax, J, max_order, plan, sigma2, nothing)
+SphericalScattering(lmax::Int, J::Int, max_order::Int, plan, sigma2, bands = nothing) =
+    SphericalScattering(lmax, J, max_order, plan, sigma2, bands, nothing)
 
 Base.show(io::IO, st::SphericalScattering{T}) where {T} =
     print(io, "SphericalScattering{", T, "}(lmax=", st.lmax, ", J=", st.J, ", max_order=", st.max_order,
-          ", ", st.plan, st.bands === nothing ? "" : ", per-scale band limits", ")")
+          ", ", st.plan, st.bands === nothing ? "" : ", per-scale band limits",
+          st.grid === nothing ? "" : ", cascade on the Gauss–Legendre grid", ")")
+
+# The plan the cascade runs on once the field is analysed.
+_cascade_plan(st) = st.grid === nothing ? st.plan : st.grid
+
+# A band field of the cascade, shaped like `field` on the plan's own samples, else on the grid's nodes.
+_band_buffer(st, field::AbstractArray) =
+    st.grid === nothing ? similar(field) :
+    similar(field, length(first(plan_points(st.grid))), Base.tail(size(field))...)
+
+# `S0`: the plan's quadrature of the samples, or for a transform with a grid the mean of the field its
+# analysis `C` recovers. `X` is a `(M, B)` stack.
+_field_mean(st, C, field) = st.grid === nothing ? sphere_mean(st.plan, field) : coeffs_mean(st.grid, C)
+_field_means(st, C, X::AbstractMatrix) =
+    st.grid === nothing ? sphere_mean(st.plan, X) : [coeffs_mean(st.grid, C, b) for b in axes(X, 2)]
+
+_on_grid(_, ::Nothing) = nothing
+_on_grid(f, grid) = f(grid)
+
+"""
+    batch_transform(st, B) -> st
+
+`st` over `B` co-located fields per call, its plan and grid through [`batch_plan`](@ref): each is
+`st`'s own at its own width and otherwise built for the copy, which [`close_task_local!`](@ref)
+releases.
+"""
+batch_transform(st::SphericalScattering, B::Integer) =
+    SphericalScattering(st.lmax, st.J, st.max_order, batch_plan(st.plan, B), st.sigma2, nothing,
+                        _on_grid(g -> batch_plan(g, B), st.grid))
+
+"""
+    task_local_batch(st, B) -> st
+
+A copy of `st` over `B` co-located fields per call, safe to run while `st` runs in another task: its
+plan and grid through [`task_local_batch_plan`](@ref). Release it with [`close_task_local!`](@ref).
+"""
+task_local_batch(st::SphericalScattering, B::Integer) =
+    SphericalScattering(st.lmax, st.J, st.max_order, task_local_batch_plan(st.plan, B), st.sigma2,
+                        nothing, _on_grid(g -> task_local_batch_plan(g, B), st.grid))
 
 """
     band_plans(plan, lmax, ls) -> Vector or nothing
@@ -372,18 +439,20 @@ function task_local(st::SphericalScattering)
     # the scale reuses `st.plan` itself, which must go on aliasing the copy.
     bands = st.bands === nothing ? nothing :
             map(p -> p === st.plan ? plan : Plans.task_local_plan(p), st.bands)
-    return SphericalScattering(st.lmax, st.J, st.max_order, plan, st.sigma2, bands)
+    return SphericalScattering(st.lmax, st.J, st.max_order, plan, st.sigma2, bands,
+                               _on_grid(Plans.task_local_plan, st.grid))
 end
 
 """
     close_task_local!(stl, st) -> nothing
 
-`Plans.close_plan!` every plan [`task_local`](@ref)`(st)` built for `stl`; plans `stl` shares with
-`st` stay open.
+`Plans.close_plan!` every plan [`task_local`](@ref)`(st)`, [`batch_transform`](@ref) or
+[`task_local_batch`](@ref) built for `stl`; plans `stl` shares with `st` stay open.
 """
 function close_task_local!(stl::SphericalScattering, st::SphericalScattering)
     _close_unshared!(stl.plan, st.plan)
     stl.bands === nothing || foreach(_close_unshared!, stl.bands, st.bands)
+    stl.grid === nothing || _close_unshared!(stl.grid, st.grid)
     return nothing
 end
 
@@ -393,10 +462,11 @@ _close_unshared!(p, shared) = (p === shared || Plans.close_plan!(p); nothing)
     SphericalWorkspace{A,C,AV,CV}
 
 Scratch for one spherical cascade: the band-pass output `band`, the current first-order field `u1`,
-and two coefficient containers, `C` for the input field and `C1` for the first-order field being
-re-analysed. Two suffice, since the cascade finishes every child of a scale before starting the
-next. `bband`, `bu1`, `bC` and `bC1` are the same per scale at its narrowed band limit, and empty
-when the transform has no `bands`.
+both on the samples the cascade runs on (the transform's grid, where it has one), and two coefficient
+containers, `C` for the input field and `C1` for the first-order field being re-analysed. Two
+suffice, since the cascade finishes every child of a scale before starting the next. `bband`, `bu1`,
+`bC` and `bC1` are the same per scale at its narrowed band limit, and empty when the transform has no
+`bands`.
 
 Build one with `SphericalWorkspace(st, field)` and reuse it across calls; a task that transforms
 concurrently needs its own, with a [`task_local`](@ref) transform.
@@ -414,17 +484,17 @@ end
 
 function SphericalWorkspace(st, field::AbstractArray)
     C() = sphere_coeffs_buffer(st.plan)
+    F() = _band_buffer(st, field)
     if st.bands === nothing
         e = similar(field, 0)
         ec = [C()][1:0]
-        return SphericalWorkspace(similar(field), similar(field), C(), C(),
-                                  typeof(e)[], typeof(e)[], ec, ec)
+        return SphericalWorkspace(F(), F(), C(), C(), typeof(e)[], typeof(e)[], ec, ec)
     end
     bband = [sphere_field_buffer(p) for p in st.bands]
     bu1 = [sphere_field_buffer(p) for p in st.bands]
     bC = [sphere_coeffs_buffer(p) for p in st.bands]
     bC1 = [sphere_coeffs_buffer(p) for p in st.bands]
-    return SphericalWorkspace(similar(field), similar(field), C(), C(), bband, bu1, bC, bC1)
+    return SphericalWorkspace(F(), F(), C(), C(), bband, bu1, bC, bC1)
 end
 
 Base.show(io::IO, ws::SphericalWorkspace) =
@@ -435,7 +505,8 @@ Base.show(io::IO, ws::SphericalWorkspace) =
 
 Apply the spherical scattering transform to a scalar `field` sampled by the plan.
 `S1[j] = ⟨|field ⋆ ψ_j|⟩`, `S2[j1,j2] = ⟨||field ⋆ ψ_{j1}| ⋆ ψ_{j2}|⟩` for strictly coarser `j2 < j1`.
-Allocates a workspace per call; use [`spherical_scattering!`](@ref) to reuse one.
+With a `grid`, the means are its quadrature of the field the analysis recovers, and `S0` that field's
+mean. Allocates a workspace per call; use [`spherical_scattering!`](@ref) to reuse one.
 """
 function (st::SphericalScattering{T})(field::AbstractArray) where {T}
     ws = SphericalWorkspace(st, field)
@@ -456,20 +527,21 @@ function spherical_scattering!(S1::AbstractVector, S2::AbstractMatrix,
                                st::SphericalScattering, ws::SphericalWorkspace,
                                field::AbstractArray)
     J = st.J
-    S0 = sphere_mean(st.plan, field)
     isempty(S2) || fill!(S2, zero(eltype(S2)))
     sphere_coeffs!(ws.C, st.plan, field)                  # analyse the field once
+    S0 = _field_mean(st, ws.C, field)
     st.bands === nothing || return _banded_cascade!(S1, S2, st, ws, S0)
+    g = _cascade_plan(st)
     for j1 in 1:J
-        sphere_apply!(ws.band, st.plan, ws.C, band_multiplier(st.sigma2[j1 + 1], st.sigma2[j1]))
+        sphere_apply!(ws.band, g, ws.C, band_multiplier(st.sigma2[j1 + 1], st.sigma2[j1]))
         @. ws.u1 = abs(ws.band)
-        S1[j1] = sphere_mean(st.plan, ws.u1)
+        S1[j1] = sphere_mean(g, ws.u1)
         (st.max_order >= 2 && j1 > 1) || continue
-        sphere_coeffs!(ws.C1, st.plan, ws.u1)             # analyse U1[j1] once, reuse across children
+        sphere_coeffs!(ws.C1, g, ws.u1)                   # analyse U1[j1] once, reuse across children
         for j2 in 1:(j1 - 1)
-            sphere_apply!(ws.band, st.plan, ws.C1, band_multiplier(st.sigma2[j2 + 1], st.sigma2[j2]))
+            sphere_apply!(ws.band, g, ws.C1, band_multiplier(st.sigma2[j2 + 1], st.sigma2[j2]))
             @. ws.band = abs(ws.band)
-            S2[j1, j2] = sphere_mean(st.plan, ws.band)
+            S2[j1, j2] = sphere_mean(g, ws.band)
         end
     end
     return (S0 = S0, S1 = S1, S2 = S2)
@@ -508,26 +580,27 @@ end
     spherical_scattering_batch!(S1, S2, st, ws, X) -> (; S0, S1, S2)
 
 Cascade over a stack of `B` fields sampled at the same points: `X` is `(M, B)`, `S1` is `(J, B)` and
-`S2` is `(J, J, B)`. Every transform covers all `B` fields in one call; `st.plan` must have batch
-width `B`.
+`S2` is `(J, J, B)`. Every transform covers all `B` fields in one call; `st.plan`, and its grid, must
+have batch width `B` ([`batch_transform`](@ref)).
 """
 function spherical_scattering_batch!(S1::AbstractMatrix, S2::AbstractArray,
                                      st::SphericalScattering, ws::SphericalWorkspace,
                                      X::AbstractMatrix)
     J = st.J
-    S0 = sphere_mean(st.plan, X)
     isempty(S2) || fill!(S2, zero(eltype(S2)))
     sphere_coeffs!(ws.C, st.plan, X)
+    S0 = _field_means(st, ws.C, X)
+    g = _cascade_plan(st)
     for j1 in 1:J
-        sphere_apply!(ws.band, st.plan, ws.C, band_multiplier(st.sigma2[j1 + 1], st.sigma2[j1]))
+        sphere_apply!(ws.band, g, ws.C, band_multiplier(st.sigma2[j1 + 1], st.sigma2[j1]))
         @. ws.u1 = abs(ws.band)
-        S1[j1, :] .= sphere_mean(st.plan, ws.u1)
+        S1[j1, :] .= sphere_mean(g, ws.u1)
         (st.max_order >= 2 && j1 > 1) || continue
-        sphere_coeffs!(ws.C1, st.plan, ws.u1)
+        sphere_coeffs!(ws.C1, g, ws.u1)
         for j2 in 1:(j1 - 1)
-            sphere_apply!(ws.band, st.plan, ws.C1, band_multiplier(st.sigma2[j2 + 1], st.sigma2[j2]))
+            sphere_apply!(ws.band, g, ws.C1, band_multiplier(st.sigma2[j2 + 1], st.sigma2[j2]))
             @. ws.band = abs(ws.band)
-            S2[j1, j2, :] .= sphere_mean(st.plan, ws.band)
+            S2[j1, j2, :] .= sphere_mean(g, ws.band)
         end
     end
     return (S0 = S0, S1 = S1, S2 = S2)
@@ -535,36 +608,46 @@ end
 
 
 """
-    SphericalMonogenicScattering{T,P,V}
+    SphericalMonogenicScattering{T,P,V,G}
 
 Spherical monogenic scattering: shares the dyadic difference-of-Gaussians bands of
 [`SphericalScattering`](@ref) but replaces the analytic modulus with the spherical monogenic
-amplitude `A_j = √(U⁰_j² + |∇_S g_j|²)` (see [`monogenic_amplitude!`](@ref)).
+amplitude `A_j = √(U⁰_j² + |∇_S g_j|²)` (see [`monogenic_amplitude!`](@ref)). `grid` is as in
+[`SphericalScattering`](@ref).
 """
-struct SphericalMonogenicScattering{T, P, V <: AbstractVector{T}}
+struct SphericalMonogenicScattering{T, P, V <: AbstractVector{T}, G}
     lmax::Int
     J::Int
     max_order::Int
     plan::P
     sigma2::V
+    grid::G
 end
+
+SphericalMonogenicScattering(lmax::Int, J::Int, max_order::Int, plan, sigma2) =
+    SphericalMonogenicScattering(lmax, J, max_order, plan, sigma2, nothing)
 
 Base.show(io::IO, st::SphericalMonogenicScattering{T}) where {T} =
     print(io, "SphericalMonogenicScattering{", T, "}(lmax=", st.lmax, ", J=", st.J, ", max_order=",
-          st.max_order, ", ", st.plan, ")")
+          st.max_order, ", ", st.plan,
+          st.grid === nothing ? "" : ", cascade on the Gauss–Legendre grid", ")")
 
 task_local(st::SphericalMonogenicScattering) =
     SphericalMonogenicScattering(st.lmax, st.J, st.max_order, Plans.task_local_plan(st.plan),
-                                 st.sigma2)
+                                 st.sigma2, _on_grid(Plans.task_local_plan, st.grid))
 
-close_task_local!(stl::SphericalMonogenicScattering, st::SphericalMonogenicScattering) =
+function close_task_local!(stl::SphericalMonogenicScattering, st::SphericalMonogenicScattering)
     _close_unshared!(stl.plan, st.plan)
+    stl.grid === nothing || _close_unshared!(stl.grid, st.grid)
+    return nothing
+end
 
 """
     monogenic_amplitude!(amp, st, C, j, w) -> amp
 
 Spherical monogenic amplitude at scale `j` of the field whose (already-computed) SH coefficients are
-`C`, written into `amp`. `w` holds the Riesz energy field `r2` and the plan's `riesz` scratch.
+`C`, written into `amp` on the samples the cascade runs on. `w` holds the Riesz energy field `r2`
+and that plan's `riesz` scratch.
 
 With `g_j = (−Δ_S)^{-1/2} U⁰_j` the spin-1 Riesz field has `|U^R_j| = |∇_S g_j|`, so
 `A_j = √(U⁰_j² + |∇_S g_j|²)`, the energy evaluated by [`sphere_riesz_energy!`](@ref). The Riesz
@@ -574,8 +657,9 @@ function monogenic_amplitude!(amp::AbstractArray, st::SphericalMonogenicScatteri
                               C, j::Int, w)
     σ²hi = st.sigma2[j + 1]
     σ²lo = st.sigma2[j]
-    sphere_apply!(amp, st.plan, C, band_multiplier(σ²hi, σ²lo))                         # U⁰
-    sphere_riesz_energy!(w.r2, st.plan, C, riesz_potential_multiplier(σ²hi, σ²lo), w.riesz)
+    g = _cascade_plan(st)
+    sphere_apply!(amp, g, C, band_multiplier(σ²hi, σ²lo))                               # U⁰
+    sphere_riesz_energy!(w.r2, g, C, riesz_potential_multiplier(σ²hi, σ²lo), w.riesz)
     @. amp = sqrt(amp^2 + w.r2)
     return amp
 end
@@ -595,10 +679,12 @@ struct SphericalMonogenicWorkspace{A, C, S}
     scratch::S
 end
 
-SphericalMonogenicWorkspace(st, field::AbstractArray) = SphericalMonogenicWorkspace(
-    similar(field), similar(field),
-    sphere_coeffs_buffer(st.plan), sphere_coeffs_buffer(st.plan),
-    (r2 = similar(field), riesz = riesz_scratch(st.plan, field)))
+function SphericalMonogenicWorkspace(st, field::AbstractArray)
+    r2 = _band_buffer(st, field)
+    return SphericalMonogenicWorkspace(_band_buffer(st, field), _band_buffer(st, field),
+                                       sphere_coeffs_buffer(st.plan), sphere_coeffs_buffer(st.plan),
+                                       (r2 = r2, riesz = riesz_scratch(_cascade_plan(st), r2)))
+end
 
 Base.show(io::IO, ws::SphericalMonogenicWorkspace) =
     print(io, "SphericalMonogenicWorkspace(fields of size ", size(ws.u1), ")")
@@ -626,17 +712,18 @@ function spherical_monogenic_scattering!(S1::AbstractVector, S2::AbstractMatrix,
                                          st::SphericalMonogenicScattering,
                                          ws::SphericalMonogenicWorkspace, field::AbstractArray)
     J = st.J
-    S0 = sphere_mean(st.plan, field)
     isempty(S2) || fill!(S2, zero(eltype(S2)))
     sphere_coeffs!(ws.C, st.plan, field)                  # analyse the field once
+    S0 = _field_mean(st, ws.C, field)
+    g = _cascade_plan(st)
     for j1 in 1:J
         monogenic_amplitude!(ws.u1, st, ws.C, j1, ws.scratch)
-        S1[j1] = sphere_mean(st.plan, ws.u1)
+        S1[j1] = sphere_mean(g, ws.u1)
         (st.max_order >= 2 && j1 > 1) || continue
-        sphere_coeffs!(ws.C1, st.plan, ws.u1)             # analyse U1[j1] once, reuse across children
+        sphere_coeffs!(ws.C1, g, ws.u1)                   # analyse U1[j1] once, reuse across children
         for j2 in 1:(j1 - 1)
             monogenic_amplitude!(ws.amp, st, ws.C1, j2, ws.scratch)
-            S2[j1, j2] = sphere_mean(st.plan, ws.amp)
+            S2[j1, j2] = sphere_mean(g, ws.amp)
         end
     end
     return (S0 = S0, S1 = S1, S2 = S2)
@@ -1002,6 +1089,15 @@ sphere_mean(plan::DirectSHTSphericalPlan{T, B}, field::AbstractArray) where {T, 
     B == 1 ? LinearAlgebra.dot(plan.weights, vec(field)) :
              transpose(reshape(field, plan.M, B)) * plan.weights
 
+# The degree-0 harmonic is 1, so the mean is the first coefficient of each column.
+coeffs_mean(plan::DirectSHTSphericalPlan, C, b::Int = 1) = C[(b - 1) * plan.K + 1]
+
+# The weighted adjoint on the Gauss–Legendre grid of band limit `L`, sharing the plan's Legendre table.
+function grid_plan(p::DirectSHTSphericalPlan{T, B}, L::Integer) where {T, B}
+    θ, φ, w = gauss_legendre_grid(Int(L), T)
+    return _direct_sht_plan(θ, φ, w, p.rtol, p.maxiter, false, _SHTRings(θ, φ), p.tab, p.lmax, B)
+end
+
 # Throw `Plans.AnalysisNotConverged` when a spherical analysis has no usable answer for some column: a
 # condition estimate at `conlim` or `1/eps` (`FTB.LSMR_CONDITION`), or a residual that is not finite. A
 # solve that stopped at `maxiter` keeps its best iterate.
@@ -1025,9 +1121,6 @@ end
 # Scattered-sphere plan selection
 # ---------------------------------------------------------------------------
 
-# Whether the NUFSHT extension is loaded; consulted only by `AutoSpectralBackend`.
-_have_nufsht() = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsNUFSHTExt) !== nothing
-
 """
     nusht_spherical_plan(θ, φ, lmax, T; rtol, maxiter, weights, ntrans, spin, nufft, solve)
 
@@ -1047,7 +1140,8 @@ its own approximation error.
 default_rtol(::SB.AbstractSpectralBackend) = 1.0e-8
 default_rtol(::SB.AbstractNUFSHTSpectralBackend) = 1.0e-4
 default_rtol(::SB.AbstractAutoSpectralBackend) =
-    _have_nufsht() ? default_rtol(SB.NUFSHTSpectralBackend()) : default_rtol(SB.DirectSumSpectralBackend())
+    Plans.available(SB.NUFSHTSpectralBackend()) ? default_rtol(SB.NUFSHTSpectralBackend()) :
+    default_rtol(SB.DirectSumSpectralBackend())
 
 """
     plan_spin(plan) -> (spin-0 plan, spin-1 plan) or nothing
@@ -1090,7 +1184,8 @@ end
 make_spherical_plan(::SB.AbstractNUFSHTSpectralBackend, θ, φ, lmax, ::Type{T}; kwargs...) where {T} =
     nusht_spherical_plan(θ, φ, lmax, T; kwargs...)
 make_spherical_plan(::SB.AbstractAutoSpectralBackend, θ, φ, lmax, ::Type{T}; kwargs...) where {T} =
-    _have_nufsht() ? make_spherical_plan(SB.NUFSHTSpectralBackend(), θ, φ, lmax, T; kwargs...) :
+    Plans.available(SB.NUFSHTSpectralBackend()) ?
+    make_spherical_plan(SB.NUFSHTSpectralBackend(), θ, φ, lmax, T; kwargs...) :
     make_spherical_plan(SB.DirectSumSpectralBackend(), θ, φ, lmax, T; kwargs...)
 
 # ---------------------------------------------------------------------------
@@ -1128,6 +1223,58 @@ function _fejer1_weights(N::Int, ::Type{T}) where {T}
     return w
 end
 
+"""
+    gauss_legendre_grid(lmax, T) -> (θ, φ, w)
+
+The Gauss–Legendre grid of band limit `lmax`, flattened with colatitude fastest: the `lmax + 1` roots
+of `P_{lmax+1}(cos θ)` by `2lmax + 1` equispaced longitudes, and quadrature weights `w` summing to 1.
+The rule integrates the product of two harmonics of degree `≤ lmax` exactly, so its weighted adjoint
+expands a degree-`lmax` field.
+"""
+function gauss_legendre_grid(lmax::Int, ::Type{T}) where {T}
+    N, nφ = lmax + 1, 2lmax + 1
+    θr, wr = _gauss_legendre_colatitudes(N, T)
+    θ = vec(T[θr[j] for j in 1:N, _ in 1:nφ])
+    φ = vec(T[2 * T(π) * (k - 1) / nφ for _ in 1:N, k in 1:nφ])
+    w = vec(T[wr[j] / (2nφ) for j in 1:N, _ in 1:nφ])
+    return θ, φ, w
+end
+
+# The roots of `P_N(cos θ)` in `(0, π)`, ascending, and their Gauss–Legendre weights (summing to 2), by
+# Newton's method in θ from Tricomi's estimate. With `d = 1 − cos θ = 2sin²(θ/2)`, Bonnet's recurrence
+# for `P_k` and `q_k = P_k − P_{k−1}` reads `q_{k+1} = (k q_k − (2k+1) d P_k)/(k+1)`, which keeps a root
+# near a pole to relative precision in θ; then `dP_N/dθ = −N D/sin θ` and `w = 2sin²θ/(N D)²` with
+# `D = d P_N − q_N`.
+function _gauss_legendre_colatitudes(N::Int, ::Type{T}) where {T}
+    θ, w = Vector{T}(undef, N), Vector{T}(undef, N)
+    for j in 1:cld(N, 2)
+        t = T(π) * (4j - 1) / (4N + 2)
+        for _ in 1:50
+            P, D = _legendre_pq(N, t)
+            δ = P * sin(t) / (N * D)
+            t += δ
+            abs(δ) <= 2 * eps(t) && break
+        end
+        _, D = _legendre_pq(N, t)
+        θ[j], w[j] = t, 2 * (sin(t) / (N * D))^2
+        if N + 1 - j != j
+            θ[N + 1 - j], w[N + 1 - j] = T(π) - t, w[j]
+        end
+    end
+    return θ, w
+end
+
+# `(P_N, d P_N − q_N)` at colatitude `t`.
+function _legendre_pq(N::Int, t::T) where {T}
+    d = 2 * sin(t / 2)^2
+    P, q = one(T), zero(T)
+    for k in 0:(N - 1)
+        q = (k * q - (2k + 1) * d * P) / (k + 1)
+        P += q
+    end
+    return P, d * P - q
+end
+
 # Direct SHT plan on the flattened structured grid (column-major, θ fastest — matching `vec` of the
 # (Nθ,Nφ) field matrix), with exact Fejér quadrature weights for the spherical mean.
 function _direct_structured_plan(lmax::Int, ::Type{T}; rtol::Real, maxiter::Int) where {T}
@@ -1139,9 +1286,6 @@ function _direct_structured_plan(lmax::Int, ::Type{T}; rtol::Real, maxiter::Int)
     wf = vec(T[wj[j] for j in 1:Nθ, _ in 1:Nφ])   # DirectSHTSphericalPlan normalizes to sum 1
     return DirectSHTSphericalPlan(θf, φf, lmax, T; rtol = rtol, maxiter = maxiter, weights = wf)
 end
-
-_have_fsh() =
-    Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsFastSphericalHarmonicsExt) !== nothing
 
 """
     fsh_structured_plan(lmax, T)
@@ -1168,7 +1312,7 @@ end
 make_structured_plan(::SB.AbstractFSHTSpectralBackend, lmax, ::Type{T}; kwargs...) where {T} =
     fsh_structured_plan(lmax, T)
 make_structured_plan(::SB.AbstractAutoSpectralBackend, lmax, ::Type{T}; kwargs...) where {T} =
-    _have_fsh() ? fsh_structured_plan(lmax, T) :
+    Plans.available(SB.FSHTSpectralBackend()) ? fsh_structured_plan(lmax, T) :
     make_structured_plan(SB.DirectSumSpectralBackend(), lmax, T; kwargs...)
 
 # ---------------------------------------------------------------------------
