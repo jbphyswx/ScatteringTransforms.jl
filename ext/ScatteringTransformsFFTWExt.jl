@@ -26,27 +26,26 @@ Base.show(io::IO, p::FFTWScatteringPlan{T}) where {T} =
 Base.show(io::IO, ::MIME"text/plain", p::FFTWScatteringPlan) = show(io, p)
 
 ST.Plans.spectral_backend(::FFTWScatteringPlan) = SB.FFTSpectralBackend()
+ST.Plans.available(::SB.FFTSpectralBackend) = true
 
 """
-    fftw_plan(T, dims; nbatch = 1, batched = false, planning = FFTW.MEASURE, fft_nthreads = 1)
+    fftw_plan(T, dims; batch = nothing, planning = FFTW.MEASURE, fft_nthreads = 1)
 
 Plan complex transforms of element type `Complex{T}` over the leading `length(dims)` axes of a
-`(dims..., nbatch)` array, or of a `dims` array when `nbatch == 1` and `batched` is `false`.
+`dims` array for `batch = nothing`, or of a `(dims..., batch)` stack for an integer `batch`.
 
 A transform executes its plan `O(nw + paths)` times per field, so `planning` defaults to
 `FFTW.MEASURE`; pass `FFTW.ESTIMATE` when build time dominates. Planning runs on scratch arrays.
 `fft_nthreads` is fixed in the plan; leave it at `1` under a parallel backend, which already
 threads over the batch and wavelet axes.
 """
-function ST.Plans.fftw_plan(::Type{T}, dims::NTuple{D, Int}; nbatch::Int = 1,
-                            batched::Bool = false,
+function ST.Plans.fftw_plan(::Type{T}, dims::NTuple{D, Int}; batch::Union{Nothing,Int} = nothing,
                             planning::Integer = FFTW.MEASURE,
                             fft_nthreads::Int = 1) where {T, D}
-    nbatch >= 1 || throw(ArgumentError("nbatch must be positive, got $nbatch"))
+    nbatch = ST.Plans.batch_length(batch)
     fft_nthreads >= 1 || throw(ArgumentError("fft_nthreads must be positive, got $fft_nthreads"))
-    # An FFTW plan is bound to an exact array shape. The batched cascade carries a trailing axis even
-    # for a batch of one, so `batched` plans `(dims…, 1)`.
-    scratch = zeros(Complex{T}, (batched || nbatch > 1) ? (dims..., nbatch) : dims)
+    # An FFTW plan is bound to an exact array shape, a stack's trailing axis included.
+    scratch = zeros(Complex{T}, _stack_size(dims, batch))
     region = 1:D
     return FFTW.set_num_threads(fft_nthreads) do
         fwd = FFTW.plan_fft(scratch, region; flags = planning)
@@ -56,6 +55,9 @@ function ST.Plans.fftw_plan(::Type{T}, dims::NTuple{D, Int}; nbatch::Int = 1,
             fwd, inv, invp, dims, nbatch)
     end
 end
+
+_stack_size(dims::Tuple, ::Nothing) = dims
+_stack_size(dims::Tuple, batch::Int) = (dims..., batch)
 
 # A plan keeps the planner thread count it was built with, and FFTW.jl runs a multi-threaded plan's
 # parallel loop on Julia tasks spawned per execution. The count is process-global and loading

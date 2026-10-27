@@ -44,20 +44,20 @@ struct ScatteringTransform2D{T, M<:AbstractMatrix{Complex{T}},
 end
 
 """
-    ScatteringTransform2D([T=Float64,] N, J; L=8, max_order=2, cache=true, oversampling=J,
-                          transform=AutoSpectralBackend())
+    ScatteringTransform2D([T=Float64,] N, J; L=8, max_order=2, filters=StoredFilters(),
+                          oversampling=J, transform=AutoSpectralBackend())
 
 Build a 2D planar scattering transform for `N = (Ny, Nx)` images over `J` scales and `L`
 orientations. The element type is positional, as for `zeros(T, …)`; omit it for `Float64`.
-`cache`, `oversampling` and `transform` are as for `Scattering1D.ScatteringTransform1D`.
+`filters`, `oversampling` and `transform` are as for `Scattering1D.ScatteringTransform1D`.
 """
 function ScatteringTransform2D(::Type{T}, N::NTuple{2,Int}, J::Int;
                                L::Int=8,
                                max_order::Int=2,
-                               cache::Bool=true,
+                               filters::FilterBanks.AbstractFilterStorage=FilterBanks.StoredFilters(),
                                oversampling::Int=J,
                                transform::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T}
-    filter_bank = FilterBanks.build_filter_bank2d(T, N, J, Val(cache); L=L)
+    filter_bank = FilterBanks.build_filter_bank2d(T, N, J, filters; L=L)
     tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
     nw = FilterBanks.nwavelets(filter_bank)
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :

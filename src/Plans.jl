@@ -212,7 +212,7 @@ adds a method; redefining this one is an error during precompilation.
 with_fft_nthreads(f, args...) = f()
 
 """
-    fftw_plan(T, dims; nbatch, batched, planning, fft_nthreads) -> AbstractScatteringPlan
+    fftw_plan(T, dims; batch, planning, fft_nthreads) -> AbstractScatteringPlan
 
 Build the FFTW-backed plan, a method the FFTW extension defines; this fallback throws an
 `ArgumentError` naming `using FFTW`.
@@ -230,38 +230,51 @@ defines the method.
 """
 function abstractffts_plan end
 
-# Whether the FFTW extension is loaded; consulted only by `AutoSpectralBackend`.
-_have_fftw() = Base.get_extension(parentmodule(@__MODULE__), :ScatteringTransformsFFTWExt) !== nothing
+"""
+    available(spectral) -> Bool
+
+Whether the extension implementing `spectral` is loaded: `true` from that extension, so the transform
+`AutoSpectralBackend` takes follows from the loaded methods.
+"""
+available(::SB.AbstractSpectralBackend) = false
 
 # The NUFFT library `AutoSpectralBackend` takes: NonuniformFFTs when it is loaded, FINUFFT when only it
 # is; `nothing` when neither is.
-function _nufft_library()
-    for b in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
-        FTB.is_available(b) && return b
-    end
-    return nothing
-end
+_nufft_library() =
+    FTB.is_available(FTB.NonuniformFFTsBackend()) ? FTB.NonuniformFFTsBackend() :
+    FTB.is_available(FTB.FINUFFTBackend()) ? FTB.FINUFFTBackend() : nothing
 
 """
-    make_plan(spectral, T, dims; nbatch=1, kwargs...) -> AbstractScatteringPlan
+    make_plan(spectral, T, dims; batch = nothing, kwargs...) -> AbstractScatteringPlan
 
 Build the spectral plan selected by `spectral` for arrays whose leading dimensions are `dims` and
-whose element type is `Complex{T}`, with a trailing batch axis of length `nbatch`.
+whose element type is `Complex{T}`: arrays of size `dims` for `batch = nothing`, and `(dims…, batch)`
+stacks for an integer `batch`.
 
 `SpectralBackends.DirectSumSpectralBackend` is the dependency-free in-core default;
 `SpectralBackends.FFTSpectralBackend` requires `using FFTW`;
 `SpectralBackends.AutoSpectralBackend` takes the FFTW fast path when its extension is loaded and
 otherwise the in-core direct sum.
 """
-make_plan(::SB.AbstractDirectSumSpectralBackend, ::Type{T}, dims; nbatch::Int = 1, kwargs...) where {T} =
-    DirectSumPlan(T, dims; nbatch = nbatch)
+make_plan(::SB.AbstractDirectSumSpectralBackend, ::Type{T}, dims;
+          batch::Union{Nothing,Int} = nothing, kwargs...) where {T} =
+    DirectSumPlan(T, dims; batch = batch)
 
-make_plan(::SB.AbstractFFTSpectralBackend, ::Type{T}, dims; nbatch::Int = 1, kwargs...) where {T} =
-    fftw_plan(T, dims; nbatch = nbatch, kwargs...)
+make_plan(::SB.AbstractFFTSpectralBackend, ::Type{T}, dims;
+          batch::Union{Nothing,Int} = nothing, kwargs...) where {T} =
+    fftw_plan(T, dims; batch = batch, kwargs...)
 
-make_plan(::SB.AbstractAutoSpectralBackend, ::Type{T}, dims; nbatch::Int = 1, kwargs...) where {T} =
-    _have_fftw() ? fftw_plan(T, dims; nbatch = nbatch, kwargs...) :
-    DirectSumPlan(T, dims; nbatch = nbatch)
+make_plan(::SB.AbstractAutoSpectralBackend, ::Type{T}, dims;
+          batch::Union{Nothing,Int} = nothing, kwargs...) where {T} =
+    available(SB.FFTSpectralBackend()) ? fftw_plan(T, dims; batch = batch, kwargs...) :
+    DirectSumPlan(T, dims; batch = batch)
+
+# The trailing batch axis's length: `1` for a plan over single arrays.
+batch_length(::Nothing) = 1
+function batch_length(batch::Int)
+    batch >= 1 || throw(ArgumentError("batch is the length of the trailing batch axis, at least 1; got $batch"))
+    return batch
+end
 
 """
     plan_like(plan, prototype) -> plan′
@@ -276,7 +289,7 @@ plan_like(plan::AbstractScatteringPlan, prototype::AbstractArray) =
     make_plan(spectral_backend(plan), real(eltype(prototype)), size(prototype))
 plan_like(plan::AbstractScatteringPlan, prototype::AbstractArray, D::Int; kwargs...) =
     make_plan(spectral_backend(plan), real(eltype(prototype)), ntuple(d -> size(prototype, d), D);
-              nbatch = size(prototype, D + 1), batched = true, kwargs...)
+              batch = size(prototype, D + 1), kwargs...)
 
 """
     plan_analysis(plan) -> (; solve, maxiter, rtol, damp, eps, nufft_nthreads)
@@ -370,13 +383,13 @@ function _twiddles(::Type{T}, N::Int) where {T}
 end
 
 """
-    DirectSumPlan(T, dims; nbatch = 1) -> DirectSumPlan
+    DirectSumPlan(T, dims; batch = nothing) -> DirectSumPlan
 
-Build a direct-summation DFT plan over leading dimensions `dims` (an `Int` or `NTuple{D,Int}`) with
-a trailing batch axis of length `nbatch`.
+Build a direct-summation DFT plan over leading dimensions `dims` (an `Int` or `NTuple{D,Int}`), with a
+trailing batch axis of length `batch` when it is an integer.
 """
-function DirectSumPlan(::Type{T}, dims::NTuple{D, Int}; nbatch::Int = 1) where {T, D}
-    nbatch >= 1 || throw(ArgumentError("nbatch must be positive, got $nbatch"))
+function DirectSumPlan(::Type{T}, dims::NTuple{D, Int}; batch::Union{Nothing,Int} = nothing) where {T, D}
+    nbatch = batch_length(batch)
     tw = ntuple(d -> _twiddles(T, dims[d]), D)
     twc = ntuple(d -> conj.(tw[d]), D)
     scratch = D == 1 ? nothing : zeros(Complex{T}, prod(dims) * nbatch)

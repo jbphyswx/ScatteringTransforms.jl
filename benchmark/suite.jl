@@ -332,27 +332,26 @@ end
 # Scattered surfaces with every setting at their defaults, against their own plan's transforms
 # ---------------------------------------------------------------------------
 
-# Planar: the cascade issues `1 + nparents` analyses and `nw + npaths` syntheses, each one NUFFT on the
-# plan's library at its thread count. The unit is one synthesis and one analysis of the plan itself.
+# Planar: one analysis of the samples onto the mode grid, one NUFFT on the plan's library, then the gridded
+# cascade's `(1 + nparents) + (nw + npaths)` steps on that grid. The floor is that analysis and those steps.
 function scattered_planar_defaults(M, m, J)
     xs, ys = rand(M), rand(M)
     st = ST.scattered_planar_scattering(xs, ys, (m, m), J; period = 1.0)
     f = randn(M)
     t = bench(() -> st(f), 2)
-    nw = ST.FilterBanks.nwavelets(st.filter_bank)
-    nan = 1 + count(g -> !isempty(g[2]), st.groups)
-    nsy = nw + length(ST.PathGraph.order_range(st.tree, 2))
     X = zeros(ComplexF64, m, m)
-    pts = zeros(ComplexF64, M)
-    ST.Plans.forward_transform!(X, st.plan, f)
-    t_pair = bench_kernel(() -> (ST.Plans.inverse_transform!(pts, st.plan, X); ST.Plans.forward_transform!(X, st.plan, f)))
-    Printf.@printf("%-30s %8.1f ms = %6.1f synthesis+analysis pairs (one %.2f ms); it issues %d analyses and %d syntheses\n",
-                   "scattered planar M=$M $(m)^2 J=$J", t * 1e3, t / t_pair, t_pair * 1e3, nan, nsy)
+    ta = bench_kernel(() -> ST.Plans.forward_transform!(X, st.plan, f))
+    ntr = transform_count(st)
+    tstep = step_time(Float64, (m, m))
+    Printf.@printf("%-30s %8.1f ms = %5.2fx floor: one analysis %.2f ms + %d grid steps of %.1f us\n",
+                   "scattered planar M=$M $(m)^2 J=$J", t * 1e3, t / (ta + ntr * tstep), ta * 1e3, ntr,
+                   tstep * 1e6)
     return nothing
 end
 
-# Sphere: the cascade analyses the field and every first-order field with children (`J` of them) and
-# synthesises `J + J(J−1)/2` bands; an analysis is the least-squares fit, a synthesis one transform.
+# Sphere: the samples are fitted once; on the Gauss–Legendre grid the cascade then analyses every
+# first-order field with children (`J − 1` of them) and synthesises `J + J(J−1)/2` bands, one transform
+# each. The floor is that fit and those transforms.
 function scattered_sphere_defaults(M, lmax, J)
     θ = acos.(1 .- 2 .* rand(M))
     φ = 2π .* rand(M)
@@ -360,12 +359,14 @@ function scattered_sphere_defaults(M, lmax, J)
     f = randn(M)
     t = bench(() -> st(f), 2)
     C = ST.SphericalCore.sphere_coeffs_buffer(st.plan)
-    out = similar(f)
+    u = similar(f, length(first(ST.SphericalCore.plan_points(st.grid))))
     ta = bench(() -> ST.SphericalCore.sphere_coeffs!(C, st.plan, f), 2)
-    ts = bench_kernel(() -> ST.SphericalCore.sphere_apply!(out, st.plan, C, Returns(1.0)))
-    Printf.@printf("%-30s %8.1f ms; one analysis (fit) %.1f ms, one synthesis %.2f ms: %d analyses + %d syntheses = %.1f ms\n",
-                   "scattered sphere M=$M lmax=$lmax J=$J", t * 1e3, ta * 1e3, ts * 1e3, J, J + J * (J - 1) ÷ 2,
-                   (J * ta + (J + J * (J - 1) ÷ 2) * ts) * 1e3)
+    ts = bench_kernel(() -> ST.SphericalCore.sphere_apply!(u, st.grid, C, Returns(1.0)))
+    tg = bench_kernel(() -> ST.SphericalCore.sphere_coeffs!(C, st.grid, u))
+    na, ns = J - 1, J + J * (J - 1) ÷ 2
+    Printf.@printf("%-30s %8.1f ms = %5.2fx floor: fit %.1f ms + %d grid analyses of %.2f ms + %d syntheses of %.2f ms\n",
+                   "scattered sphere M=$M lmax=$lmax J=$J", t * 1e3, t / (ta + na * tg + ns * ts), ta * 1e3,
+                   na, tg * 1e3, ns, ts * 1e3)
     return nothing
 end
 
@@ -469,9 +470,9 @@ function main()
     tt = bench(() -> ST.scattering_batch(sp, Xp; execution = CB.ThreadedBackend()))
     Printf.@printf("%-24s serial %8.1f ms   threaded %8.1f ms   %.2fx\n", "scattered planar M=$M",
                    ts * 1e3, tt * 1e3, ts / tt)
-    # The batch axis is also a transform axis here: a plan built with `ntrans = B` runs the whole stack
-    # through one NUFFT execution per cascade step. Reported against the per-field loop above; the two
-    # compose with threading.
+    # The batch axis is also a transform axis here: a plan built with `ntrans = B` analyses the whole
+    # stack in one NUFFT execution. Reported against the per-field loop above; the two compose with
+    # threading.
     spb = ST.ScatteredPlanar.build(Float64, px, py, (32, 32), 3; period = 1.0, L = 4, ntrans = Bp)
     if ST.Plans.batch_width(spb.plan) == Bp
         tb = bench(() -> ST.scattering_batch(spb, Xp))
@@ -493,8 +494,9 @@ function main()
 
     # Scattered sphere reports per-field against batched because it is the one CPU surface where the
     # batched plan wins: the gridded cascade is bandwidth bound, so its `batch_cascade!` loses to a
-    # per-slice loop, while here each step is an iterative solve whose transforms NUFSHT batches over
-    # `ntrans`. Threading is reported against the batched time, since the two compose.
+    # per-slice loop, while here the fit at the points and every step on the grid are NUFSHT
+    # transforms batched over `ntrans`. Threading is reported against the batched time, since the two
+    # compose.
     if _ext(:ScatteringTransformsNUFSHTExt)
         for (lmax, M) in (TIER == "full" ? ((8, 500), (16, 1500), (32, 5000)) : ((8, 500),))
             ga = π * (3 - sqrt(5.0))

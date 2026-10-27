@@ -178,6 +178,10 @@ ScatteringTransforms.FilterBanks.build_filter_bank2d
 ScatteringTransforms.FilterBanks.build_filter_bank3d
 ScatteringTransforms.FilterBanks.ComputedFilterBank1D
 ScatteringTransforms.FilterBanks.ComputedFilterBank2D
+ScatteringTransforms.FilterBanks.AbstractFilterStorage
+ScatteringTransforms.FilterBanks.StoredFilters
+ScatteringTransforms.FilterBanks.ComputedFilters
+ScatteringTransforms.FilterBanks.filter_storage
 ScatteringTransforms.FilterBanks.nwavelets
 ScatteringTransforms.FilterBanks.filter_at
 ScatteringTransforms.FilterBanks.iscomputed
@@ -282,8 +286,9 @@ ScatteringTransforms.ScatteredPlanar.scattered_planar_scattering_batch!
 ## Spherical scattering
 
 A spherical plan implements three primitives — analysis, multiply-and-synthesise, and the spherical
-mean — and everything above them is shared. The in-core direct plan is always available; NUFSHT and
-FastSphericalHarmonics supply the fast ones.
+mean — and everything above them is shared. A scattered transform analyses its samples once and runs
+the rest of its cascade on a plan of the same kind on the Gauss–Legendre grid of its band limit. The
+in-core direct plan is always available; NUFSHT and FastSphericalHarmonics supply the fast ones.
 
 ```@docs
 ScatteringTransforms.SphericalCore.AbstractSphericalPlan
@@ -296,6 +301,12 @@ ScatteringTransforms.SphericalCore.sphere_apply!
 ScatteringTransforms.SphericalCore.sphere_mean
 ScatteringTransforms.SphericalCore.sphere_plan_at
 ScatteringTransforms.SphericalCore.sphere_restrict!
+ScatteringTransforms.SphericalCore.grid_plan
+ScatteringTransforms.SphericalCore.grid_band
+ScatteringTransforms.SphericalCore.coeffs_mean
+ScatteringTransforms.SphericalCore.gauss_legendre_grid
+ScatteringTransforms.SphericalCore.batch_transform
+ScatteringTransforms.SphericalCore.task_local_batch
 ScatteringTransforms.SphericalCore.band_lmax
 ScatteringTransforms.SphericalCore.band_plans
 ScatteringTransforms.SphericalCore.SphericalScattering

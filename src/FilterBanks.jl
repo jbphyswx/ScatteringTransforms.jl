@@ -7,6 +7,30 @@ export FilterBank1D, FilterBank2D, FilterBank3D
 export build_filter_bank1d, build_filter_bank2d, build_filter_bank3d
 export WaveletMeta
 export ComputedFilterBank2D, nwavelets, filter_at, task_bank, batch_views, iscomputed
+export AbstractFilterStorage, StoredFilters, ComputedFilters, filter_storage
+
+"""
+    AbstractFilterStorage
+
+How a transform holds its wavelets, the `filters` keyword of its constructor: [`StoredFilters`](@ref)
+or [`ComputedFilters`](@ref).
+"""
+abstract type AbstractFilterStorage end
+
+"""
+    StoredFilters() <: AbstractFilterStorage
+
+Every wavelet stored in the Fourier domain on the transform's grid, the default.
+"""
+struct StoredFilters <: AbstractFilterStorage end
+
+"""
+    ComputedFilters() <: AbstractFilterStorage
+
+Each wavelet's parameters stored, and the wavelet evaluated on demand into one scratch array (see
+[`ComputedFilterBank2D`](@ref)), for grids whose stored bank does not fit in memory.
+"""
+struct ComputedFilters <: AbstractFilterStorage end
 
 # ---------------------------------------------------------------------------
 # Littlewood–Paley normalization
@@ -335,12 +359,12 @@ end
 
 
 """
-    build_filter_bank2d(T, N, J, ::Val{cache}; L = 8)
+    build_filter_bank2d(T, N, J, filters::AbstractFilterStorage; L = 8)
 
-`Val(false)` returns a [`ComputedFilterBank2D`](@ref), which evaluates each wavelet on demand, for
-grids whose stored bank does not fit in memory; `Val(true)` returns the stored bank.
+[`ComputedFilters`](@ref)`()` returns a [`ComputedFilterBank2D`](@ref), which evaluates each wavelet
+on demand; [`StoredFilters`](@ref)`()` returns the stored bank.
 """
-function build_filter_bank2d(::Type{T}, N::NTuple{2, Int}, J::Int, ::Val{false};
+function build_filter_bank2d(::Type{T}, N::NTuple{2, Int}, J::Int, ::ComputedFilters;
                              L::Int = 8) where {T <: Real}
     morlets = [Filters.Morlet2D{T}(N, j, T(π) * l / L; L = L) for j in 0:(J - 1) for l in 0:(L - 1)]
     meta = [WaveletMeta{T}(j, 0, l, T(j), morlets[j * L + l + 1].center_freq, T(π) * l / L)
@@ -348,7 +372,7 @@ function build_filter_bank2d(::Type{T}, N::NTuple{2, Int}, J::Int, ::Val{false};
     return ComputedFilterBank2D(morlets, T(lp_scale_2d(L)), Filters.gaussian_lowpass(T, N, J),
                                 Matrix{T}(undef, N), meta, J, L)
 end
-build_filter_bank2d(::Type{T}, N::NTuple{2, Int}, J::Int, ::Val{true}; L::Int = 8) where {T <: Real} =
+build_filter_bank2d(::Type{T}, N::NTuple{2, Int}, J::Int, ::StoredFilters; L::Int = 8) where {T <: Real} =
     build_filter_bank2d(T, N, J; L = L)
 
 """
@@ -380,23 +404,23 @@ struct ComputedFilterBank3D{T, A <: AbstractArray{T, 3}, MV <: AbstractVector{Wa
 end
 
 """
-    build_filter_bank1d(T, N, J, ::Val{cache}; Q = 1)
-    build_filter_bank3d(T, N, J, ::Val{cache}; n_orient = 6)
+    build_filter_bank1d(T, N, J, filters::AbstractFilterStorage; Q = 1)
+    build_filter_bank3d(T, N, J, filters::AbstractFilterStorage; n_orient = 6)
 
-`Val(false)` returns a computed bank, which evaluates each wavelet on demand; `Val(true)` returns
-the stored bank.
+[`ComputedFilters`](@ref)`()` returns a computed bank, which evaluates each wavelet on demand;
+[`StoredFilters`](@ref)`()` returns the stored bank.
 """
-function build_filter_bank1d(::Type{T}, N::Int, J::Int, ::Val{false}; Q::Int = 1) where {T <: Real}
+function build_filter_bank1d(::Type{T}, N::Int, J::Int, ::ComputedFilters; Q::Int = 1) where {T <: Real}
     morlets = [Filters.Morlet1D{T}(N, j * Q + q; Q = Q) for j in 0:(J - 1) for q in 0:(Q - 1)]
     meta = [WaveletMeta{T}(j, q, 0, T(j + q / Q), morlets[j * Q + q + 1].center_freq, zero(T))
             for j in 0:(J - 1) for q in 0:(Q - 1)]
     return ComputedFilterBank1D(morlets, T(lp_scale_1d(Q)), Filters.gaussian_lowpass(T, (N,), J),
                                 Vector{T}(undef, N), meta, J, Q)
 end
-build_filter_bank1d(::Type{T}, N::Int, J::Int, ::Val{true}; Q::Int = 1) where {T <: Real} =
+build_filter_bank1d(::Type{T}, N::Int, J::Int, ::StoredFilters; Q::Int = 1) where {T <: Real} =
     build_filter_bank1d(T, N, J; Q = Q)
 
-function build_filter_bank3d(::Type{T}, N::NTuple{3, Int}, J::Int, ::Val{false};
+function build_filter_bank3d(::Type{T}, N::NTuple{3, Int}, J::Int, ::ComputedFilters;
                              n_orient::Int = 6) where {T <: Real}
     dirs = Filters.fibonacci_directions(n_orient, T)
     morlets = [Filters.Morlet3D{T}(N, j, d; n_orient = n_orient) for j in 0:(J - 1) for d in dirs]
@@ -405,7 +429,7 @@ function build_filter_bank3d(::Type{T}, N::NTuple{3, Int}, J::Int, ::Val{false};
     return ComputedFilterBank3D(morlets, T(lp_scale_3d(n_orient)), Filters.gaussian_lowpass(T, N, J),
                                 Array{T, 3}(undef, N), meta, J, n_orient)
 end
-build_filter_bank3d(::Type{T}, N::NTuple{3, Int}, J::Int, ::Val{true};
+build_filter_bank3d(::Type{T}, N::NTuple{3, Int}, J::Int, ::StoredFilters;
                     n_orient::Int = 6) where {T <: Real} =
     build_filter_bank3d(T, N, J; n_orient = n_orient)
 
@@ -488,6 +512,15 @@ live at once, or a filter at a resolution the bank does not hold, must copy it.
 """
 iscomputed(::StoredBank) = false
 iscomputed(::ComputedBank) = true
+
+"""
+    filter_storage(fb) -> AbstractFilterStorage
+
+The `filters` that builds a bank like `fb`: [`StoredFilters`](@ref)`()` or
+[`ComputedFilters`](@ref)`()`.
+"""
+filter_storage(::StoredBank) = StoredFilters()
+filter_storage(::ComputedBank) = ComputedFilters()
 
 """
     task_bank(fb) -> fb′

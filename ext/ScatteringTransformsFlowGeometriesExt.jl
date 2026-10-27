@@ -40,9 +40,8 @@ _coordinates(grid::FG.Grids.AbstractUnstructuredGrid) =
 _coordinates(grid::FG.Grids.AbstractGrid) = FG.Grids.materialize(grid)
 
 # The entries of a per-cell vector at the grid's active cells.
-function _active(grid::FG.Grids.AbstractGrid, v::AbstractVector)
-    m = FG.Grids.mask(grid)
-    return all(m) ? v : v[vec(m)]
-end
+_active(grid::FG.Grids.AbstractGrid, v::AbstractVector) = _active(FG.Grids.mask(grid), v)
+_active(::FG.Grids.AllActive, v::AbstractVector) = v
+_active(m::AbstractArray{Bool}, v::AbstractVector) = v[vec(m)]
 
 end # module ScatteringTransformsFlowGeometriesExt

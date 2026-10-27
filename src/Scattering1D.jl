@@ -45,13 +45,14 @@ struct ScatteringTransform1D{T, V<:AbstractVector{Complex{T}},
 end
 
 """
-    ScatteringTransform1D([T=Float64,] N, J; Q=1, max_order=2, cache=true, oversampling=J,
-                          transform=AutoSpectralBackend())
+    ScatteringTransform1D([T=Float64,] N, J; Q=1, max_order=2, filters=StoredFilters(),
+                          oversampling=J, transform=AutoSpectralBackend())
 
 Build a 1D scattering transform for length-`N` signals over `J` octaves. The element type is
 positional, as for `zeros(T, …)`; omit it for `Float64`.
 
-`cache = false` evaluates each wavelet on demand (see `FilterBanks.ComputedFilterBank1D`).
+`filters = FilterBanks.ComputedFilters()` evaluates each wavelet on demand (see
+`FilterBanks.ComputedFilterBank1D`).
 `oversampling = α` produces a scale-`j` wavelet's output decimated by `2^max(j-α, 0)`; the default
 `J` decimates nothing. `transform` is the `SpectralBackends` tag of the discrete Fourier transform
 the cascade runs on (see `Plans.make_plan`).
@@ -59,10 +60,10 @@ the cascade runs on (see `Plans.make_plan`).
 function ScatteringTransform1D(::Type{T}, N::Int, J::Int;
                                Q::Int=1,
                                max_order::Int=2,
-                               cache::Bool=true,
+                               filters::FilterBanks.AbstractFilterStorage=FilterBanks.StoredFilters(),
                                oversampling::Int=J,
                                transform::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T}
-    filter_bank = FilterBanks.build_filter_bank1d(T, N, J, Val(cache); Q=Q)
+    filter_bank = FilterBanks.build_filter_bank1d(T, N, J, filters; Q=Q)
     tree = PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
     nw = FilterBanks.nwavelets(filter_bank)
     groups = max_order >= 2 ? PathGraph.order2_groups(tree, nw) :

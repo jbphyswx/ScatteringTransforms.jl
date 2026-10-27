@@ -64,6 +64,7 @@ ST.SphericalCore.plan_points(::SHTSphericalPlan) = nothing
 ST.SphericalCore.plan_weights(::SHTSphericalPlan) = nothing
 ST.SphericalCore.plan_solver(::SHTSphericalPlan) = nothing
 ST.Plans.spectral_backend(::SHTSphericalPlan) = SB.FSHTSpectralBackend()
+ST.Plans.available(::SB.FSHTSpectralBackend) = true
 
 # `cbuf` is mutated per band and the cached plans hold their own scratch, so a task needs both.
 ST.Plans.task_local_plan(p::SHTSphericalPlan) =

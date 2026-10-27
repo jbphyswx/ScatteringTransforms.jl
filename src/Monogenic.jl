@@ -154,15 +154,17 @@ function FilterBanks.filter_at(fb::ComputedMonogenicFilterBank, j::Integer)
 end
 FilterBanks.iscomputed(::MonogenicFilterBank) = false
 FilterBanks.iscomputed(::ComputedMonogenicFilterBank) = true
+FilterBanks.filter_storage(::MonogenicFilterBank) = FilterBanks.StoredFilters()
+FilterBanks.filter_storage(::ComputedMonogenicFilterBank) = FilterBanks.ComputedFilters()
 FilterBanks.task_bank(fb::MonogenicFilterBank) = fb
 FilterBanks.task_bank(fb::ComputedMonogenicFilterBank) =
     ComputedMonogenicFilterBank(fb.profiles, fb.rescale, fb.riesz, fb.averaging,
                                 similar(fb.scratch), fb.meta, fb.J, fb.Q)
 
-build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int, ::Val{true};
+build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int, ::FilterBanks.StoredFilters;
                      Q::Int=1) where {T<:Real,D} = build_monogenic_bank(T, dims, J; Q=Q)
 
-function build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int, ::Val{false};
+function build_monogenic_bank(::Type{T}, dims::NTuple{D,Int}, J::Int, ::FilterBanks.ComputedFilters;
                               Q::Int=1) where {T<:Real,D}
     profiles = NTuple{2,T}[]
     meta = FilterBanks.WaveletMeta{T}[]
@@ -296,19 +298,21 @@ function assemble(fb, tree, groups, max_order::Int, plan,
 end
 
 """
-    MonogenicScattering([T=Float64,] dims, J; Q=1, max_order=2, cache=true, oversampling=J,
-                        transform=AutoSpectralBackend())
+    MonogenicScattering([T=Float64,] dims, J; Q=1, max_order=2, filters=StoredFilters(),
+                        oversampling=J, transform=AutoSpectralBackend())
 
 Construct a monogenic scattering transform for fields of size `dims` (`Int` or `NTuple{D,Int}`).
-The element type is positional, as for `zeros(T, …)`; omit it for `Float64`. `cache = false`
-evaluates the band-passes on demand ([`ComputedMonogenicFilterBank`](@ref)); `oversampling` and
-`transform` are as for the gridded transforms. The KernelAbstractions extension adds
-`MonogenicScattering([T,] dims, J, gpu::GPUBackend; …)`, a transform on that device.
+The element type is positional, as for `zeros(T, …)`; omit it for `Float64`.
+`filters = FilterBanks.ComputedFilters()` evaluates the band-passes on demand
+([`ComputedMonogenicFilterBank`](@ref)); `oversampling` and `transform` are as for the gridded
+transforms. The KernelAbstractions extension adds `MonogenicScattering([T,] dims, J, gpu::GPUBackend; …)`,
+a transform on that device.
 """
 function MonogenicScattering(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1, max_order::Int=2,
-                             cache::Bool=true, oversampling::Int=J,
+                             filters::FilterBanks.AbstractFilterStorage=FilterBanks.StoredFilters(),
+                             oversampling::Int=J,
                              transform::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T,D}
-    fb = build_monogenic_bank(T, dims, J, Val(cache); Q=Q)
+    fb = build_monogenic_bank(T, dims, J, filters; Q=Q)
     plan = Plans.make_plan(transform, T, dims)
     tree, groups = tree_groups(fb, max_order)
     pw = Cascade.build(fb, groups, dims, T, oversampling, plan)

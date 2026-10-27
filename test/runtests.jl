@@ -74,8 +74,7 @@ Test.@testset "Littlewood–Paley sum of every bank: A(0) = 1, 0 < A ≤ 1" begi
     # by the identity, and `min A > 0` makes it invertible.
     FBk = ScatteringTransforms.FilterBanks
     Mono = ScatteringTransforms.Monogenic
-    for T in (Float64, Float32), cache in (true, false)
-        c = Val(cache)
+    for T in (Float64, Float32), c in (FBk.StoredFilters(), FBk.ComputedFilters())
         banks = (FBk.build_filter_bank1d(T, 256, 5, c; Q = 1),
                  FBk.build_filter_bank1d(T, 255, 4, c; Q = 2),
                  FBk.build_filter_bank2d(T, (64, 64), 3, c; L = 8),
@@ -617,29 +616,30 @@ Test.@testset "2D localized field: mean equals averaged coefficient" begin
     end
 end
 
-Test.@testset "Computed filter banks (cache=false) match stored ones everywhere" begin
+Test.@testset "Computed filter banks match stored ones everywhere" begin
     # A computed bank evaluates each wavelet on demand into one shared scratch array, so each task
     # needs its own scratch.
     Random.seed!(41)
     FB = SpectralBackends.FFTSpectralBackend()
     CBk = ComputationalBackends
+    FBk = ScatteringTransforms.FilterBanks
     flat(c) = vcat(c.S0, vec(c.S1), vec(c.S2))
 
     for (mk, x, run!, mkc) in (
-            ((α, ca) -> ScatteringTransforms.Scattering1D.ScatteringTransform1D(128, 4; Q=1,
-                            max_order=2, oversampling=α, transform=FB, cache=ca),
+            ((α, fs) -> ScatteringTransforms.Scattering1D.ScatteringTransform1D(128, 4; Q=1,
+                            max_order=2, oversampling=α, transform=FB, filters=fs),
              randn(128), ScatteringTransforms.Scattering1D.scattering_transform!,
              st -> ScatteringTransforms.batch_coeffs(st, Float64)),
-            ((α, ca) -> ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4,
-                            max_order=2, oversampling=α, transform=FB, cache=ca),
+            ((α, fs) -> ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4,
+                            max_order=2, oversampling=α, transform=FB, filters=fs),
              randn(32, 32), ScatteringTransforms.Scattering2D.scattering_transform2d!,
              st -> ScatteringTransforms.batch_coeffs(st, Float64)),
-            ((α, ca) -> ScatteringTransforms.Scattering3D.ScatteringTransform3D((16, 16, 16), 2;
-                            n_orient=4, max_order=2, oversampling=α, transform=FB, cache=ca),
+            ((α, fs) -> ScatteringTransforms.Scattering3D.ScatteringTransform3D((16, 16, 16), 2;
+                            n_orient=4, max_order=2, oversampling=α, transform=FB, filters=fs),
              randn(16, 16, 16), ScatteringTransforms.Scattering3D.scattering_transform3d!,
              st -> ScatteringTransforms.batch_coeffs(st, Float64)))
         for α in (4, 1, 0)
-            stored, computed = mk(α, true), mk(α, false)
+            stored, computed = mk(α, FBk.StoredFilters()), mk(α, FBk.ComputedFilters())
             Test.@test ScatteringTransforms.FilterBanks.iscomputed(computed.filter_bank)
             Test.@test !ScatteringTransforms.FilterBanks.iscomputed(stored.filter_bank)
             # Same arithmetic in the same order.
@@ -657,7 +657,7 @@ Test.@testset "Computed filter banks (cache=false) match stored ones everywhere"
 
     # A worker rebuilding from a spec gets a computed bank too.
     st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2,
-             oversampling=1, transform=FB, cache=false)
+             oversampling=1, transform=FB, filters=FBk.ComputedFilters())
     rebuilt = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
     Test.@test ScatteringTransforms.FilterBanks.iscomputed(rebuilt.filter_bank)
     x2 = randn(32, 32)
@@ -725,7 +725,7 @@ Test.@testset "Every bank's averaging filter is the Gaussian φ_J" begin
     FBk = ScatteringTransforms.FilterBanks
     N, J = 256, 4
     φ = ScatteringTransforms.Filters.gaussian_lowpass(Float64, (N,), J)
-    for c in (Val(true), Val(false))
+    for c in (FBk.StoredFilters(), FBk.ComputedFilters())
         Test.@test FBk.build_filter_bank1d(Float64, N, J, c; Q = 2).averaging == φ
         Test.@test FBk.build_filter_bank2d(Float64, (32, 48), 3, c; L = 4).averaging ==
                    ScatteringTransforms.Filters.gaussian_lowpass(Float64, (32, 48), 3)
@@ -920,8 +920,9 @@ Test.@testset "Monogenic periodized cascade converges to the undecimated one" be
 
     for (dims, J) in (((128,), 4), ((32, 32), 3), ((16, 16, 16), 2))
         x = randn(dims...)
-        mk(α; cache=true) = ScatteringTransforms.Monogenic.MonogenicScattering(
-            Float64, dims, J; Q=1, max_order=2, transform=FB, oversampling=α, cache=cache)
+        mk(α; filters=ScatteringTransforms.FilterBanks.StoredFilters()) =
+            ScatteringTransforms.Monogenic.MonogenicScattering(
+                Float64, dims, J; Q=1, max_order=2, transform=FB, oversampling=α, filters=filters)
         cref = mk(J)(x)
         # Nothing decimated: the same operations in the same order, so equality.
         Test.@test flat(mk(J + 2)(x)) == flat(cref)
@@ -938,7 +939,7 @@ Test.@testset "Monogenic periodized cascade converges to the undecimated one" be
         Test.@test mk(0)(x).S0 ≈ cref.S0
 
         # A computed bank evaluates into shared scratch.
-        Test.@test flat(mk(1; cache=false)(x)) == flat(mk(1)(x))
+        Test.@test flat(mk(1; filters=ScatteringTransforms.FilterBanks.ComputedFilters())(x)) == flat(mk(1)(x))
     end
 end
 

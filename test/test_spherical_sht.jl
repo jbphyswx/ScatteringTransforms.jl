@@ -181,33 +181,38 @@ Test.@testset "The in-core direct SHT is the least-squares fit onto degree ≤ l
 end
 
 # `solve = false` analyses by the weighted adjoint. Fejér's first rule on `2lmax + 1` midpoint colatitudes
-# and `2lmax + 1` equispaced longitudes integrate the product of two degree-`lmax` harmonics, so on their
-# product grid the adjoint is the expansion of a degree-`lmax` field.
+# and the Gauss–Legendre rule on `lmax + 1`, each by `2lmax + 1` equispaced longitudes, integrate the
+# product of two degree-`lmax` harmonics, so on their product grids the adjoint is the expansion of a
+# degree-`lmax` field.
 Test.@testset "Scattered analysis by the weighted adjoint" begin
     SC = ScatteringTransforms.SphericalCore
     lmax, J = 8, 3
     N = 2lmax + 1
     fw = SC._fejer1_weights(N, Float64)
-    θ = vec([π * (j - 0.5) / N for j in 1:N, _ in 1:N])
-    φ = vec([2π * (k - 1) / N for _ in 1:N, k in 1:N])
-    w = vec([fw[j] for j in 1:N, _ in 1:N])
-    A = reduce(hcat, [c(NUFSHT.sYlm(0, ℓ, m, θ[k], φ[k])) for k in eachindex(θ)] for ℓ in 0:lmax for m in 0:ℓ
-                      for c in (m == 0 ? (real,) : (real, imag)))
+    fejer = (vec([π * (j - 0.5) / N for j in 1:N, _ in 1:N]), vec([2π * (k - 1) / N for _ in 1:N, k in 1:N]),
+             vec([fw[j] for j in 1:N, _ in 1:N]))
     Random.seed!(8)
-    F = A * randn(size(A, 2), 3)
-    for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
-        plan = SC.make_spherical_plan(spec, θ, φ, lmax, Float64; weights = w, solve = false, ntrans = 3)
-        out = similar(F)
-        SC.sphere_apply!(out, plan, SC.sphere_coeffs(plan, F), Returns(1.0))
-        Test.@test out ≈ F rtol = (plan isa SC.DirectSHTSphericalPlan ? 1e-12 : 2 * plan.plan.tol)
-        # A transform rebuilt from its spec, as on a Distributed worker, computes the same coefficients.
-        st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, weights = w, solve = false)
-        rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
-        Test.@test rb(F[:, 1]).S1 ≈ st(F[:, 1]).S1 rtol = 1e-8
-        foreach(ScatteringTransforms.close_transform!, (st, rb))
+    for (θ, φ, w) in (fejer, SC.gauss_legendre_grid(lmax, Float64))
+        A = reduce(hcat, [c(NUFSHT.sYlm(0, ℓ, m, θ[k], φ[k])) for k in eachindex(θ)] for ℓ in 0:lmax
+                          for m in 0:ℓ for c in (m == 0 ? (real,) : (real, imag)))
+        F = A * randn(size(A, 2), 3)
+        for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
+            plan = SC.make_spherical_plan(spec, θ, φ, lmax, Float64; weights = w, solve = false, ntrans = 3)
+            out = similar(F)
+            SC.sphere_apply!(out, plan, SC.sphere_coeffs(plan, F), Returns(1.0))
+            Test.@test out ≈ F rtol = (plan isa SC.DirectSHTSphericalPlan ? 1e-12 : 2 * plan.plan.tol)
+            # A transform rebuilt from its spec, as on a Distributed worker, computes the same coefficients.
+            st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, weights = w,
+                                                           solve = false)
+            rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
+            Test.@test rb(F[:, 1]).S1 ≈ st(F[:, 1]).S1 rtol = 1e-8
+            foreach(ScatteringTransforms.close_transform!, (st, rb))
+        end
     end
 end
 
+# `S0` is the mean of the field the analysis recovers, which for the weighted adjoint is its degree-0
+# coefficient, `Σ wₖ fₖ / Σ wₖ`; NUFSHT's adjoint is exact to its NUFFT's tolerance.
 Test.@testset "Scattered spherical means take the given quadrature weights" begin
     lmax, J, M = 6, 2, 300
     gr = (sqrt(5) - 1) / 2
@@ -215,12 +220,14 @@ Test.@testset "Scattered spherical means take the given quadrature weights" begi
     φ = [2π * mod(k * gr, 1) for k in 1:M]
     Random.seed!(6)
     w = 0.5 .+ rand(M)
-    f = randn(M)
-    for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
-        st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, weights = w)
-        Test.@test st(f).S0 ≈ sum(w .* f) / sum(w) rtol = 1e-12
+    f = 1 .+ randn(M)
+    for (spec, tol) in ((SpectralBackends.DirectSumSpectralBackend(), 1e-12),
+                        (SpectralBackends.NUFSHTSpectralBackend(), 1e-6))
+        st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, weights = w,
+                                                       solve = false)
+        Test.@test st(f).S0 ≈ sum(w .* f) / sum(w) rtol = tol
         rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
-        Test.@test rb(f).S0 ≈ sum(w .* f) / sum(w) rtol = 1e-12
+        Test.@test rb(f).S0 ≈ sum(w .* f) / sum(w) rtol = tol
         ScatteringTransforms.close_transform!(st)
         ScatteringTransforms.close_transform!(rb)
     end

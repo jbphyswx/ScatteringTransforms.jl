@@ -35,9 +35,15 @@ struct ScatteringCoefficients1D{T,V<:AbstractVector{T},M<:AbstractMatrix{T},S0}
                                       S0=zero(eltype(S1)))
         T = eltype(S1)
         n = length(S1)
-        @assert (isempty(S2) || (size(S2, 1) == n && size(S2, 2) == n)) "S2 must be empty or n×n"
+        _check_S2(S2, n)
         new{T, typeof(S1), typeof(S2), typeof(S0)}(S0, S1, S2, n)
     end
+end
+
+function _check_S2(S2::AbstractMatrix, n::Int)
+    (isempty(S2) || size(S2) == (n, n)) || throw(DimensionMismatch(
+        "S2 is $(size(S2)); it is empty or n×n, n = $n the number of wavelets"))
+    return nothing
 end
 
 function ScatteringCoefficients1D(n::Int, ::Type{T}=Float64; 
@@ -94,7 +100,8 @@ end
     flat_row_s2(j1, j2, n) -> Int
 
 Row layout of the flattened coefficient vector `[S0; S1; vec(S2 upper triangle)]` for `n` wavelets,
-as produced by [`flatten1d!`](@ref)/[`flatten2d!`](@ref).
+as produced by [`flatten1d!`](@ref)/[`flatten2d!`](@ref). The `S2` rows are present, zero, for
+coefficients that hold no `S2`.
 
 The batched paths write flattened columns through these accessors, so they must match the order the
 `flatten*!` loops write.
@@ -145,8 +152,13 @@ function flatten1d!(out::AbstractVector, c::ScatteringCoefficients1D)
         throw(DimensionMismatch("out length $(length(out)) != flatten_length $(flatten_length(c))"))
     out[1] = zeroth_order(c)
     @inbounds out[2:(1 + n)] .= c.S1
+    return _flatten_S2!(out, c.S2, n)
+end
+
+# The upper triangle of `S2` into rows `n + 2` on, j1-major, or zeros where `S2` is empty.
+function _flatten_S2!(out::AbstractVector, S2::AbstractMatrix, n::Int)
+    isempty(S2) && return (fill!(view(out, (n + 2):length(out)), zero(eltype(out))); out)
     idx = 2 + n
-    S2 = c.S2
     @inbounds for j1 in 1:n, j2 in (j1 + 1):n
         out[idx] = S2[j1, j2]
         idx += 1
@@ -176,7 +188,7 @@ struct ScatteringCoefficients2D{T,V<:AbstractVector{T},M<:AbstractMatrix{T},S0}
                                     S0=zero(eltype(S1)), n_scales::Int=0, n_orientations::Int=0)
         T = eltype(S1)
         n = length(S1)
-        @assert (isempty(S2) || (size(S2, 1) == n && size(S2, 2) == n)) "S2 must be empty or n×n"
+        _check_S2(S2, n)
         new{T, typeof(S1), typeof(S2), typeof(S0)}(S0, S1, S2, n_scales, n_orientations, n)
     end
 end
@@ -229,13 +241,7 @@ function flatten2d!(out::AbstractVector, c::ScatteringCoefficients2D)
         throw(DimensionMismatch("out length $(length(out)) != flatten_length $(flatten_length(c))"))
     out[1] = zeroth_order(c)
     @inbounds out[2:(1 + n)] .= c.S1
-    idx = 2 + n
-    S2 = c.S2
-    @inbounds for j1 in 1:n, j2 in (j1 + 1):n
-        out[idx] = S2[j1, j2]
-        idx += 1
-    end
-    return out
+    return _flatten_S2!(out, c.S2, n)
 end
 
 end # module Coefficients
