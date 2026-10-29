@@ -2,7 +2,7 @@
 
 Symbols are accessed via fully-qualified submodule paths (the package does not re-export names into
 its top-level namespace); `using ScatteringTransforms: ScatteringTransforms as ST`, then e.g.
-`ST.Scattering2D.ScatteringTransform2D(...)`.
+`ST.ScatteringCore.ScatteringTransform(...)`.
 
 ```@docs
 ScatteringTransforms.ScatteringTransforms
@@ -14,7 +14,7 @@ Planar (Cartesian) and spherical scattering, on uniform/structured and nonunifor
 
 | domain | uniform / structured | nonuniform / scattered |
 |---|---|---|
-| Cartesian | `ScatteringTransform{1,2,3}D` (FFT/direct sum; GPU via `GPUBackend`) | `scattered_planar_scattering` (exact direct NUDFT; NonuniformFFTs or FINUFFT fast path) |
+| Cartesian | `ScatteringTransform{D}` (FFT/direct sum; GPU via `GPUBackend`) | `scattered_planar_scattering` (exact direct NUDFT; NonuniformFFTs or FINUFFT fast path) |
 | Sphere (S²) | `structured_spherical_scattering` (exact direct SHT; FastSphericalHarmonics fast path) | `spherical_scattering` (exact direct SHT; NUFSHT fast path) |
 
 **Every cell has an in-core, dependency-free default** (direct summation), with an optional fast path
@@ -28,16 +28,18 @@ structured sphere. `AutoSpectralBackend` (the default) picks the fast path if it
 loaded, else the direct sum — so nothing requires an external library. Naming a backend explicitly is
 honoured exactly: if its extension is absent it throws.
 
-Monogenic (Riesz) variants exist on both sphere paths; see below. Pointwise
-`spherical_monogenic_components` takes a scattered-point transform, on the in-core or the NUFSHT
-plan.
+Monogenic variants support gridded Cartesian fields and both spherical samplings.
+`spherical_monogenic_components` accepts scattered and structured spherical transforms.
 
 ## Transforms
 
+All transform objects subtype `ScatteringCore.AbstractScatteringTransform` and are callable as
+`st(field)`. Both Cartesian families carry spatial rank as `ScatteringTransform{D,…}` and
+`MonogenicScatteringTransform{D,…}`. `D = 1, 2, 3` selects a signal, image or volume.
+
 ```@docs
-ScatteringTransforms.Scattering1D.ScatteringTransform1D
-ScatteringTransforms.Scattering2D.ScatteringTransform2D
-ScatteringTransforms.Scattering3D.ScatteringTransform3D
+ScatteringTransforms.ScatteringCore.AbstractScatteringTransform
+ScatteringTransforms.ScatteringCore.ScatteringTransform
 ScatteringTransforms.Scattering1D.scattering_transform!
 ScatteringTransforms.Scattering2D.scattering_transform2d!
 ScatteringTransforms.Scattering3D.scattering_transform3d!
@@ -62,7 +64,7 @@ ScatteringTransforms.scattering_loss
 ## Monogenic (Riesz) scattering
 
 ```@docs
-ScatteringTransforms.Monogenic.MonogenicScattering
+ScatteringTransforms.Monogenic.MonogenicScatteringTransform
 ScatteringTransforms.Monogenic.MonogenicFilterBank
 ScatteringTransforms.Monogenic.ComputedMonogenicFilterBank
 ScatteringTransforms.Monogenic.MonogenicWorkspace
@@ -70,6 +72,7 @@ ScatteringTransforms.Monogenic.build_monogenic_bank
 ScatteringTransforms.Monogenic.riesz_multipliers
 ScatteringTransforms.Monogenic.monogenic_amplitude
 ScatteringTransforms.Monogenic.monogenic_components
+ScatteringTransforms.Monogenic.monogenic_scattering!
 ScatteringTransforms.spherical_monogenic_scattering
 ScatteringTransforms.spherical_monogenic_components
 ScatteringTransforms.structured_spherical_monogenic_scattering
@@ -82,6 +85,7 @@ ScatteringTransforms.ScatteringFields.scattering_field
 ScatteringTransforms.ScatteringFields.scattering_field!
 ScatteringTransforms.ScatteringFields.ScatteringField1D
 ScatteringTransforms.ScatteringFields.ScatteringField2D
+ScatteringTransforms.ScatteringFields.ScatteringField3D
 ScatteringTransforms.ScatteringFields.path_field
 ScatteringTransforms.ScatteringFields.subsample_factor
 ```
@@ -128,6 +132,7 @@ ScatteringTransforms.batch_coeffs
 ScatteringTransforms.flat_rows
 ScatteringTransforms.batch_workspace
 ScatteringTransforms.Batched.BatchWorkspace
+ScatteringTransforms.Batched.SpectralBatchWorkspace
 ScatteringTransforms.Batched.batch_cascade!
 ScatteringTransforms.close_transform!
 ```
@@ -197,6 +202,7 @@ ScatteringTransforms.Filters.Morlet2D
 ScatteringTransforms.Filters.Morlet3D
 ScatteringTransforms.Filters.frequency_response
 ScatteringTransforms.Filters.frequency_response!
+ScatteringTransforms.Filters._alias_rms
 ScatteringTransforms.Filters.fibonacci_directions
 ScatteringTransforms.PathGraph.ScatteringTree
 ScatteringTransforms.PathGraph.build_tree
@@ -217,6 +223,7 @@ ScatteringTransforms.Plans.forward_transform
 ScatteringTransforms.Plans.inverse_transform
 ScatteringTransforms.Plans.make_plan
 ScatteringTransforms.Plans.make_scattered_plan
+ScatteringTransforms.Plans.available
 ScatteringTransforms.Plans.spectral_backend
 ScatteringTransforms.Plans.task_local_plan
 ScatteringTransforms.Plans.batch_width
@@ -240,11 +247,19 @@ ScatteringTransforms.ScatteringCore.task_workspace
 
 ### Scattered least-squares solve
 
-`solve = true` on a scattered planar transform fits the mode grid to the samples by least squares with
-`FlowTransformBindings.lsmr!`, as every scattered-sphere analysis does. These are the defaults that
-configure it.
+`analysis = ST.Plans.LeastSquares()` fits spectral coefficients with `FlowTransformBindings.lsmr!`.
+`ST.Plans.WeightedAdjoint()` applies the quadrature-weighted adjoint. The planar default is
+`WeightedAdjoint()`; the scattered-sphere default is `LeastSquares()`.
+
+`rtol` controls the fit's relative normal residual. A fit that reaches its iteration or condition
+limit returns its best iterate. Fit diagnostics remain in its LSMR workspace; coefficient containers
+hold the scattering coefficients. For scattered planar transforms, `tol` controls NUFFT accuracy and
+`nthreads` controls the NUFFT library's threads.
 
 ```@docs
+ScatteringTransforms.Plans.AbstractAnalysis
+ScatteringTransforms.Plans.WeightedAdjoint
+ScatteringTransforms.Plans.LeastSquares
 ScatteringTransforms.Plans.default_solver_rtol
 ScatteringTransforms.Plans.warn_underdetermined
 ```
@@ -264,10 +279,7 @@ ScatteringTransforms.Plans.abstractffts_plan
 ```@docs
 ScatteringTransforms.Execution.resolve_backend
 ScatteringTransforms.Execution.check_available
-ScatteringTransforms.Execution.have_threads
-ScatteringTransforms.Execution.have_gpu
-ScatteringTransforms.Execution.have_distributed
-ScatteringTransforms.Execution.have_mpi
+ScatteringTransforms.Execution.available
 ```
 
 ## Cascade internals
@@ -278,7 +290,7 @@ The cascade each gridded transform runs, and the per-surface in-place entry poin
 ScatteringTransforms.Scattering1D.cascade!
 ScatteringTransforms.Scattering2D.cascade!
 ScatteringTransforms.Scattering3D.cascade!
-ScatteringTransforms.ScatteredPlanar.ScatteredPlanarScattering
+ScatteringTransforms.ScatteredPlanar.ScatteredPlanarScatteringTransform
 ScatteringTransforms.ScatteredPlanar.scattered_planar_scattering!
 ScatteringTransforms.ScatteredPlanar.scattered_planar_scattering_batch!
 ```
@@ -300,6 +312,7 @@ ScatteringTransforms.SphericalCore.sphere_field_buffer
 ScatteringTransforms.SphericalCore.sphere_apply!
 ScatteringTransforms.SphericalCore.sphere_mean
 ScatteringTransforms.SphericalCore.sphere_plan_at
+ScatteringTransforms.SphericalCore.sphere_lmax
 ScatteringTransforms.SphericalCore.sphere_restrict!
 ScatteringTransforms.SphericalCore.grid_plan
 ScatteringTransforms.SphericalCore.grid_band
@@ -309,8 +322,8 @@ ScatteringTransforms.SphericalCore.batch_transform
 ScatteringTransforms.SphericalCore.task_local_batch
 ScatteringTransforms.SphericalCore.band_lmax
 ScatteringTransforms.SphericalCore.band_plans
-ScatteringTransforms.SphericalCore.SphericalScattering
-ScatteringTransforms.SphericalCore.SphericalMonogenicScattering
+ScatteringTransforms.SphericalCore.SphericalScatteringTransform
+ScatteringTransforms.SphericalCore.SphericalMonogenicScatteringTransform
 ScatteringTransforms.SphericalCore.SphericalWorkspace
 ScatteringTransforms.SphericalCore.SphericalMonogenicWorkspace
 ScatteringTransforms.SphericalCore.spherical_scattering!
@@ -333,7 +346,6 @@ ScatteringTransforms.SphericalCore.task_local_batch_plan
 ScatteringTransforms.SphericalCore.supports_batch
 ScatteringTransforms.SphericalCore.plan_nufft
 ScatteringTransforms.SphericalCore.plan_spin
-ScatteringTransforms.Plans.AnalysisNotConverged
 ScatteringTransforms.SphericalCore.default_rtol
 ScatteringTransforms.SphericalCore.make_spherical_plan
 ScatteringTransforms.SphericalCore.make_structured_plan

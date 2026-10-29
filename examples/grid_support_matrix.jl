@@ -26,19 +26,19 @@ println("="^64)
 println("\n1. Scattered-planar scattering (NUFFT)")
 Ny, Nx, J, L = 24, 24, 3, 4
 f = randn(Ny, Nx)
-grid = ST.Scattering2D.ScatteringTransform2D((Ny, Nx), J; L=L, max_order=2, transform=SB.FFTSpectralBackend())
+grid = ST.ScatteringCore.ScatteringTransform((Ny, Nx), J; L=L, max_order=2, transform=SB.FFTSpectralBackend())
 n1 = vec([Float64(i) for i in 0:Ny-1, j in 0:Nx-1])
 n2 = vec([Float64(j) for i in 0:Ny-1, j in 0:Nx-1])
 sca = ST.scattered_planar_scattering(n1, n2, (Ny, Nx), J; L=L, max_order=2, period=(Ny, Nx))
 relerr = maximum(abs.(ST.Coefficients.flatten2d(sca(vec(f))) .- ST.Coefficients.flatten2d(grid(f)))) /
          maximum(abs.(ST.Coefficients.flatten2d(grid(f))))
 println("   uniform-grid parity vs gridded FFT: rel-err = ", relerr)
-println("   (irregular data: pass solve=true for the band-limited least-squares inversion)")
+println("   (irregular data: pass analysis=ST.Plans.LeastSquares() for a band-limited fit)")
 
 # ---------------------------------------------------------------------------
 # Sphere: structured (fast SHT) and scattered (NUFSHT).
 # ---------------------------------------------------------------------------
-println("\n2. Structured spherical scattering (fast SHT on a Clenshaw–Curtis grid)")
+println("\n2. Structured spherical scattering (fast SHT on a Fejér grid)")
 lmax, Js = 16, 3
 Θ, Φ = ST.structured_sphere_points(lmax)
 gfield = [cos(θ)^2 - 1/3 + 0.4sin(θ)*cos(φ) for θ in Θ, φ in Φ]

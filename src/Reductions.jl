@@ -19,13 +19,10 @@ function normalized_coefficients(c::_Coeffs)
     S0 = Coefficients.zeroth_order(c)
     S1 = Coefficients.first_order(c)
     S2 = Coefficients.second_order(c)
-    s1 = S0 != zero(S0) ? S1 ./ S0 : copy(S1)
-    s2 = zero(S2)
-    @inbounds for j1 in axes(S2, 1), j2 in axes(S2, 2)
-        if S1[j1] > zero(eltype(S1))
-            s2[j1, j2] = S2[j1, j2] / S1[j1]
-        end
-    end
+    s1 = S1 ./ ifelse(iszero(S0), one(S0), S0)
+    positive = reshape(S1 .> zero(eltype(S1)), :, 1)
+    denominator = reshape(ifelse.(S1 .> zero(eltype(S1)), S1, one(eltype(S1))), :, 1)
+    s2 = isempty(S2) ? copy(S2) : ifelse.(positive, S2 ./ denominator, zero(eltype(S2)))
     return (S0 = S0, s1 = s1, s2 = s2)
 end
 

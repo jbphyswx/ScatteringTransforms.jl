@@ -8,6 +8,67 @@ export apply_modulus, apply_modulus!, spatial_average
 export scattering
 
 """
+    AbstractScatteringTransform
+
+Prepared scattering transform whose call `st(field)` returns scattering coefficients.
+"""
+abstract type AbstractScatteringTransform end
+
+"""
+    ScatteringTransform{D}
+    ScatteringTransform([T=Float64,] dims, J; kwargs...)
+
+Regular Cartesian scattering transform with `D` spatial axes, a wavelet bank and reusable buffers.
+The rank of the `dims` tuple selects the 1D, 2D or 3D wavelet builder; an integer selects 1D.
+"""
+struct ScatteringTransform{D,T,M<:AbstractArray{Complex{T},D},P<:Plans.AbstractScatteringPlan,
+                           Tree,FB,G<:AbstractVector,PW,W} <: AbstractScatteringTransform
+    filter_bank::FB
+    tree::Tree
+    groups::G
+    max_order::Int
+    plan::P
+    buffer_input::M
+    buffer_signal_fft::M
+    dims::NTuple{D,Int}
+    pw::PW
+    workspaces::W
+end
+
+function ScatteringTransform(fb, tree, groups, max_order, plan,
+        input::AbstractArray{Complex{T},D}, spectrum, dims::NTuple{D,Int}, pw, workspaces) where {T,D}
+    return ScatteringTransform{D,T,typeof(input),typeof(plan),typeof(tree),typeof(fb),
+                               typeof(groups),typeof(pw),typeof(workspaces)}(
+        fb, tree, groups, max_order, plan, input, spectrum, dims, pw, workspaces)
+end
+
+ScatteringTransform(fb, tree, groups, max_order, plan, input::AbstractArray{Complex{T},D},
+                    spectrum, dims::NTuple{D,Int}, pw) where {T,D} =
+    ScatteringTransform(fb, tree, groups, max_order, plan, input, spectrum, dims, pw,
+                         Workspaces(ScatteringTransform{D}))
+
+ScatteringTransform{D}(fb, tree, groups, max_order, plan, input, spectrum,
+                       dims::NTuple{D,Int}, pw) where {D} =
+    ScatteringTransform(fb, tree, groups, max_order, plan, input, spectrum, dims, pw)
+
+ScatteringTransform(::Type{T}, dims::NTuple{D,Int}, J::Int; kwargs...) where {T,D} =
+    ScatteringTransform{D}(T, dims, J; kwargs...)
+ScatteringTransform(::Type{T}, N::Int, J::Int; kwargs...) where {T} =
+    ScatteringTransform{1}(T, N, J; kwargs...)
+ScatteringTransform(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
+    ScatteringTransform(Float64, dims, J; kwargs...)
+ScatteringTransform(N::Int, J::Int; kwargs...) = ScatteringTransform(Float64, N, J; kwargs...)
+ScatteringTransform{D}(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
+    ScatteringTransform{D}(Float64, dims, J; kwargs...)
+ScatteringTransform{1}(N::Int, J::Int; kwargs...) = ScatteringTransform{1}(Float64, N, J; kwargs...)
+ScatteringTransform{1}(::Type{T}, dims::NTuple{1,Int}, J::Int; kwargs...) where {T} =
+    ScatteringTransform{1}(T, first(dims), J; kwargs...)
+
+Base.show(io::IO, st::ScatteringTransform{D,T}) where {D,T} =
+    print(io, "ScatteringTransform{", D, ", ", T, "}(dims=", st.dims, ", J=", st.filter_bank.J,
+          ", max_order=", st.max_order, ", oversampling=", st.pw.oversampling, ", ", st.plan, ")")
+
+"""
     scattering(st, x) -> coefficient container
 
 The coefficients of `st(x)`, computed without mutation so the forward map can be differentiated
@@ -27,6 +88,68 @@ but owns fresh buffers and a task-local spectral plan, so the two can run concur
 defined per transform type.
 """
 function task_workspace end
+
+abstract type AbstractBatchWorkspace end
+abstract type AbstractWorker end
+function close_batch_workspace! end
+
+struct Workspaces{T,B,R,L}
+    tasks::T
+    batches::B
+    workers::R
+    lock::L
+end
+
+Workspaces(::Type{S}) where {S} =
+    Workspaces(S[], AbstractBatchWorkspace[], AbstractWorker[], ReentrantLock())
+
+Base.show(io::IO, pool::Workspaces) =
+    print(io, "Workspaces(tasks=", length(pool.tasks), ", batches=", length(pool.batches),
+          ", workers=", length(pool.workers), ")")
+
+function with_task_workspaces(f::F, st, n::Int) where {F}
+    pool = st.workspaces
+    return lock(pool.lock) do
+        while length(pool.tasks) < n
+            push!(pool.tasks, task_workspace(st))
+        end
+        f(pool.tasks)
+    end
+end
+
+struct CachedBatch{W,E} <: AbstractBatchWorkspace
+    workspace::W
+    execution::E
+    B::Int
+    fft_nthreads::Int
+    slot::Symbol
+end
+
+Base.show(io::IO, entry::CachedBatch) =
+    print(io, "CachedBatch(B=", entry.B, ", fft_nthreads=", entry.fft_nthreads, ")")
+
+function with_batch_workspaces(f::F, build::G, st, B::Int, execution, n::Int,
+                               fft_nthreads::Int = 1, slot::Symbol = :full) where {F,G}
+    pool = st.workspaces
+    return lock(pool.lock) do
+        for i in reverse(eachindex(pool.batches))
+            w = pool.batches[i]
+            if w isa CachedBatch && w.execution == execution && w.slot == slot &&
+               (w.B != B || w.fft_nthreads != fft_nthreads)
+                close_batch_workspace!(w.workspace)
+                deleteat!(pool.batches, i)
+            end
+        end
+        matches = CachedBatch[w for w in pool.batches if w isa CachedBatch && w.B == B &&
+                   w.execution == execution && w.fft_nthreads == fft_nthreads && w.slot == slot]
+        while length(matches) < n
+            w = CachedBatch(build(), execution, B, fft_nthreads, slot)
+            push!(pool.batches, w)
+            push!(matches, w)
+        end
+        f(matches)
+    end
+end
 
 """
     wavelet_convolve(signal_fft, filter_fft, plan) -> AbstractArray

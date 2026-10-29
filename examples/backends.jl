@@ -22,8 +22,8 @@ N, J = 2048, 7
 x = randn(N)
 
 # ── spectral backend: in-core direct sum (default-available) vs FFTW fast path ─
-st_direct = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, transform=SB.DirectSumSpectralBackend())
-st_fftw   = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2, transform=SB.FFTSpectralBackend())
+st_direct = ST.ScatteringCore.ScatteringTransform(N, J; Q=1, max_order=2, transform=SB.DirectSumSpectralBackend())
+st_fftw   = ST.ScatteringCore.ScatteringTransform(N, J; Q=1, max_order=2, transform=SB.FFTSpectralBackend())
 cd, cf = st_direct(x), st_fftw(x)
 println("\nspectral backends agree: ",
         ST.Coefficients.first_order(cd) ≈ ST.Coefficients.first_order(cf) && ST.Coefficients.second_order(cd) ≈ ST.Coefficients.second_order(cf))
@@ -34,7 +34,7 @@ println("direct sum: ", round(td * 1e3, digits=2), " ms   FFTW: ", round(tf * 1e
         " ms   (", round(td / tf, digits=1), "× faster)")
 
 # ── compute backends over a batch ─────────────────────────────────────────────
-st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)   # AutoSpectralBackend → FFTW (loaded)
+st = ST.ScatteringCore.ScatteringTransform(N, J; Q=1, max_order=2)   # AutoSpectralBackend → FFTW (loaded)
 X = randn(N, 64)
 serial   = ST.scattering_batch(st, X)
 threaded = ST.scattering_batch(st, X; execution = CB.ThreadedBackend())   # OhMyThreads, $(Threads.nthreads()) threads
@@ -57,7 +57,7 @@ gpu_backend, xdev = try
 catch
     (CB.GPUBackend(KA.CPU()), Float32.(x))
 end
-st_gpu = ST.Scattering1D.ScatteringTransform1D(Float32, N, J, gpu_backend;)
+st_gpu = ST.ScatteringCore.ScatteringTransform(Float32, N, J, gpu_backend;)
 cg = st_gpu(xdev)
 println("GPU (", typeof(gpu_backend.backend), ") transform ran; S1 length = ",
         length(ST.Coefficients.first_order(cg)))

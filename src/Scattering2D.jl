@@ -10,48 +10,18 @@ using ..PathGraph: PathGraph
 using ..ScatteringFields: ScatteringFields
 using ..Cascade: Cascade
 
-export ScatteringTransform2D, scattering_transform2d!, cascade!
+export scattering_transform2d!, cascade!
 export compute_shape_sparsity
 
 """
-    ScatteringTransform2D{T,M,P,Tree,FB,G,PW}
-
-2D planar scattering transform with oriented wavelets and pre-allocated workspace.
-
-# Fields
-- `filter_bank`: 2D filter bank, stored or computed
-- `tree`: admissible scattering paths
-- `groups`: `(j1, children, path ids)` from `tree`, longest-first, the order the cascade walks
-- `max_order::Int`: maximum scattering order (1 or 2)
-- `plan`: the full-grid spectral plan, also level 1 of `pw`
-- `buffer_input`: complex matrix for real→complex promotion
-- `buffer_signal_fft`: the input spectrum, read-only for the whole cascade
-- `dims`: the field's spatial size
-- `pw`: the periodized cascade's workspace (see `Cascade`)
-"""
-struct ScatteringTransform2D{T, M<:AbstractMatrix{Complex{T}},
-                             P<:Plans.AbstractScatteringPlan, Tree<:PathGraph.ScatteringTree,
-                             FB, G<:AbstractVector, PW}
-    filter_bank::FB
-    tree::Tree
-    groups::G
-    max_order::Int
-    plan::P
-    buffer_input::M
-    buffer_signal_fft::M
-    dims::NTuple{2,Int}
-    pw::PW
-end
-
-"""
-    ScatteringTransform2D([T=Float64,] N, J; L=8, max_order=2, filters=StoredFilters(),
+    ScatteringCore.ScatteringTransform{2}([T=Float64,] N, J; L=8, max_order=2, filters=StoredFilters(),
                           oversampling=J, transform=AutoSpectralBackend())
 
 Build a 2D planar scattering transform for `N = (Ny, Nx)` images over `J` scales and `L`
 orientations. The element type is positional, as for `zeros(T, …)`; omit it for `Float64`.
-`filters`, `oversampling` and `transform` are as for `Scattering1D.ScatteringTransform1D`.
+`filters`, `oversampling` and `transform` are as for `ScatteringCore.ScatteringTransform{1}`.
 """
-function ScatteringTransform2D(::Type{T}, N::NTuple{2,Int}, J::Int;
+function ScatteringCore.ScatteringTransform{2}(::Type{T}, N::NTuple{2,Int}, J::Int;
                                L::Int=8,
                                max_order::Int=2,
                                filters::FilterBanks.AbstractFilterStorage=FilterBanks.StoredFilters(),
@@ -64,32 +34,15 @@ function ScatteringTransform2D(::Type{T}, N::NTuple{2,Int}, J::Int;
              [(j, Int[], Int[]) for j in 1:nw]
     plan = Plans.make_plan(transform, T, N)
     pw = Cascade.build(filter_bank, groups, N, T, oversampling, plan)
-    return ScatteringTransform2D(filter_bank, tree, groups, max_order, plan,
+    return ScatteringCore.ScatteringTransform{2}(filter_bank, tree, groups, max_order, plan,
                                  zeros(Complex{T}, N), zeros(Complex{T}, N), N, pw)
 end
-ScatteringTransform2D(N::NTuple{2,Int}, J::Int; kwargs...) =
-    ScatteringTransform2D(Float64, N, J; kwargs...)
-
-Base.show(io::IO, st::ScatteringTransform2D{T}) where {T} =
-    print(io, "ScatteringTransform2D{", T, "}(N=", st.dims, ", J=", st.filter_bank.J, ", L=",
-          st.filter_bank.L, ", max_order=", st.max_order, ", oversampling=", st.pw.oversampling, ", ",
-          st.plan, ")")
-
-# Shares filter bank / tree / groups; copies only the buffers and the plans' scratch. The workspace's
-# level-1 plan is the transform's own.
-function ScatteringCore.task_workspace(st::ScatteringTransform2D)
-    fb = FilterBanks.task_bank(st.filter_bank)
-    pw = Cascade.task_copy(st.pw, fb)
-    return ScatteringTransform2D(fb, st.tree, st.groups, st.max_order, first(pw.plans),
-                                 similar(st.buffer_input), similar(st.buffer_signal_fft), st.dims, pw)
-end
-
 """
-    (st::ScatteringTransform2D)(image) -> ScatteringCoefficients2D
+    (st::ScatteringCore.ScatteringTransform{2})(image) -> ScatteringCoefficients2D
 
 The scattering coefficients of `image`, in a new container.
 """
-function (st::ScatteringTransform2D)(image::AbstractMatrix)
+function (st::ScatteringCore.ScatteringTransform{2})(image::AbstractMatrix)
     J = st.filter_bank.J
     L = st.filter_bank.L
     T = real(eltype(st.buffer_input))
@@ -107,7 +60,7 @@ Fill `coeffs.S1`/`coeffs.S2` and return the coefficients with `S0` set by
 extension) runs the first-order wavelet groups as parallel tasks.
 """
 function scattering_transform2d!(coeffs::Coefficients.ScatteringCoefficients2D,
-                                 st::ScatteringTransform2D, image::AbstractMatrix;
+                                 st::ScatteringCore.ScatteringTransform{2}, image::AbstractMatrix;
                                  execution::CB.AbstractExecutionBackend = CB.SerialBackend())
     st.buffer_input .= complex.(image)
     Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
@@ -116,7 +69,7 @@ function scattering_transform2d!(coeffs::Coefficients.ScatteringCoefficients2D,
 end
 
 cascade!(S1::AbstractVector, S2::AbstractMatrix, ::CB.AbstractSerialBackend,
-         st::ScatteringTransform2D, image_fft::AbstractMatrix) = cascade!(S1, S2, st, image_fft)
+         st::ScatteringCore.ScatteringTransform{2}, image_fft::AbstractMatrix) = cascade!(S1, S2, st, image_fft)
 
 """
     cascade!(S1, S2, st, image_fft) -> (S1, S2)
@@ -124,7 +77,7 @@ cascade!(S1::AbstractVector, S2::AbstractMatrix, ::CB.AbstractSerialBackend,
 Both scattering orders in one grouped pass, as in the 1D `cascade!`. An order-2 path pairs any two
 orientations at strictly increasing scale.
 """
-cascade!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringTransform2D,
+cascade!(S1::AbstractVector, S2::AbstractMatrix, st::ScatteringCore.ScatteringTransform{2},
          image_fft::AbstractMatrix) =
     Cascade.cascade!(S1, S2, st.pw, st.filter_bank, st.groups, image_fft)
 
@@ -194,7 +147,7 @@ function _default_subsample(Ny::Int, Nx::Int, J::Int)
     return ds
 end
 
-function ScatteringFields.scattering_field(st::ScatteringTransform2D, image::AbstractMatrix;
+function ScatteringFields.scattering_field(st::ScatteringCore.ScatteringTransform{2}, image::AbstractMatrix;
         subsample::Int = _default_subsample(st.dims[1], st.dims[2],
                                             st.filter_bank.J))
     Ny, Nx = st.dims
@@ -211,7 +164,7 @@ function ScatteringFields.scattering_field(st::ScatteringTransform2D, image::Abs
 end
 
 function ScatteringFields.scattering_field!(field::ScatteringFields.ScatteringField2D,
-        st::ScatteringTransform2D, image::AbstractMatrix)
+        st::ScatteringCore.ScatteringTransform{2}, image::AbstractMatrix)
     st.buffer_input .= complex.(image)
     Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
     Cascade.field_cascade!(field.data, field.ws, st.filter_bank, st.groups, st.buffer_signal_fft,
@@ -224,7 +177,7 @@ end
 # Non-mutating forward for autodiff; see `ScatteringCore.scattering`.
 # ============================================================================
 
-function ScatteringCore.scattering(st::ScatteringTransform2D, image::AbstractMatrix)
+function ScatteringCore.scattering(st::ScatteringCore.ScatteringTransform{2}, image::AbstractMatrix)
     S0, S1, S2 = Cascade.scattering_values(st, image)
     fb = st.filter_bank
     return Coefficients.ScatteringCoefficients2D(S1, S2; S0=S0,

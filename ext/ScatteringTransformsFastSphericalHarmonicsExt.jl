@@ -104,6 +104,9 @@ ST.SphericalCore.sphere_coeffs_buffer(plan::SHTSphericalPlan) =
 ST.SphericalCore.sphere_plan_at(::SHTSphericalPlan, lmax::Integer) = SHTSphericalPlan(Int(lmax))
 ST.SphericalCore.sphere_lmax(p::SHTSphericalPlan) = p.lmax
 
+ST.SphericalCore.band_plans(p::SHTSphericalPlan, lmax::Integer, ls::AbstractVector{<:Integer}) =
+    map(l -> l >= lmax ? p : SHTSphericalPlan(Int(l)), ls)
+
 # A coefficient's position encodes `(l, m)` the same way at every grid size (column `m`, row
 # `l - |m|`), so the coefficients a narrower grid represents are its leading sub-block, degrees above
 # `nθ-1` at high `|m|` included.
@@ -142,6 +145,31 @@ function ST.SphericalCore.sphere_mean(plan::SHTSphericalPlan{T}, field::Abstract
         acc += plan.θweights[j] * field[j, k]
     end
     return acc * plan.invnφ / 2
+end
+
+function ST.spherical_monogenic_components(
+        st::ST.SphericalCore.SphericalMonogenicScatteringTransform{<:Any,<:SHTSphericalPlan},
+        field::AbstractMatrix, j::Int)
+    p = st.plan
+    C = ST.SphericalCore.sphere_coeffs(p, field)
+    σhi, σlo = st.sigma2[j], st.sigma2[j + 1]
+    bandpass = similar(field)
+    ST.SphericalCore.sphere_apply!(bandpass, p, C, ST.SphericalCore.band_multiplier(σhi, σlo))
+    h = ST.SphericalCore.riesz_potential_multiplier(σhi, σlo)
+    D = ST.SphericalCore.sphere_coeffs_buffer(p)
+    dφ, re, im = similar(field), similar(field), similar(field)
+    for (component, out) in ((0, dφ), (1, re), (2, im))
+        ST.SphericalCore._sph_derivative!(D, C, h, p.lmax, component)
+        ST.SphericalCore.sphere_apply!(out, p, D, Returns(one(eltype(field))))
+    end
+    θ, φ = ST.SphericalCore.structured_grid(p.lmax, eltype(field))
+    uθ = cos.(transpose(φ)) .* re .+ sin.(transpose(φ)) .* im
+    uφ = dφ ./ sin.(θ)
+    rnorm = hypot.(uθ, uφ)
+    amplitude = hypot.(bandpass, rnorm)
+    phase = atan.(rnorm, bandpass)
+    orientation = atan.(uφ, uθ)
+    return (; bandpass, riesz = (uθ, uφ), amplitude, phase, orientation)
 end
 
 # ---------------------------------------------------------------------------

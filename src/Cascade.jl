@@ -74,9 +74,6 @@ struct PeriodizedWorkspace{T, D, A <: AbstractArray{Complex{T}}, FA <: AbstractA
     # filters[l][j] is ψ_j periodized onto N ./ resolutions[l]. Level 1 holds the originals, which
     # order 1 multiplies against; coarser levels are what order 2 applies at its parent's resolution.
     filters::FV
-    # A computed bank's level-1 entries all alias its scratch, which `_filter` refills per wavelet.
-    # Coarser levels are always materialised.
-    full_computed::Bool
     # How a filter is shaped for this workspace's buffers (the batched build adds a stack axis), so
     # `task_copy` can rebuild level 1 against a task's own bank.
     shapefilter::SF
@@ -84,13 +81,13 @@ struct PeriodizedWorkspace{T, D, A <: AbstractArray{Complex{T}}, FA <: AbstractA
 end
 
 function PeriodizedWorkspace(dims::NTuple{D, Int}, α::Integer, resolutions, level, plans, work,
-                             out, spec, filters, full_computed::Bool, shapefilter,
+                             out, spec, filters, shapefilter,
                              means = nothing) where {D}
     A = eltype(work)
     return PeriodizedWorkspace{real(eltype(A)), D, A, eltype(eltype(filters)), typeof(resolutions),
                                typeof(level), typeof(plans), typeof(work), typeof(filters),
                                typeof(shapefilter), typeof(means)}(
-        dims, Int(α), resolutions, level, plans, work, out, spec, filters, full_computed,
+        dims, Int(α), resolutions, level, plans, work, out, spec, filters,
         shapefilter, means)
 end
 
@@ -179,7 +176,7 @@ function build(fb, groups, dims::NTuple{D, Int}, ::Type{T}, α::Int;
         DeviceMeans(device_zeros(T, full), device_zeros(T, (nw,)), device_zeros(T, (nw, nw)),
                     T[one(T) / prod(rdims(level[j])) for j in 1:nw])
     return PeriodizedWorkspace(dims, α, resolutions, level, plans, work, out, spec, filters,
-                               FilterBanks.iscomputed(fb), shapefilter, means)
+                               shapefilter, means)
 end
 
 """
@@ -359,12 +356,12 @@ function task_copy(ws::PeriodizedWorkspace, fb)
     out = map(l -> ws.out[l] === ws.work[l] ? work[l] : similar(ws.out[l]), eachindex(ws.out))
     spec = map(similar, ws.spec)
     filters = ws.filters
-    if ws.full_computed
+    if FilterBanks.iscomputed(fb)
         filters = copy(ws.filters)     # outer vector only — the coarser levels stay shared
         filters[1] = [ws.shapefilter(FilterBanks.filter_at(fb, j)) for j in eachindex(ws.filters[1])]
     end
     return PeriodizedWorkspace(ws.dims, ws.oversampling, ws.resolutions, ws.level, plans, work,
-                               out, spec, filters, ws.full_computed, ws.shapefilter,
+                               out, spec, filters, ws.shapefilter,
                                _copy_means(ws.means))
 end
 
@@ -381,14 +378,14 @@ retargeting a cascade's transforms. `f` must preserve [`Plans.inplace_inverse`](
 """
 with_plans(f, ws::PeriodizedWorkspace) =
     PeriodizedWorkspace(ws.dims, ws.oversampling, ws.resolutions, ws.level, map(f, ws.plans),
-                        ws.work, ws.out, ws.spec, ws.filters, ws.full_computed, ws.shapefilter,
+                        ws.work, ws.out, ws.spec, ws.filters, ws.shapefilter,
                         ws.means)
 
 # A computed bank evaluates its filters on demand into one shared array; `fr[j]` aliases that array
 # for every `j`, so refilling it is all that is needed and the entry keeps whatever shape `build`
 # gave it. A stored bank hands its own array back and needs no refill.
 @inline function _filter(ws::PeriodizedWorkspace, fb, level::Int, fr::AbstractVector, j::Integer)
-    (ws.full_computed && level == 1) && FilterBanks.filter_at(fb, j)
+    (FilterBanks.iscomputed(fb) && level == 1) && FilterBanks.filter_at(fb, j)
     return @inbounds fr[j]
 end
 

@@ -18,7 +18,7 @@ Test.@testset "Allocation discipline" begin
     FB  = SpectralBackends.FFTSpectralBackend()
 
     N, J = 512, 6
-    st1 = S1D.ScatteringTransform1D(N, J; Q=1, max_order=2, transform=FB)
+    st1 = ScatteringTransforms.ScatteringCore.ScatteringTransform(N, J; Q=1, max_order=2, transform=FB)
     nw1 = length(st1.filter_bank.wavelets)
     x1  = randn(N)
 
@@ -38,7 +38,7 @@ Test.@testset "Allocation discipline" begin
     Test.@testset "localized scattering_field! is zero-allocation" begin
         f1 = SF.scattering_field(st1, x1)
         Test.@test _alloc(SF.scattering_field!, f1, st1, x1) == 0
-        st2 = S2D.ScatteringTransform2D((32, 32), 3; L=4, max_order=2, transform=FB)
+        st2 = ScatteringTransforms.ScatteringCore.ScatteringTransform((32, 32), 3; L=4, max_order=2, transform=FB)
         x2 = randn(32, 32)
         f2 = SF.scattering_field(st2, x2)
         Test.@test _alloc(SF.scattering_field!, f2, st2, x2) == 0
@@ -51,7 +51,7 @@ Test.@testset "Allocation discipline" begin
         Test.@test a16 == a64            # one-time workspace only, nothing per column
         Test.@test a16 < 4096
 
-        st2 = S2D.ScatteringTransform2D((24, 24), 3; L=4, max_order=2, transform=FB)
+        st2 = ScatteringTransforms.ScatteringCore.ScatteringTransform((24, 24), 3; L=4, max_order=2, transform=FB)
         flen2 =C.flatten_length(C.ScatteringCoefficients2D(st2.filter_bank.J, st2.filter_bank.L, Float64; compute_S2=true))
         b8  = _alloc(ScatteringTransforms.scattering_batch!, Matrix{Float64}(undef, flen2, 8),  st2, randn(24, 24, 8))
         b32 = _alloc(ScatteringTransforms.scattering_batch!, Matrix{Float64}(undef, flen2, 32), st2, randn(24, 24, 32))
@@ -61,7 +61,7 @@ Test.@testset "Allocation discipline" begin
     Test.@testset "the batched-plan cascade is exactly zero-allocation" begin
         # The whole-stack cascade, called directly; `scattering_batch!` reaches it through a keyword
         # argument.
-        st2 = S2D.ScatteringTransform2D((24, 24), 3; L=4, max_order=2, transform=FB)
+        st2 = ScatteringTransforms.ScatteringCore.ScatteringTransform((24, 24), 3; L=4, max_order=2, transform=FB)
         X = randn(24, 24, 8)
         ws = ScatteringTransforms.batch_workspace(st2, 8)
         out = ScatteringTransforms.scattering_batch(st2, X)
@@ -72,7 +72,7 @@ Test.@testset "Allocation discipline" begin
         gpu = ComputationalBackends.GPUBackend(KA.CPU())
         kaext = Base.get_extension(ScatteringTransforms, :ScatteringTransformsKernelAbstractionsExt)
         Ny, Nx, B = 24, 24, 8
-        gst = S2D.ScatteringTransform2D(Float32, (Ny, Nx), 3, gpu; L=4, max_order=2)
+        gst = ScatteringTransforms.ScatteringCore.ScatteringTransform(Float32, (Ny, Nx), 3, gpu; L=4, max_order=2)
         ws = kaext.gpu_batch_workspace(gpu, gst, B)
         X = randn(Float32, Ny, Nx, B)
         flen = size(ScatteringTransforms.scattering_batch(gst, X; execution = gpu), 1)
@@ -85,13 +85,13 @@ Test.@testset "Allocation discipline" begin
     Test.@testset "batched scattered-planar cascade allocates nothing per field" begin
         # The analysis transforms the `(M, B)` stack in one execution, and each field's cascade runs on
         # the mode grid. FINUFFT runs its FFT through the libfftw3 that FFTW.jl gives a Julia-task
-        # thread callback; at `nufft_nthreads = 1` the library allocates nothing.
+        # thread callback; at `nthreads = 1` the library allocates nothing.
         SP = ScatteringTransforms.ScatteredPlanar
         M, ms = 500, (16, 16)
         px, py = rand(M), rand(M)
         function batched_alloc(B)
             stb = SP.build(Float64, px, py, ms, 3; period = 1.0, L = 4, max_order = 2,
-                           transform = FTB.FINUFFTBackend(), ntrans = B, nufft_nthreads = 1)
+                           transform = FTB.FINUFFTBackend(), ntrans = B, nthreads = 1)
             # Precondition: the plan is `B` wide.
             Test.@test ScatteringTransforms.Plans.batch_width(stb.plan) == B
             nwp = length(stb.filter_bank.wavelets)
@@ -107,7 +107,7 @@ Test.@testset "Allocation discipline" begin
     end
 
     Test.@testset "the scattered least-squares solve allocates nothing per call" begin
-        # `solve = true` runs an iterative solve per analysis, once per field and wavelet path; its
+        # Least-squares analysis runs an iterative solve per field; its
         # workspace lives on the plan. NonuniformFFTs is excluded: its `exec_type1!`/`exec_type2!`
         # open a `Threads.@threads` region on every execution, even at one thread.
         Msc, mssc = 500, (16, 16)
@@ -117,16 +117,16 @@ Test.@testset "Allocation discipline" begin
         Xs = zeros(ComplexF64, mssc)
         for spec in (SpectralBackends.DirectSumSpectralBackend(), FTB.FINUFFTBackend())
             plan = P.make_scattered_plan(spec, pxs, pys, mssc, Float64; period = (2π, 2π),
-                                         solve = true, maxiter = 20, nufft_nthreads = 1)
+                                         analysis = P.LeastSquares(), maxiter = 20, nthreads = 1)
             # Precondition: the plan solves.
-            Test.@test P.plan_analysis(plan).solve
+            Test.@test P.plan_analysis(plan).analysis isa P.LeastSquares
             Test.@test _alloc(P.forward_transform!, Xs, plan, bs) == 0
         end
         # Batched: the per-column recurrence runs host-side over `B` states, reducing into mirrors
         # preallocated on the plan.
         Bsc = 4
         pb = P.make_scattered_plan(FTB.FINUFFTBackend(), pxs, pys, mssc, Float64; period = (2π, 2π),
-                                   solve = true, maxiter = 20, ntrans = Bsc, nufft_nthreads = 1)
+                                   analysis = P.LeastSquares(), maxiter = 20, ntrans = Bsc, nthreads = 1)
         Test.@test P.batch_width(pb) == Bsc
         Test.@test _alloc(P.forward_transform!, zeros(ComplexF64, mssc..., Bsc), pb,
                           randn(Msc, Bsc)) == 0
@@ -149,7 +149,7 @@ Test.@testset "Allocation discipline" begin
         # The in-core plan solves through its own operator scratch and workspace, single-field and
         # batched, and synthesizes into the caller's array.
         for B in (1, 3)
-            dp = SC.make_spherical_plan(SpectralBackends.DirectSumSpectralBackend(), θ, φ, lmax,
+            dp = SC.make_spherical_plan(SC.SphericalScatteringTransform, SpectralBackends.DirectSumSpectralBackend(), θ, φ, lmax,
                                         Float64; ntrans = B)
             F = B == 1 ? randn(Ms) : randn(Ms, B)
             Cd = SC.sphere_coeffs_buffer(dp)
@@ -163,8 +163,8 @@ Test.@testset "Allocation discipline" begin
     Test.@testset "st(x) allocates only its coefficient container (size-independent)" begin
         # The non-mutating callable allocates coefficient storage, whose size depends on the number of
         # wavelets only.
-        st_small = S1D.ScatteringTransform1D(256,  J; Q=1, max_order=2, transform=FB)
-        st_big   = S1D.ScatteringTransform1D(4096, J; Q=1, max_order=2, transform=FB)
+        st_small = ScatteringTransforms.ScatteringCore.ScatteringTransform(256,  J; Q=1, max_order=2, transform=FB)
+        st_big   = ScatteringTransforms.ScatteringCore.ScatteringTransform(4096, J; Q=1, max_order=2, transform=FB)
         Test.@test _alloc(st_small, randn(256)) == _alloc(st_big, randn(4096))
     end
 end

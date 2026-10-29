@@ -3,11 +3,6 @@ module ScatteringTransformsDifferentiationInterfaceExt
 using DifferentiationInterface: DifferentiationInterface as DI
 using ScatteringTransforms: ScatteringTransforms
 
-# The gridded transforms expose the same non-mutating `scattering` + `dims` shape.
-const _Gridded = Union{ScatteringTransforms.Scattering1D.ScatteringTransform1D,
-                       ScatteringTransforms.Scattering2D.ScatteringTransform2D,
-                       ScatteringTransforms.Scattering3D.ScatteringTransform3D}
-
 # A target given as a field array -> its coefficients; otherwise it already is a coeff container.
 _target_coeffs(st, target::AbstractArray) = ScatteringTransforms.ScatteringCore.scattering(st, target)
 _target_coeffs(::Any, target) = target
@@ -20,7 +15,7 @@ _field_shape(st) = st.dims
 # `EnzymeMutabilityException`.
 _objective(z, st, tc, loss) = loss(ScatteringTransforms.ScatteringCore.scattering(st, z), tc)
 
-function ScatteringTransforms.synthesize(st::_Gridded, target;
+function ScatteringTransforms.synthesize(st::ScatteringTransforms.ScatteringCore.ScatteringTransform, target;
                                          backend,
                                          init = nothing,
                                          iters::Int = 500,

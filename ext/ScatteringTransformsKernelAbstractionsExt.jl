@@ -3,8 +3,8 @@ module ScatteringTransformsKernelAbstractionsExt
 # Device execution on `CB.GPUBackend{B}` for any `KernelAbstractions.Backend` `B`. The cascade is
 # array-type generic (broadcasts and plan executions), so this extension supplies only device
 # allocation and `AbstractFFTs` plans, which dispatch on the array type. It adds device-resident
-# constructors `ScatteringTransform{1,2,3}D([T,] N, J, gpu::GPUBackend; …)` and
-# `MonogenicScattering([T,] dims, J, gpu::GPUBackend; …)`, and the batched
+# constructors `ScatteringTransform{D}([T,] dims, J, gpu::GPUBackend; …)` and
+# `MonogenicScatteringTransform([T,] dims, J, gpu::GPUBackend; …)`, and the batched
 # `scattering_batch(st, X; execution = gpu)` / `scattering_batch!(out, st, X; execution = gpu)`.
 
 using KernelAbstractions: KernelAbstractions as KA
@@ -12,6 +12,8 @@ using AbstractFFTs: AbstractFFTs
 using LinearAlgebra: LinearAlgebra
 using ComputationalBackends: ComputationalBackends as CB
 using ScatteringTransforms: ScatteringTransforms as ST
+
+ST.Execution.available(::CB.AbstractGPUBackend) = true
 
 # ---------------------------------------------------------------------------
 # Vendor-neutral spectral plan (cuFFT / rocFFT / FFTW via AbstractFFTs dispatch)
@@ -59,8 +61,8 @@ ST.Plans.inplace_inverse(::AbstractFFTsScatteringPlan) = true
 # The prototype array carries the device.
 ST.Plans.plan_like(::AbstractFFTsScatteringPlan, prototype::AbstractArray) =
     ST.Plans.abstractffts_plan(prototype; region = 1:ndims(prototype))
-ST.Plans.plan_like(::AbstractFFTsScatteringPlan, prototype::AbstractArray, D::Int;
-                   fft_nthreads::Int = 1) =
+ST.Plans.plan_like(::AbstractFFTsScatteringPlan, prototype::AbstractArray, ::Val{D};
+                   fft_nthreads::Int = 1) where {D} =
     ST.Plans.abstractffts_plan(prototype; region = 1:D, fft_nthreads = fft_nthreads)
 ST.Plans.forward_transform(p::AbstractFFTsScatteringPlan, x::AbstractArray) = p.fwd * x
 ST.Plans.inverse_transform(p::AbstractFFTsScatteringPlan, x::AbstractArray) = p.inv * x
@@ -83,6 +85,40 @@ function _dzeros(backend, ::Type{T}, dims) where {T}
     return a
 end
 
+_device_bank(b, fb::ST.FilterBanks.FilterBank1D) =
+    ST.FilterBanks.FilterBank1D(map(f -> _to_device(b, f), fb.wavelets), _to_device(b, fb.averaging),
+                                 fb.meta, fb.J, fb.Q)
+_device_bank(b, fb::ST.FilterBanks.FilterBank2D) =
+    ST.FilterBanks.FilterBank2D(map(f -> _to_device(b, f), fb.wavelets), _to_device(b, fb.averaging),
+                                 fb.meta, fb.J, fb.L)
+_device_bank(b, fb::ST.FilterBanks.FilterBank3D) =
+    ST.FilterBanks.FilterBank3D(map(f -> _to_device(b, f), fb.wavelets), _to_device(b, fb.averaging),
+                                 fb.meta, fb.J, fb.n_orient)
+_device_bank(b, fb::ST.FilterBanks.ComputedFilterBank1D) =
+    ST.FilterBanks.ComputedFilterBank1D(fb.morlets, fb.rescale, _to_device(b, fb.averaging),
+                                         KA.allocate(b, eltype(fb.scratch), size(fb.scratch)), fb.meta, fb.J, fb.Q)
+_device_bank(b, fb::ST.FilterBanks.ComputedFilterBank2D) =
+    ST.FilterBanks.ComputedFilterBank2D(fb.morlets, fb.rescale, _to_device(b, fb.averaging),
+                                         KA.allocate(b, eltype(fb.scratch), size(fb.scratch)), fb.meta, fb.J, fb.L)
+_device_bank(b, fb::ST.FilterBanks.ComputedFilterBank3D) =
+    ST.FilterBanks.ComputedFilterBank3D(fb.morlets, fb.rescale, _to_device(b, fb.averaging),
+                                         KA.allocate(b, eltype(fb.scratch), size(fb.scratch)), fb.meta, fb.J, fb.n_orient)
+
+function _device_bank(b, fb::ST.Monogenic.MonogenicFilterBank{D,T}) where {D,T}
+    wavelets = map(f -> _to_device(b, f), fb.wavelets)
+    riesz = map(f -> _to_device(b, f), fb.riesz)
+    averaging = _to_device(b, fb.averaging)
+    return ST.Monogenic.MonogenicFilterBank{D,T,typeof(averaging),typeof(wavelets),typeof(riesz),typeof(fb.meta)}(
+        wavelets, riesz, averaging, fb.meta, fb.J, fb.Q)
+end
+
+function _device_bank(b, fb::ST.Monogenic.ComputedMonogenicFilterBank{D,T}) where {D,T}
+    riesz = map(f -> _to_device(b, f), fb.riesz)
+    averaging = _to_device(b, fb.averaging)
+    return ST.Monogenic.ComputedMonogenicFilterBank{D,T,typeof(averaging),typeof(riesz),typeof(fb.meta),typeof(fb.profiles)}(
+        fb.profiles, fb.rescale, riesz, averaging, KA.allocate(b, T, size(fb.scratch)), fb.meta, fb.J, fb.Q)
+end
+
 # ---------------------------------------------------------------------------
 # Device-resident transform constructors
 # ---------------------------------------------------------------------------
@@ -97,18 +133,16 @@ _device_pw(b, fb, groups, dims, ::Type{T}, α::Int, D::Int, plan) where {T} =
                                                                  region = 1:D),
                      level1 = plan, device_zeros = (S, d) -> _dzeros(b, S, d))
 
-function ST.Scattering1D.ScatteringTransform1D(::Type{T}, N::Int, J::Int, gpu::CB.GPUBackend;
-                                               Q::Int = 1, max_order::Int = 2, oversampling::Int = J) where {T}
+function ST.ScatteringCore.ScatteringTransform{1}(::Type{T}, N::Int, J::Int, gpu::CB.GPUBackend;
+                                               Q::Int = 1, max_order::Int = 2, oversampling::Int = J,
+                                               filters::ST.FilterBanks.AbstractFilterStorage = ST.FilterBanks.StoredFilters()) where {T}
     b = gpu.backend
-    cpu_fb = ST.FilterBanks.build_filter_bank1d(T, N, J; Q = Q)
-    wavelets = [_to_device(b, ψ) for ψ in cpu_fb.wavelets]
-    averaging = _to_device(b, cpu_fb.averaging)
-    filter_bank = ST.FilterBanks.FilterBank1D(wavelets, averaging, cpu_fb.meta, cpu_fb.J, cpu_fb.Q)
+    filter_bank = _device_bank(b, ST.FilterBanks.build_filter_bank1d(T, N, J, filters; Q))
     tree = ST.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
-    groups = _groups(tree, length(wavelets), max_order)
+    groups = _groups(tree, ST.FilterBanks.nwavelets(filter_bank), max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, (N,)))
     pw = _device_pw(b, filter_bank, groups, (N,), T, oversampling, 1, plan)
-    return ST.Scattering1D.ScatteringTransform1D(filter_bank, tree, groups, max_order, plan,
+    return ST.ScatteringCore.ScatteringTransform{1}(filter_bank, tree, groups, max_order, plan,
         _dzeros(b, Complex{T}, (N,)), _dzeros(b, Complex{T}, (N,)), (N,), pw)
 end
 # Scattered planar: everything downstream of the points follows their array type, so this moves the
@@ -124,65 +158,67 @@ ST.ScatteredPlanar.build(x::AbstractVector, y::AbstractVector, ms::NTuple{2,Int}
                          gpu::CB.GPUBackend; kwargs...) =
     ST.ScatteredPlanar.build(Float32, x, y, ms, J, gpu; kwargs...)
 
-ST.Scattering1D.ScatteringTransform1D(N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) =
-    ST.Scattering1D.ScatteringTransform1D(Float32, N, J, gpu; kwargs...)
+ST.ScatteringCore.ScatteringTransform{1}(N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) =
+    ST.ScatteringCore.ScatteringTransform{1}(Float32, N, J, gpu; kwargs...)
 
-function ST.Scattering2D.ScatteringTransform2D(::Type{T}, N::NTuple{2,Int}, J::Int, gpu::CB.GPUBackend;
-                                               L::Int = 8, max_order::Int = 2, oversampling::Int = J) where {T}
+function ST.ScatteringCore.ScatteringTransform{2}(::Type{T}, N::NTuple{2,Int}, J::Int, gpu::CB.GPUBackend;
+                                               L::Int = 8, max_order::Int = 2, oversampling::Int = J,
+                                               filters::ST.FilterBanks.AbstractFilterStorage = ST.FilterBanks.StoredFilters()) where {T}
     b = gpu.backend
-    cpu_fb = ST.FilterBanks.build_filter_bank2d(T, N, J; L = L)
-    wavelets = [_to_device(b, ψ) for ψ in cpu_fb.wavelets]
-    averaging = _to_device(b, cpu_fb.averaging)
-    filter_bank = ST.FilterBanks.FilterBank2D(wavelets, averaging, cpu_fb.meta, cpu_fb.J, cpu_fb.L)
+    filter_bank = _device_bank(b, ST.FilterBanks.build_filter_bank2d(T, N, J, filters; L))
     tree = ST.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
-    groups = _groups(tree, length(wavelets), max_order)
+    groups = _groups(tree, ST.FilterBanks.nwavelets(filter_bank), max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, N))
     pw = _device_pw(b, filter_bank, groups, N, T, oversampling, 2, plan)
-    return ST.Scattering2D.ScatteringTransform2D(filter_bank, tree, groups, max_order, plan,
+    return ST.ScatteringCore.ScatteringTransform{2}(filter_bank, tree, groups, max_order, plan,
         _dzeros(b, Complex{T}, N), _dzeros(b, Complex{T}, N), N, pw)
 end
-ST.Scattering2D.ScatteringTransform2D(N::NTuple{2,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) =
-    ST.Scattering2D.ScatteringTransform2D(Float32, N, J, gpu; kwargs...)
-
-function ST.Scattering3D.ScatteringTransform3D(::Type{T}, N::NTuple{3,Int}, J::Int, gpu::CB.GPUBackend;
-                                               n_orient::Int = 6, max_order::Int = 2, oversampling::Int = J) where {T}
+function ST.ScatteringCore.ScatteringTransform{3}(::Type{T}, N::NTuple{3,Int}, J::Int, gpu::CB.GPUBackend;
+                                               n_orient::Int = 6, max_order::Int = 2, oversampling::Int = J,
+                                               filters::ST.FilterBanks.AbstractFilterStorage = ST.FilterBanks.StoredFilters()) where {T}
     b = gpu.backend
-    cpu_fb = ST.FilterBanks.build_filter_bank3d(T, N, J; n_orient = n_orient)
-    wavelets = [_to_device(b, ψ) for ψ in cpu_fb.wavelets]
-    averaging = _to_device(b, cpu_fb.averaging)
-    filter_bank = ST.FilterBanks.FilterBank3D(wavelets, averaging, cpu_fb.meta, cpu_fb.J, cpu_fb.n_orient)
+    filter_bank = _device_bank(b, ST.FilterBanks.build_filter_bank3d(T, N, J, filters; n_orient))
     tree = ST.PathGraph.build_tree([m.j_eff for m in filter_bank.meta], max_order)
-    groups = _groups(tree, length(wavelets), max_order)
+    groups = _groups(tree, ST.FilterBanks.nwavelets(filter_bank), max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, N))
     pw = _device_pw(b, filter_bank, groups, N, T, oversampling, 3, plan)
-    return ST.Scattering3D.ScatteringTransform3D(filter_bank, tree, groups, max_order, plan,
+    return ST.ScatteringCore.ScatteringTransform{3}(filter_bank, tree, groups, max_order, plan,
         _dzeros(b, Complex{T}, N), _dzeros(b, Complex{T}, N), N, pw)
 end
-ST.Scattering3D.ScatteringTransform3D(N::NTuple{3,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) =
-    ST.Scattering3D.ScatteringTransform3D(Float32, N, J, gpu; kwargs...)
+ST.ScatteringCore.ScatteringTransform{D}(dims::NTuple{D,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) where {D} =
+    ST.ScatteringCore.ScatteringTransform{D}(Float32, dims, J, gpu; kwargs...)
+ST.ScatteringCore.ScatteringTransform{1}(::Type{T}, dims::NTuple{1,Int}, J::Int,
+                                        gpu::CB.GPUBackend; kwargs...) where {T} =
+    ST.ScatteringCore.ScatteringTransform{1}(T, first(dims), J, gpu; kwargs...)
+ST.ScatteringCore.ScatteringTransform(::Type{T}, dims::NTuple{D,Int}, J::Int,
+                                     gpu::CB.GPUBackend; kwargs...) where {T,D} =
+    ST.ScatteringCore.ScatteringTransform{D}(T, dims, J, gpu; kwargs...)
+ST.ScatteringCore.ScatteringTransform(::Type{T}, N::Int, J::Int,
+                                     gpu::CB.GPUBackend; kwargs...) where {T} =
+    ST.ScatteringCore.ScatteringTransform{1}(T, N, J, gpu; kwargs...)
+ST.ScatteringCore.ScatteringTransform(dims::NTuple{D,Int}, J::Int,
+                                     gpu::CB.GPUBackend; kwargs...) where {D} =
+    ST.ScatteringCore.ScatteringTransform(Float32, dims, J, gpu; kwargs...)
+ST.ScatteringCore.ScatteringTransform(N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) =
+    ST.ScatteringCore.ScatteringTransform(Float32, N, J, gpu; kwargs...)
 
-function ST.Monogenic.MonogenicScattering(::Type{T}, dims::NTuple{D,Int}, J::Int, gpu::CB.GPUBackend;
+function ST.Monogenic.MonogenicScatteringTransform(::Type{T}, dims::NTuple{D,Int}, J::Int, gpu::CB.GPUBackend;
                                           Q::Int = 1, max_order::Int = 2,
-                                          oversampling::Int = J) where {T, D}
+                                          oversampling::Int = J,
+                                          filters::ST.FilterBanks.AbstractFilterStorage = ST.FilterBanks.StoredFilters()) where {T, D}
     b = gpu.backend
-    cpu_fb = ST.Monogenic.build_monogenic_bank(T, dims, J; Q = Q)
-    wavelets = [_to_device(b, ψ) for ψ in cpu_fb.wavelets]
-    riesz = map(R -> _to_device(b, R), cpu_fb.riesz)
-    averaging = _to_device(b, cpu_fb.averaging)
-    fb = ST.Monogenic.MonogenicFilterBank{D, T, typeof(averaging), typeof(wavelets), typeof(riesz),
-                                          typeof(cpu_fb.meta)}(wavelets, riesz, averaging, cpu_fb.meta,
-                                                               cpu_fb.J, cpu_fb.Q)
+    fb = _device_bank(b, ST.Monogenic.build_monogenic_bank(T, dims, J, filters; Q))
     tree, groups = ST.Monogenic.tree_groups(fb, max_order)
     plan = ST.Plans.abstractffts_plan(_dzeros(b, Complex{T}, dims))
     pw = _device_pw(b, fb, groups, dims, T, oversampling, D, plan)
     return ST.Monogenic.assemble(fb, tree, groups, max_order, plan, pw)
 end
-ST.Monogenic.MonogenicScattering(::Type{T}, N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) where {T} =
-    ST.Monogenic.MonogenicScattering(T, (N,), J, gpu; kwargs...)
-ST.Monogenic.MonogenicScattering(dims::NTuple{D,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) where {D} =
-    ST.Monogenic.MonogenicScattering(Float32, dims, J, gpu; kwargs...)
-ST.Monogenic.MonogenicScattering(N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) =
-    ST.Monogenic.MonogenicScattering(Float32, (N,), J, gpu; kwargs...)
+ST.Monogenic.MonogenicScatteringTransform(::Type{T}, N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) where {T} =
+    ST.Monogenic.MonogenicScatteringTransform(T, (N,), J, gpu; kwargs...)
+ST.Monogenic.MonogenicScatteringTransform(dims::NTuple{D,Int}, J::Int, gpu::CB.GPUBackend; kwargs...) where {D} =
+    ST.Monogenic.MonogenicScatteringTransform(Float32, dims, J, gpu; kwargs...)
+ST.Monogenic.MonogenicScatteringTransform(N::Int, J::Int, gpu::CB.GPUBackend; kwargs...) =
+    ST.Monogenic.MonogenicScatteringTransform(Float32, (N,), J, gpu; kwargs...)
 
 # The cascade's work list. Path topology is integer bookkeeping, so it stays on the host even for a
 # device-resident transform.
@@ -205,19 +241,21 @@ function gpu_batch_workspace(gpu::CB.GPUBackend, st, B::Int)
     T = real(eltype(st.filter_bank.averaging))
     D = length(st.dims)                           # (N,) 1D, (Ny,Nx) 2D, (Nz,Ny,Nx) 3D
     # Filters carry a trailing singleton so they broadcast over the batch axis.
-    return ST.Batched.build_workspace(st, B, T; zeros_like = (S, d) -> _dzeros(b, S, d),
+    fb = _device_bank(b, st.filter_bank)
+    return ST.Batched.build_workspace(fb, st.groups, st.dims, st.pw.oversampling, B, T;
+                                      zeros_like = (S, d) -> _dzeros(b, S, d),
                                       makeplan = rd -> ST.Plans.abstractffts_plan(
                                           _dzeros(b, Complex{T}, (rd..., B)); region = 1:D),
-                                      shapefilter = f -> reshape(_to_device(b, f), (size(f)..., 1)))
+                                      shapefilter = f -> reshape(f, (size(f)..., 1)))
 end
 
-for (Mod, TT, CF, ND, dimarg) in (
-        (:Scattering1D, :ScatteringTransform1D, :_flen1d, 2, :(size(X, 2))),
-        (:Scattering2D, :ScatteringTransform2D, :_flen2d, 3, :(size(X, 3))),
-        (:Scattering3D, :ScatteringTransform3D, :_flen3d, 4, :(size(X, 4))))
+for (D, CF, ND, dimarg) in (
+        (1, :_flen1d, 2, :(size(X, 2))),
+        (2, :_flen2d, 3, :(size(X, 3))),
+        (3, :_flen3d, 4, :(size(X, 4))))
     @eval begin
         # A complex stack has complex columns, for its complex `S0`.
-        function ST._scattering_batch(gpu::CB.GPUBackend, st::ST.$Mod.$TT,
+        function ST._scattering_batch(gpu::CB.GPUBackend, st::ST.ScatteringCore.ScatteringTransform{$D},
                                       X::AbstractArray{<:Any,$ND})
             T = real(eltype(st.filter_bank.averaging))
             out = _dzeros(gpu.backend, ST._flat_eltype(T, X), ($CF(st, T), $dimarg))
@@ -225,13 +263,46 @@ for (Mod, TT, CF, ND, dimarg) in (
         end
 
         # The annotation keeps the `workspace` keyword concretely typed, so the call does not box it.
-        function ST._scattering_batch!(out::AbstractMatrix, gpu::CB.GPUBackend, st::ST.$Mod.$TT,
+        function ST._scattering_batch!(out::AbstractMatrix, gpu::CB.GPUBackend,
+                                       st::ST.ScatteringCore.ScatteringTransform{$D},
                                        X::AbstractArray{<:Any,$ND};
-                                       workspace::ST.Batched.BatchWorkspace =
-                                           gpu_batch_workspace(gpu, st, $dimarg))
-            return ST.Batched.batch_cascade!(out, workspace, X)
+                                       workspace::Union{Nothing,ST.Batched.BatchWorkspace} = nothing)
+            workspace === nothing || return ST.Batched.batch_cascade!(out, workspace, X)
+            ST.ScatteringCore.with_batch_workspaces(() -> gpu_batch_workspace(gpu, st, $dimarg),
+                                                   st, $dimarg, gpu, 1) do entries
+                ST._apply_cached_batch!(out, first(entries), X)
+            end
+            return out
         end
     end
+end
+
+_memory_buffer(st::ST.ScatteredPlanar.ScatteredPlanarScatteringTransform) = st.X_modes
+_memory_buffer(st::ST.Monogenic.MonogenicScatteringTransform) = st.buffer_signal_fft
+_memory_buffer(st::Union{ST.SphericalCore.SphericalScatteringTransform,ST.SphericalCore.SphericalMonogenicScatteringTransform}) =
+    st.ws.C
+
+function _require_backend(gpu, st)
+    KA.get_backend(_memory_buffer(st)) == gpu.backend || throw(ArgumentError(
+        "build the transform on the requested device before applying this batch"))
+    return nothing
+end
+
+const _DeviceResidentTransform = Union{ST.ScatteredPlanar.ScatteredPlanarScatteringTransform,
+    ST.SphericalCore.SphericalScatteringTransform, ST.SphericalCore.SphericalMonogenicScatteringTransform,
+    ST.Monogenic.MonogenicScatteringTransform}
+
+function ST._scattering_batch(gpu::CB.GPUBackend, st::_DeviceResidentTransform, X::AbstractArray)
+    _require_backend(gpu, st)
+    T = ST._flat_eltype(ST._coefficient_eltype(st), X)
+    out = KA.allocate(gpu.backend, T, (ST.flat_rows(st), size(X)[end]))
+    return ST._scattering_batch!(out, gpu, st, X)
+end
+
+function ST._scattering_batch!(out::AbstractMatrix, gpu::CB.GPUBackend, st::_DeviceResidentTransform,
+                               X::AbstractArray)
+    _require_backend(gpu, st)
+    return ST._scattering_batch!(out, CB.SerialBackend(), st, X)
 end
 
 _flen1d(st, ::Type{T}) where {T} = ST.Coefficients.flatten_length(

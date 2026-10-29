@@ -15,12 +15,12 @@ using ScatteringTransforms: ScatteringTransforms as ST
 
 # 1D scattering (N = signal length, J = number of octaves)
 signal = randn(1024)
-st = ST.Scattering1D.ScatteringTransform1D(1024, 8; Q=1, max_order=2)
+st = ST.ScatteringCore.ScatteringTransform(1024, 8; Q=1, max_order=2)
 coeffs = st(signal)
 
 # 2D planar scattering (N = image size, J = scales, L = orientations)
 image = randn(256, 256)
-st2d = ST.Scattering2D.ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
+st2d = ST.ScatteringCore.ScatteringTransform((256, 256), 4; L=8, max_order=2)
 coeffs2d = st2d(image)
 ```
 
@@ -79,6 +79,12 @@ using .Monogenic: Monogenic
 using .SphericalCore: SphericalCore
 using .Inverse: Inverse
 
+function ScatteringCore.task_workspace(st::ScatteringCore.ScatteringTransform)
+    fb = FilterBanks.task_bank(st.filter_bank)
+    pw = Cascade.task_copy(st.pw, fb)
+    return ScatteringCore.ScatteringTransform(fb, st.tree, st.groups, st.max_order, first(pw.plans),
+        similar(st.buffer_input), similar(st.buffer_signal_fft), st.dims, pw)
+end
 
 # ============================================================================
 # Batched transforms
@@ -102,26 +108,28 @@ function batch_workspace(st, B::Int; transform = nothing, fft_nthreads::Int = 1,
     like = st.buffer_input
     zeros_like(::Type{S}, dims) where {S} = fill!(similar(like, S, dims), zero(S))
     makeplan = transform === nothing ?
-        (rd -> Plans.plan_like(st.plan, zeros_like(Complex{T}, (rd..., B)), length(rd);
+        (rd -> Plans.plan_like(st.plan, zeros_like(Complex{T}, (rd..., B)), Plans.spatial_rank(rd);
                                fft_nthreads = fft_nthreads, kwargs...)) :
         (rd -> Plans.make_plan(transform, T, rd; batch = B, fft_nthreads = fft_nthreads, kwargs...))
-    return Batched.build_workspace(st, B, T; zeros_like = zeros_like, makeplan = makeplan,
+    fb = FilterBanks.task_bank(st.filter_bank)
+    return Batched.build_workspace(fb, st.groups, st.dims, st.pw.oversampling, B, T;
+                                   zeros_like = zeros_like, makeplan = makeplan,
                                    shapefilter = f -> reshape(f, (size(f)..., 1)))
 end
 
 """
-    scattering_batch(st::Scattering1D.ScatteringTransform1D, X; execution = SerialBackend()) -> Matrix
+    scattering_batch(st::ScatteringCore.ScatteringTransform{1}, X; execution = SerialBackend()) -> Matrix
 
 Apply a 1D scattering transform to a batch of signals `X` of size `(N, B)` (signals as columns),
 returning a `(flatten_length, B)` matrix whose column `b` is `flatten1d(st(X[:, b]))`. The plan,
 the workspace and one coefficient container are reused across the batch. `execution` is where the
 batch runs, as in [`scattering_batch!`](@ref).
 """
-scattering_batch(st::Scattering1D.ScatteringTransform1D, X::AbstractMatrix;
+scattering_batch(st::ScatteringCore.ScatteringTransform{1}, X::AbstractMatrix;
                  execution::CB.AbstractExecutionBackend = CB.SerialBackend()) =
     _scattering_batch(execution, st, X)
 
-function _scattering_batch(b::CB.AbstractSerialBackend, st::Scattering1D.ScatteringTransform1D,
+function _scattering_batch(b::CB.AbstractSerialBackend, st::ScatteringCore.ScatteringTransform{1},
                            X::AbstractMatrix)
     T = eltype(st.filter_bank.averaging) |> real
     nw = FilterBanks.nwavelets(st.filter_bank)
@@ -143,7 +151,8 @@ field in place.
 `T` is the element type of `S1`/`S2`, which are moduli; `S0T` is that of `S0`, the field mean,
 which is complex for a complex field.
 """
-batch_coeffs(st::Scattering1D.ScatteringTransform1D, ::Type{T}, ::Type{S0T} = T) where {T, S0T} =
+batch_coeffs(st::Union{ScatteringCore.ScatteringTransform{1},Monogenic.MonogenicScatteringTransform},
+             ::Type{T}, ::Type{S0T} = T) where {T, S0T} =
     (nw = FilterBanks.nwavelets(st.filter_bank);
      Coefficients.ScatteringCoefficients1D(
         Vector{T}(undef, nw),
@@ -155,9 +164,9 @@ _batch_coeffs2d(st, ::Type{T}, ::Type{S0T}, ns, no) where {T, S0T} =
         st.max_order >= 2 ? zeros(T, ns * no, ns * no) : Matrix{T}(undef, 0, 0);
         S0 = [zero(S0T)], n_scales = ns, n_orientations = no)
 
-batch_coeffs(st::Scattering2D.ScatteringTransform2D, ::Type{T}, ::Type{S0T} = T) where {T, S0T} =
+batch_coeffs(st::ScatteringCore.ScatteringTransform{2}, ::Type{T}, ::Type{S0T} = T) where {T, S0T} =
     _batch_coeffs2d(st, T, S0T, st.filter_bank.J, st.filter_bank.L)
-batch_coeffs(st::Scattering3D.ScatteringTransform3D, ::Type{T}, ::Type{S0T} = T) where {T, S0T} =
+batch_coeffs(st::ScatteringCore.ScatteringTransform{3}, ::Type{T}, ::Type{S0T} = T) where {T, S0T} =
     _batch_coeffs2d(st, T, S0T, st.filter_bank.J, st.filter_bank.n_orient)
 
 """
@@ -180,17 +189,21 @@ scattering_batch!(out::AbstractMatrix, st, X::AbstractArray;
                   execution::CB.AbstractExecutionBackend = CB.SerialBackend(), kwargs...) =
     _scattering_batch!(out, execution, st, X; kwargs...)
 
-for (Mod, TT, XT, tfun, flat, ND) in (
-        (:Scattering1D, :ScatteringTransform1D, :AbstractMatrix, :scattering_transform!, :flatten1d!, 2),
-        (:Scattering2D, :ScatteringTransform2D, :(AbstractArray{<:Any,3}), :scattering_transform2d!, :flatten2d!, 3),
-        (:Scattering3D, :ScatteringTransform3D, :(AbstractArray{<:Any,4}), :scattering_transform3d!, :flatten2d!, 4))
-    @eval function _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend, st::$Mod.$TT,
+@inline _batch_column(X::AbstractArray{T,N}, b) where {T,N} =
+    view(X, ntuple(_ -> Colon(), Val(N - 1))..., b)
+
+for (Mod, D, XT, tfun, flat, ND) in (
+        (:Scattering1D, 1, :AbstractMatrix, :scattering_transform!, :flatten1d!, 2),
+        (:Scattering2D, 2, :(AbstractArray{<:Any,3}), :scattering_transform2d!, :flatten2d!, 3),
+        (:Scattering3D, 3, :(AbstractArray{<:Any,4}), :scattering_transform3d!, :flatten2d!, 4))
+    @eval function _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
+                                      st::ScatteringCore.ScatteringTransform{$D},
                                       X::$XT; workspace = nothing)
         workspace === nothing || return Batched.batch_cascade!(out, workspace, X)
         # `out` decides: real columns get a real `S0` slot, complex columns a complex one.
         coeffs = batch_coeffs(st, real(eltype(out)), eltype(out))
         @inbounds for b in 1:size(X, $ND)
-            c = $Mod.$tfun(coeffs, st, selectdim(X, $ND, b))
+            c = $Mod.$tfun(coeffs, st, _batch_column(X, b))
             Coefficients.$flat(view(out, :, b), c)
         end
         return out
@@ -198,17 +211,17 @@ for (Mod, TT, XT, tfun, flat, ND) in (
 end
 
 """
-    scattering_batch(st::Scattering2D.ScatteringTransform2D, X; execution = SerialBackend()) -> Matrix
+    scattering_batch(st::ScatteringCore.ScatteringTransform{2}, X; execution = SerialBackend()) -> Matrix
 
 Apply a 2D scattering transform to a batch of images `X` of size `(Ny, Nx, B)`, returning a
 `(flatten_length, B)` matrix whose column `b` is `flatten2d(st(X[:, :, b]))`. Plan and workspace
 are reused across the batch. `execution` is as in [`scattering_batch!`](@ref).
 """
-scattering_batch(st::Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3};
+scattering_batch(st::ScatteringCore.ScatteringTransform{2}, X::AbstractArray{<:Any,3};
                  execution::CB.AbstractExecutionBackend = CB.SerialBackend()) =
     _scattering_batch(execution, st, X)
 
-function _scattering_batch(b::CB.AbstractSerialBackend, st::Scattering2D.ScatteringTransform2D,
+function _scattering_batch(b::CB.AbstractSerialBackend, st::ScatteringCore.ScatteringTransform{2},
                            X::AbstractArray{<:Any,3})
     T = eltype(st.filter_bank.averaging) |> real
     flen = Coefficients.flatten_length(
@@ -218,17 +231,17 @@ function _scattering_batch(b::CB.AbstractSerialBackend, st::Scattering2D.Scatter
 end
 
 """
-    scattering_batch(st::Scattering3D.ScatteringTransform3D, X; execution = SerialBackend()) -> Matrix
+    scattering_batch(st::ScatteringCore.ScatteringTransform{3}, X; execution = SerialBackend()) -> Matrix
 
 Apply a 3D scattering transform to a batch of volumes `X` of size `(Nz, Ny, Nx, B)`, returning a
 `(flatten_length, B)` matrix. Plan and workspace are reused across the batch. `execution` is as in
 [`scattering_batch!`](@ref).
 """
-scattering_batch(st::Scattering3D.ScatteringTransform3D, X::AbstractArray{<:Any,4};
+scattering_batch(st::ScatteringCore.ScatteringTransform{3}, X::AbstractArray{<:Any,4};
                  execution::CB.AbstractExecutionBackend = CB.SerialBackend()) =
     _scattering_batch(execution, st, X)
 
-function _scattering_batch(b::CB.AbstractSerialBackend, st::Scattering3D.ScatteringTransform3D,
+function _scattering_batch(b::CB.AbstractSerialBackend, st::ScatteringCore.ScatteringTransform{3},
                            X::AbstractArray{<:Any,4})
     T = eltype(st.filter_bank.averaging) |> real
     flen = Coefficients.flatten_length(
@@ -241,7 +254,7 @@ end
 # Batches on the remaining surfaces, where every slice shares the transform's point set or grid
 # ----------------------------------------------------------------------------
 
-batch_coeffs(st::ScatteredPlanar.ScatteredPlanarScattering, ::Type{T},
+batch_coeffs(st::ScatteredPlanar.ScatteredPlanarScatteringTransform, ::Type{T},
              ::Type{S0T} = T) where {T, S0T} =
     _batch_coeffs2d(st, T, S0T, st.filter_bank.J, st.filter_bank.L)
 
@@ -250,16 +263,59 @@ batch_coeffs(st::ScatteredPlanar.ScatteredPlanarScattering, ::Type{T},
 
 Rows a flattened coefficient column of `st` occupies — the height of `scattering_batch`'s output.
 """
-flat_rows(st::ScatteredPlanar.ScatteredPlanarScattering) =
+flat_rows(st::ScatteredPlanar.ScatteredPlanarScatteringTransform) =
     Coefficients.flat_length(st.filter_bank.J * st.filter_bank.L)
-flat_rows(st::SphericalCore.SphericalScattering) = Coefficients.flat_length(st.J)
-flat_rows(st::SphericalCore.SphericalMonogenicScattering) = Coefficients.flat_length(st.J)
+flat_rows(st::SphericalCore.SphericalScatteringTransform) = Coefficients.flat_length(st.J)
+flat_rows(st::SphericalCore.SphericalMonogenicScatteringTransform) = Coefficients.flat_length(st.J)
+flat_rows(st::Monogenic.MonogenicScatteringTransform) = Coefficients.flat_length(FilterBanks.nwavelets(st.filter_bank))
+flat_rows(st::ScatteringCore.ScatteringTransform) =
+    Coefficients.flat_length(FilterBanks.nwavelets(st.filter_bank))
+
+_coefficient_eltype(st) = real(eltype(st.filter_bank.averaging))
+_coefficient_eltype(st::Union{SphericalCore.SphericalScatteringTransform,SphericalCore.SphericalMonogenicScatteringTransform}) =
+    eltype(st.sigma2)
+
+batch_coeffs(st::Union{SphericalCore.SphericalScatteringTransform,SphericalCore.SphericalMonogenicScatteringTransform},
+             ::Type{T}, ::Type{S0T} = T) where {T,S0T} =
+    Coefficients.ScatteringCoefficients1D(Vector{T}(undef, st.J),
+        st.max_order >= 2 ? zeros(T, st.J, st.J) : Matrix{T}(undef, 0, 0); S0 = [zero(S0T)])
+
+_single_scattering!(c, st::ScatteringCore.ScatteringTransform{1}, x) = Scattering1D.scattering_transform!(c, st, x)
+_single_scattering!(c, st::ScatteringCore.ScatteringTransform{2}, x) = Scattering2D.scattering_transform2d!(c, st, x)
+_single_scattering!(c, st::ScatteringCore.ScatteringTransform{3}, x) = Scattering3D.scattering_transform3d!(c, st, x)
+_single_scattering!(c, st::Monogenic.MonogenicScatteringTransform, x) = Monogenic.monogenic_scattering!(c, st, x)
+_single_scattering!(c, st::SphericalCore.SphericalScatteringTransform, x) =
+    SphericalCore.spherical_scattering!(c.S1, c.S2, st, st.ws, x)
+_single_scattering!(c, st::SphericalCore.SphericalMonogenicScatteringTransform, x) =
+    SphericalCore.spherical_monogenic_scattering!(c.S1, c.S2, st, st.ws, x)
+
+scattering_batch(st::Monogenic.MonogenicScatteringTransform, X::AbstractArray;
+                 execution::CB.AbstractExecutionBackend = CB.SerialBackend()) =
+    _scattering_batch(execution, st, X)
+
+function _scattering_batch(b::CB.AbstractSerialBackend, st::Monogenic.MonogenicScatteringTransform,
+                           X::AbstractArray)
+    T = real(eltype(st.buffer_signal_fft))
+    return _scattering_batch!(Matrix{_flat_eltype(T, X)}(undef, flat_rows(st), size(X)[end]), b, st, X)
+end
+
+function _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
+                            st::Monogenic.MonogenicScatteringTransform{D}, X::AbstractArray) where {D}
+    coeffs = batch_coeffs(st, real(eltype(out)), eltype(out))
+    flat = Vector{eltype(out)}(undef, size(out, 1))
+    for b in axes(out, 2)
+        c = Monogenic.monogenic_scattering!(coeffs, st, _batch_column(X, b))
+        Coefficients.flatten1d!(flat, c)
+        copyto!(view(out, :, b), flat)
+    end
+    return out
+end
 
 _flatten_into!(col, c::Coefficients.ScatteringCoefficients1D) = Coefficients.flatten1d!(col, c)
 _flatten_into!(col, c::Coefficients.ScatteringCoefficients2D) = Coefficients.flatten2d!(col, c)
 
 """
-    scattering_batch(st::ScatteredPlanar.ScatteredPlanarScattering, X; execution = SerialBackend())
+    scattering_batch(st::ScatteredPlanar.ScatteredPlanarScatteringTransform, X; execution = SerialBackend())
         -> Matrix
 
 Transform every slice of `X` against one transform, returning a `(flatten_length, B)` matrix. `X` is
@@ -267,142 +323,89 @@ Transform every slice of `X` against one transform, returning a `(flatten_length
 columns `W` at a time, through one execution per cascade step for each group, the last group padded
 with zero columns. `execution` is as in [`scattering_batch!`](@ref).
 """
-scattering_batch(st::ScatteredPlanar.ScatteredPlanarScattering, X::AbstractMatrix;
+scattering_batch(st::ScatteredPlanar.ScatteredPlanarScatteringTransform, X::AbstractMatrix;
                  execution::CB.AbstractExecutionBackend = CB.SerialBackend()) =
     _scattering_batch(execution, st, X)
 
-function _scattering_batch(b::CB.AbstractSerialBackend, st::ScatteredPlanar.ScatteredPlanarScattering,
+function _scattering_batch(b::CB.AbstractSerialBackend, st::ScatteredPlanar.ScatteredPlanarScatteringTransform,
                            X::AbstractMatrix)
     T = real(eltype(st.filter_bank.averaging))
     return _scattering_batch!(Matrix{_flat_eltype(T, X)}(undef, flat_rows(st), size(X, 2)), b, st, X)
 end
 
 function _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
-                            st::ScatteredPlanar.ScatteredPlanarScattering, X::AbstractMatrix)
-    # `out` decides: real columns get a real `S0` slot, complex columns a complex one.
-    coeffs = batch_coeffs(st, real(eltype(out)), eltype(out))
+                            st::ScatteredPlanar.ScatteredPlanarScatteringTransform, X::AbstractMatrix)
     B = size(X, 2)
     W = Plans.batch_width(st.plan)
-    if W == 1
-        @inbounds for b in 1:B
-            c = ScatteredPlanar.scattered_planar_scattering!(coeffs, st, view(X, :, b))
-            Coefficients.flatten2d!(view(out, :, b), c)
-        end
-        return out
-    end
-    stage = _PlanarStage(st, eltype(out), eltype(X))
     for g in 1:cld(B, W)
-        _planar_group!(out, st, X, ((g - 1) * W + 1):min(g * W, B), stage, coeffs)
+        _planar_group!(out, st, X, ((g - 1) * W + 1):min(g * W, B))
     end
     return out
 end
 
-# What a transform `W = batch_width(st.plan)` wide runs a group of columns through: the group padded
-# with zero columns to `W`, the group's `S0`, `S1` and `S2` on the device of the transform's points,
-# and their host copies (the same arrays on the host).
-struct _PlanarStage{XP, A0, A1, A2, H0, H1, H2}
-    pad::XP
-    S0::A0
-    S1::A1
-    S2::A2
-    h0::H0
-    h1::H1
-    h2::H2
-end
+_planar_flat(st, out::StridedMatrix) = ScatteredPlanar._host_coefficients!(st)
+_planar_flat(st, out::AbstractMatrix) = st.flat
 
-_host_copy(A::Array) = A
-_host_copy(A::AbstractArray) = Array{eltype(A)}(undef, size(A))
-_to_host!(h, A) = h === A ? h : copyto!(h, A)
-
-function _PlanarStage(st::ScatteredPlanar.ScatteredPlanarScattering, ::Type{TO},
-                      ::Type{TX}) where {TO, TX}
-    T = real(TO)
-    W = Plans.batch_width(st.plan)
-    M = length(st.weights)
-    nw = FilterBanks.nwavelets(st.filter_bank)
-    zeros_like(::Type{S}, dims) where {S} = fill!(similar(st.weights, S, dims), zero(S))
-    pad = zeros_like(TX <: Complex ? Complex{T} : T, (M, W))
-    S0 = zeros_like(TO, (W,))
-    S1 = zeros_like(T, (nw, W))
-    S2 = zeros_like(T, st.max_order >= 2 ? (nw, nw, W) : (0, 0, W))
-    return _PlanarStage(pad, S0, S1, S2, _host_copy(S0), _host_copy(S1), _host_copy(S2))
-end
+_copy_planar_flat!(out::AbstractMatrix{<:Real}, flat) = (out .= real.(flat); out)
+_copy_planar_flat!(out::AbstractMatrix{<:Complex}, flat) = (copyto!(out, flat); out)
 
 # Columns `cols` of `X`, at most `W` of them, written into the same columns of `out`.
-function _planar_group!(out::AbstractMatrix, st::ScatteredPlanar.ScatteredPlanarScattering,
-                        X::AbstractMatrix, cols::UnitRange{Int}, stage::_PlanarStage, coeffs)
+function _planar_group!(out::AbstractMatrix, st::ScatteredPlanar.ScatteredPlanarScatteringTransform,
+                        X::AbstractMatrix, cols::UnitRange{Int})
     n = length(cols)
-    n < size(stage.pad, 2) && fill!(stage.pad, zero(eltype(stage.pad)))
-    copyto!(view(stage.pad, :, 1:n), view(X, :, cols))
-    r = ScatteredPlanar.scattered_planar_scattering_batch!(stage.S0, stage.S1, stage.S2, st, stage.pad)
-    h0 = _to_host!(stage.h0, r.S0)
-    h1 = _to_host!(stage.h1, r.S1)
-    h2 = _to_host!(stage.h2, r.S2)
-    @inbounds for i in 1:n
-        copyto!(coeffs.S1, view(h1, :, i))
-        isempty(coeffs.S2) || copyto!(coeffs.S2, view(h2, :, :, i))
-        Coefficients.flatten2d!(view(out, :, cols[i]), Coefficients.update_S0(coeffs, h0[i]))
-    end
+    pad = ScatteredPlanar._samples(st, X)
+    n < size(pad, 2) && fill!(pad, zero(eltype(pad)))
+    copyto!(view(pad, :, 1:n), view(X, :, cols))
+    spectrum = ScatteredPlanar._analyse!(st, pad)
+    Batched.batch_spectral_cascade!(st.flat, st.batch, spectrum)
+    _copy_planar_flat!(view(out, :, cols), view(_planar_flat(st, out), :, 1:n))
     return out
 end
 
 """
-    scattering_batch(st::SphericalCore.SphericalScattering, X; execution = SerialBackend()) -> Matrix
-    scattering_batch(st::SphericalCore.SphericalMonogenicScattering, X; execution = SerialBackend())
+    scattering_batch(st::SphericalCore.SphericalScatteringTransform, X; execution = SerialBackend()) -> Matrix
+    scattering_batch(st::SphericalCore.SphericalMonogenicScatteringTransform, X; execution = SerialBackend())
         -> Matrix
 
 Transform a stack of `B` fields sampled by the same spherical plan — `X` of size
 `(field_size…, B)`, so `(M, B)` for a scattered point set and `(nθ, nφ, B)` on a structured grid.
 `execution` is as in [`scattering_batch!`](@ref).
 
-Rows follow the flat layout of [`Coefficients.flat_length`](@ref) and its row accessors. The spherical cascade
-pairs each scale with strictly *coarser* ones (`j2 < j1`), so a pair lands in the row that layout
-assigns to the unordered pair, `flat_row_s2(j2, j1, J)`.
+Rows follow [`Coefficients.flat_length`](@ref). Scales are finest-first and second-order
+pairs satisfy `j2 > j1`, with row `flat_row_s2(j1, j2, J)`.
 """
-scattering_batch(st::SphericalCore.SphericalScattering, X::AbstractArray;
+scattering_batch(st::SphericalCore.SphericalScatteringTransform, X::AbstractArray;
                  execution::CB.AbstractExecutionBackend = CB.SerialBackend()) =
     _scattering_batch(execution, st, X)
 
-scattering_batch(st::SphericalCore.SphericalMonogenicScattering, X::AbstractArray;
+scattering_batch(st::SphericalCore.SphericalMonogenicScatteringTransform, X::AbstractArray;
                  execution::CB.AbstractExecutionBackend = CB.SerialBackend()) =
     _scattering_batch(execution, st, X)
 
-_scattering_batch(b::CB.AbstractSerialBackend, st::SphericalCore.SphericalScattering{T},
+_scattering_batch(b::CB.AbstractSerialBackend, st::SphericalCore.SphericalScatteringTransform{T},
                   X::AbstractArray) where {T} =
     _scattering_batch!(Matrix{T}(undef, flat_rows(st), size(X)[end]), b, st, X)
 
-_scattering_batch(b::CB.AbstractSerialBackend, st::SphericalCore.SphericalMonogenicScattering{T},
+_scattering_batch(b::CB.AbstractSerialBackend, st::SphericalCore.SphericalMonogenicScatteringTransform{T},
                   X::AbstractArray) where {T} =
     _scattering_batch!(Matrix{T}(undef, flat_rows(st), size(X)[end]), b, st, X)
-
-# `S2` is lower-triangular (`j2 < j1`), and the flat layout stores one row per unordered pair
-# `(j2, j1)`.
-function _flatten_spherical!(col::AbstractVector, S0, S1::AbstractVector, S2::AbstractMatrix, J::Int)
-    col[Coefficients.flat_row_s0()] = S0
-    @inbounds for j in 1:J
-        col[Coefficients.flat_row_s1(j, J)] = S1[j]
-    end
-    @inbounds for j1 in 1:J, j2 in 1:(j1 - 1)
-        col[Coefficients.flat_row_s2(j2, j1, J)] = isempty(S2) ? zero(eltype(col)) : S2[j1, j2]
-    end
-    return col
-end
 
 for (TT, WS, fun) in (
-        (:SphericalScattering, :SphericalWorkspace, :spherical_scattering!),
-        (:SphericalMonogenicScattering, :SphericalMonogenicWorkspace, :spherical_monogenic_scattering!))
+        (:SphericalScatteringTransform, :SphericalWorkspace, :spherical_scattering!),
+        (:SphericalMonogenicScatteringTransform, :SphericalMonogenicWorkspace, :spherical_monogenic_scattering!))
     @eval function _spherical_batch_perfield!(out::AbstractMatrix, st::SphericalCore.$TT{T},
                                               X::AbstractArray) where {T}
         D = ndims(X)
         # An empty block (more MPI ranks than columns) has no field to size the workspace from.
         size(X, D) == 0 && return out
-        field1 = selectdim(X, D, 1)
-        ws = SphericalCore.$WS(st, field1)
+        ws = st.ws
         S1 = zeros(T, st.J)
         S2 = st.max_order >= 2 ? zeros(T, st.J, st.J) : Matrix{T}(undef, 0, 0)
+        flat = Vector{eltype(out)}(undef, size(out, 1))
         @inbounds for b in 1:size(X, D)
             r = SphericalCore.$fun(S1, S2, st, ws, selectdim(X, D, b))
-            _flatten_spherical!(view(out, :, b), r.S0, r.S1, r.S2, st.J)
+            Coefficients.flatten1d!(flat, r)
+            copyto!(view(out, :, b), flat)
         end
         return out
     end
@@ -411,36 +414,69 @@ end
 # The monogenic cascade has no batched form: its amplitude needs the Riesz gradient, which is built
 # from per-field spin-0 transforms.
 _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
-                   st::SphericalCore.SphericalMonogenicScattering, X::AbstractArray) =
+                   st::SphericalCore.SphericalMonogenicScatteringTransform, X::AbstractArray) =
     _spherical_batch_perfield!(out, st, X)
 
 # A widened plan takes a scattered `(M, B)` stack with `B > 1`; a structured grid's fields are
 # matrices.
 _spherical_batches(plan, X::AbstractArray) =
-    size(X)[end] > 1 && ndims(X) == 2 && SphericalCore.supports_batch(plan)
+    SphericalCore.supports_batch(plan)
 
 # Scattered-point backends that support `batch_plan` run one transform per cascade step for the
 # whole stack. Structured and in-core plans take the per-field loop.
 function _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
-                            st::SphericalCore.SphericalScattering{T}, X::AbstractArray) where {T}
+                            st::SphericalCore.SphericalScatteringTransform{T}, X::AbstractArray) where {T}
     B = size(X)[end]
+    B == 0 && return out
     _spherical_batches(st.plan, X) || return _spherical_batch_perfield!(out, st, X)
 
-    # The plans `batch_transform` builds at another width belong to this call.
-    stb = SphericalCore.batch_transform(st, B)
-    try
-        ws = SphericalCore.SphericalWorkspace(stb, X)
-        S1 = zeros(T, st.J, B)
-        S2 = st.max_order >= 2 ? zeros(T, st.J, st.J, B) : Array{T, 3}(undef, 0, 0, 0)
-        r = SphericalCore.spherical_scattering_batch!(S1, S2, stb, ws, X)
-        empty2 = Matrix{T}(undef, 0, 0)
-        @inbounds for b in 1:B
-            S2b = isempty(r.S2) ? empty2 : view(r.S2, :, :, b)
-            _flatten_spherical!(view(out, :, b), r.S0[b], view(r.S1, :, b), S2b, st.J)
-        end
-    finally
-        SphericalCore.close_task_local!(stb, st)
+    ScatteringCore.with_batch_workspaces(() -> SphericalBatchWorkspace(st, B), st,
+                                         B, CB.SerialBackend(), 1) do entries
+        _apply_cached_batch!(out, first(entries), X)
     end
+    return out
+end
+
+struct SphericalBatchWorkspace{S,I,A1,A2,F}
+    transform::S
+    input::I
+    S1::A1
+    S2::A2
+    flat::F
+end
+
+Base.show(io::IO, ws::SphericalBatchWorkspace) =
+    print(io, "SphericalBatchWorkspace(J=", ws.transform.J, ", B=", size(ws.input, 2), ")")
+
+function SphericalBatchWorkspace(st, B::Int)
+    stb = SphericalCore.task_local_batch(st, B)
+    prototype = SphericalCore.sphere_field_buffer(stb.plan)
+    T = real(eltype(prototype))
+    S1 = similar(prototype, T, st.J, B)
+    S2 = similar(prototype, T, st.max_order >= 2 ? (st.J, st.J, B) : (0, 0, B))
+    flat = similar(prototype, T, flat_rows(st), B)
+    return SphericalBatchWorkspace(stb, prototype, S1, S2, flat)
+end
+
+_apply_cached_batch!(out, entry::ScatteringCore.CachedBatch, X) =
+    _apply_batch!(out, entry.workspace, X)
+_apply_batch!(out, ws::Batched.BatchWorkspace, X) = Batched.batch_cascade!(out, ws, X)
+
+function _apply_batch!(out, ws::SphericalBatchWorkspace, X)
+    st = ws.transform
+    n = size(out, 2)
+    n < size(ws.input, 2) && fill!(ws.input, zero(eltype(ws.input)))
+    copyto!(view(ws.input, :, 1:n), X)
+    r = SphericalCore.spherical_scattering_batch!(ws.S1, ws.S2, st, st.ws, ws.input)
+    fill!(ws.flat, zero(eltype(ws.flat)))
+    view(ws.flat, 1, :) .= r.S0
+    view(ws.flat, 2:(st.J + 1), :) .= r.S1
+    if !isempty(r.S2)
+        for j1 in 1:st.J, j2 in (j1 + 1):st.J
+            view(ws.flat, Coefficients.flat_row_s2(j1, j2, st.J), :) .= view(r.S2, j1, j2, :)
+        end
+    end
+    copyto!(out, view(ws.flat, :, 1:n))
     return out
 end
 
@@ -450,14 +486,43 @@ end
 `Plans.close_plan!` every spectral plan `st` owns. `st` must not be in use by any task, and is not
 usable after.
 """
-close_transform!(st) = (Plans.close_plan!(st.plan); nothing)
-function close_transform!(st::SphericalCore.SphericalScattering)
+function close_transform!(st)
+    _close_workspaces!(st)
+    Plans.close_plan!(st.plan)
+    pw = _cascade_workspace(st)
+    foreach(Plans.close_plan!, pw.plans)
+    return nothing
+end
+_cascade_workspace(st) = st.pw
+_cascade_workspace(st::Monogenic.MonogenicScatteringTransform) = st.mw.pw
+
+function _close_workspaces!(st)
+    pool = st.workspaces
+    lock(pool.lock) do
+        foreach(close_transform!, pool.tasks)
+        foreach(w -> ScatteringCore.close_batch_workspace!(w.workspace), pool.batches)
+        foreach(close_worker!, pool.workers)
+        empty!(pool.tasks)
+        empty!(pool.batches)
+        empty!(pool.workers)
+    end
+    return nothing
+end
+
+function close_worker! end
+ScatteringCore.close_batch_workspace!(ws::Batched.BatchWorkspace) = ScatteringCore.close_batch_workspace!(ws.spectral)
+ScatteringCore.close_batch_workspace!(ws::Batched.SpectralBatchWorkspace) = (foreach(Plans.close_plan!, ws.pw.plans); nothing)
+ScatteringCore.close_batch_workspace!(ws::SphericalBatchWorkspace) = close_transform!(ws.transform)
+
+function close_transform!(st::SphericalCore.SphericalScatteringTransform)
+    _close_workspaces!(st)
     Plans.close_plan!(st.plan)
     st.bands === nothing || foreach(Plans.close_plan!, st.bands)
     st.grid === nothing || Plans.close_plan!(st.grid)
     return nothing
 end
-function close_transform!(st::SphericalCore.SphericalMonogenicScattering)
+function close_transform!(st::SphericalCore.SphericalMonogenicScatteringTransform)
+    _close_workspaces!(st)
     Plans.close_plan!(st.plan)
     st.grid === nothing || Plans.close_plan!(st.grid)
     return nothing
@@ -483,17 +548,25 @@ _gridded_spec(build, st, N, bank::NamedTuple) =
                    filters = FilterBanks.filter_storage(st.filter_bank),
                    transform = Plans.spectral_backend(st.plan)))
 
-transform_spec(st::Scattering1D.ScatteringTransform1D) =
-    _gridded_spec(Scattering1D.ScatteringTransform1D, st, st.dims[1], (Q = st.filter_bank.Q,))
-transform_spec(st::Scattering2D.ScatteringTransform2D) =
-    _gridded_spec(Scattering2D.ScatteringTransform2D, st, st.dims, (L = st.filter_bank.L,))
-transform_spec(st::Scattering3D.ScatteringTransform3D) =
-    _gridded_spec(Scattering3D.ScatteringTransform3D, st, st.dims,
+transform_spec(st::ScatteringCore.ScatteringTransform{1}) =
+    _gridded_spec(ScatteringCore.ScatteringTransform{1}, st, st.dims[1], (Q = st.filter_bank.Q,))
+transform_spec(st::ScatteringCore.ScatteringTransform{2}) =
+    _gridded_spec(ScatteringCore.ScatteringTransform{2}, st, st.dims, (L = st.filter_bank.L,))
+transform_spec(st::ScatteringCore.ScatteringTransform{3}) =
+    _gridded_spec(ScatteringCore.ScatteringTransform{3}, st, st.dims,
                   (n_orient = st.filter_bank.n_orient,))
+
+transform_spec(st::Monogenic.MonogenicScatteringTransform) =
+    TransformSpec(Monogenic.MonogenicScatteringTransform,
+                  (real(eltype(st.buffer_signal_fft)), st.dims, st.filter_bank.J),
+                  (Q = st.filter_bank.Q, max_order = st.max_order,
+                   oversampling = st.mw.pw.oversampling,
+                   filters = FilterBanks.filter_storage(st.filter_bank),
+                   transform = Plans.spectral_backend(st.plan)))
 
 # The nonuniform and spherical specs carry the sample locations and omit the batch width: a rebuilt
 # transform is single-field, so it accepts a column block of any width.
-function transform_spec(st::ScatteredPlanar.ScatteredPlanarScattering)
+function transform_spec(st::ScatteredPlanar.ScatteredPlanarScatteringTransform)
     x, y = Plans.plan_points(st.plan)
     a = Plans.plan_analysis(st.plan)
     # The plan's points lie on its domain of period `2π`.
@@ -501,14 +574,14 @@ function transform_spec(st::ScatteredPlanar.ScatteredPlanarScattering)
                          (real(eltype(st.filter_bank.averaging)), x, y, st.plan.ms, st.filter_bank.J),
                          (L = st.filter_bank.L, max_order = st.max_order,
                           transform = Plans.spectral_backend(st.plan), weights = st.weights,
-                          period = (2π, 2π), solve = a.solve, maxiter = a.maxiter, rtol = a.rtol,
-                          damp = a.damp, eps = a.eps, nufft_nthreads = a.nufft_nthreads,
+                          period = (2π, 2π), analysis = a.analysis, maxiter = a.maxiter, rtol = a.rtol,
+                          damp = a.damp, tol = a.tol, nthreads = a.nthreads,
                           oversampling = st.pw.oversampling,
                           filters = FilterBanks.filter_storage(st.filter_bank)))
 end
 
-function transform_spec(st::Union{SphericalCore.SphericalScattering,
-                                  SphericalCore.SphericalMonogenicScattering})
+function transform_spec(st::Union{SphericalCore.SphericalScatteringTransform,
+                                  SphericalCore.SphericalMonogenicScatteringTransform})
     pts = SphericalCore.plan_points(st.plan)
     # No points means the plan is defined by its band limit alone (a structured backend).
     pts === nothing && return _structured_spec(st)
@@ -519,20 +592,20 @@ function transform_spec(st::Union{SphericalCore.SphericalScattering,
     return TransformSpec(_scattered_build(st), (copy(pts[1]), copy(pts[2]), st.lmax, st.J),
                          (max_order = st.max_order, transform = Plans.spectral_backend(st.plan),
                           weights = w === nothing ? nothing : copy(w), rtol = solver.rtol,
-                          maxiter = solver.maxiter, solve = solver.solve,
+                          maxiter = solver.maxiter, analysis = solver.analysis,
                           nufft = SphericalCore.plan_nufft(st.plan),
                           grid_lmax = SphericalCore.grid_band(st.grid)))
 end
 
-_scattered_build(::SphericalCore.SphericalScattering) = spherical_scattering
-_scattered_build(::SphericalCore.SphericalMonogenicScattering) = spherical_monogenic_scattering
+_scattered_build(::SphericalCore.SphericalScatteringTransform) = spherical_scattering
+_scattered_build(::SphericalCore.SphericalMonogenicScatteringTransform) = spherical_monogenic_scattering
 
-_structured_spec(st::SphericalCore.SphericalScattering{T}) where {T} =
+_structured_spec(st::SphericalCore.SphericalScatteringTransform{T}) where {T} =
     TransformSpec(_structured_scattering,
-                  (T, st.lmax, st.J, st.bands === nothing ? fill(st.lmax, st.J) :
+                  (T, st.lmax, st.J, st.bands === nothing ? nothing :
                                                            map(SphericalCore.sphere_lmax, st.bands)),
                   (max_order = st.max_order, transform = Plans.spectral_backend(st.plan)))
-_structured_spec(st::SphericalCore.SphericalMonogenicScattering{T}) where {T} =
+_structured_spec(st::SphericalCore.SphericalMonogenicScatteringTransform{T}) where {T} =
     TransformSpec(structured_spherical_monogenic_scattering, (T, st.lmax, st.J),
                   (max_order = st.max_order, transform = Plans.spectral_backend(st.plan)))
 
@@ -553,15 +626,15 @@ _scattering_batch!(out, b::CB.AbstractExecutionBackend, st, X; kwargs...) =
 
 """
     scattered_planar_scattering([T=Float64,] x, y, ms, J; period, origin=(0, 0), L=8, max_order=2,
-                                transform=SpectralBackends.AutoSpectralBackend(), solve=false,
-                                weights=nothing, eps=nothing, maxiter=100,
-                                rtol=Plans.default_solver_rtol(T, transform, eps), damp=0,
-                                ntrans=1, nufft_nthreads=0, filters=StoredFilters(), oversampling=J)
+                                transform=SpectralBackends.AutoSpectralBackend(),
+                                analysis=Plans.WeightedAdjoint(), weights=nothing, tol=nothing,
+                                maxiter=100, rtol=Plans.default_solver_rtol(T, transform, tol), damp=0,
+                                ntrans=1, nthreads=0, filters=StoredFilters(), oversampling=J)
     scattered_planar_scattering([T,] grid, ms, J; kwargs...)
 
 Build a 2D planar scattering transform for a scalar field sampled at scattered points `(x, y)`. A
 nonuniform DFT analyses the samples onto a uniform Fourier **mode grid** of size `ms = (m1, m2)`, and
-the cascade of the gridded `Scattering2D.ScatteringTransform2D`, with its oriented Morlet bank and
+the cascade of the gridded `ScatteringCore.ScatteringTransform{2}`, with its oriented Morlet bank and
 `oversampling`, runs on that grid: each coefficient is the domain mean of a modulus of the field the
 analysis recovers. Apply it to a length-`M` vector of samples.
 
@@ -570,28 +643,27 @@ corner (a number for both axes, or a 2-tuple): mode `k` has wavelength `period/k
 physical scales are those of the domain, and point sets drawn from one domain share them. Points
 `0:m-1` with `period = m` are the nodes of the length-`m` DFT. With FlowGeometries loaded, a 2-D
 Cartesian `FlowGeometries.Grids` grid stands in for the points: its active cells are the points, its
-`Grids.domain_length` the period, the lowest cell centre the origin and its cell measure the default
-`weights`.
+periodic axes supply their periods, bounded axes their extents plus the coarsest wavelet width,
+the lowest cell centre supplies the origin, and cell measures supply default `weights`.
 
 `transform` names the nonuniform transform: `SpectralBackends.DirectSumSpectralBackend` is the in-core,
 dependency-free exact NUDFT (always available, `O(M·prod(ms))`);
 `FlowTransformBindings.NonuniformFFTsBackend()` and `FlowTransformBindings.FINUFFTBackend()` select a
 nonuniform-FFT library (`using NonuniformFFTs` / `using FINUFFT`);
 and `SpectralBackends.AutoSpectralBackend` (the default) takes NonuniformFFTs when it is loaded, FINUFFT
-when only it is, and the direct sum otherwise. `solve=false` takes the adjoint (type-1) weighted by
+when only it is, and the direct sum otherwise. `analysis=Plans.WeightedAdjoint()` takes the adjoint weighted by
 `weights`, the quadrature of each Fourier coefficient's domain integral: exact on the nodes of the
-DFT, an estimate elsewhere. `solve=true` fits the band-limited coefficients by least squares (slower,
+DFT, an estimate elsewhere. `analysis=Plans.LeastSquares()` fits the band-limited coefficients by least squares (slower,
 for irregular sampling). `weights` (length `M`, normalized to sum to 1) are uniform by default; `S0` is
-the mean of the analysed field. `eps` is the NUFFT tolerance (ignored by the exact direct sum).
+the mean of the analysed field. `tol` is the NUFFT tolerance (ignored by the exact direct sum).
 `ntrans = B` builds a transform that runs `B` fields per call through one execution per cascade step
 (see [`scattering_batch`](@ref)). `filters = FilterBanks.ComputedFilters()` evaluates the wavelets on
 demand.
 
 The solve is LSMR (`FlowTransformBindings.lsmr!`), which costs one type-2 and one type-1 per
 iteration and keeps both `‖b - Af‖` and `‖A†(b - Af)‖` monotone, so stopping at `maxiter` returns the
-best iterate reached. It stops on the tests of Fong & Saunders, `‖b - Af‖ ≤ rtol ‖b‖` or
-`‖A†(b - Af)‖ ≤ rtol ‖A‖ ‖b - Af‖`, and `rtol` defaults to the accuracy of the transform under it:
-`sqrt(eps(T))` for the exact direct sum and `~10·eps` for a fast library, whose type-1 and type-2
+best iterate reached. `rtol` targets `‖A†(b - Af)‖ ≤ rtol ‖A†b‖` and defaults to the accuracy of
+the transform under it: `sqrt(eps(T))` for the exact direct sum and at least `10·tol` for a fast library, whose type-1 and type-2
 are adjoints only to its own tolerance
 ([`Plans.default_solver_rtol`](@ref ScatteringTransforms.Plans.default_solver_rtol)). `damp` is a
 Tikhonov `λ` minimising `‖Af - b‖² + λ²‖f‖²`, `0` by default; with `prod(ms) > M` the problem is
@@ -601,9 +673,9 @@ The Krylov process terminates within `prod(ms)` steps, and `maxiter` caps it ear
 solve returns the best iterate reached but is reproducible only to the accuracy of the transform
 under it: a multi-threaded NUFFT accumulates its spreading in a run-dependent order, which an
 unconverged solve amplifies by about `cond(A)²`. Raise `maxiter` until the solve converges for an
-answer independent of the thread count, or set `nufft_nthreads = 1` for bitwise-identical repeats.
+answer independent of the thread count, or set `nthreads = 1` for bitwise-identical repeats.
 
-`nufft_nthreads` is the fast library's own thread count, honoured by every copy of the plan,
+`nthreads` is the fast library's own thread count, honoured by every copy of the plan,
 including the per-task copies a threaded backend builds. `0` (the default) takes `Threads.nthreads()`
 on a serial backend and gives each per-task copy one thread. `1` keeps the library single-threaded
 everywhere, and its plan executes without allocating; a multi-threaded FFTW plan runs its parallel
@@ -617,7 +689,7 @@ scattered_planar_scattering(x::AbstractVector, y::AbstractVector, ms::NTuple{2, 
 
 """
     spherical_scattering(pts_theta, pts_phi, lmax, J; max_order=2,
-                         transform=SpectralBackends.AutoSpectralBackend(), solve=true,
+                         transform=SpectralBackends.AutoSpectralBackend(), analysis=Plans.LeastSquares(),
                          rtol=SphericalCore.default_rtol(transform), maxiter=500, weights=nothing,
                          ntrans=1, nufft=SpectralBackends.AutoSpectralBackend(), grid_lmax=2lmax)
 
@@ -635,9 +707,9 @@ second analysis after that runs on the Gauss–Legendre grid of band limit `grid
 field the analysis recovers, and `S0` is that field's mean. A modulus is not band limited, and the grid's
 analysis of it onto degree `≤ lmax` is exact for its content up to degree `2grid_lmax + 1 − lmax`.
 
-`solve = true` analyses by the least-squares fit, by LSMR, which `rtol` and `maxiter` configure and
-which returns its best iterate at `maxiter`. `solve = false` takes the adjoint weighted by `weights`
-instead, one transform: the expansion of a degree-`lmax` field where the weights integrate the
+`analysis = Plans.LeastSquares()` fits by LSMR, configured by `rtol` and `maxiter`, and returns
+its best iterate at a stopping limit. `Plans.WeightedAdjoint()` takes the adjoint weighted by
+`weights`: the expansion of a degree-`lmax` field where the weights integrate the
 product of two degree-`lmax` harmonics exactly, and an approximation elsewhere. `weights` (length `M`,
 normalized to sum to 1) are the quadrature of that adjoint and the weights of the fit, uniform by
 default. `ntrans = B` builds a plan that transforms `B` co-located fields per call. `nufft` names the
@@ -649,12 +721,13 @@ function spherical_scattering(pts_theta::AbstractVector{TT}, pts_phi::AbstractVe
                               rtol::Real = SphericalCore.default_rtol(transform),
                               maxiter::Int = 500, weights = nothing, ntrans::Int = 1,
                               nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
-                              solve::Bool = true, grid_lmax::Int = 2lmax) where {TT<:Real}
+                              analysis::Plans.AbstractAnalysis = Plans.LeastSquares(),
+                              grid_lmax::Int = 2lmax) where {TT<:Real}
     T = float(TT)
-    plan = SphericalCore.make_spherical_plan(transform, pts_theta, pts_phi, lmax, T;
+    plan = SphericalCore.make_spherical_plan(SphericalCore.SphericalScatteringTransform, transform, pts_theta, pts_phi, lmax, T;
                                              rtol = rtol, maxiter = maxiter, weights = weights,
-                                             ntrans = ntrans, nufft = nufft, solve = solve)
-    return SphericalCore.SphericalScattering(lmax, J, max_order, plan,
+                                             ntrans = ntrans, nufft = nufft, analysis = analysis)
+    return SphericalCore.SphericalScatteringTransform(lmax, J, max_order, plan,
                                              SphericalCore.dog_sigma2(lmax, J, T), nothing,
                                              SphericalCore.grid_plan(plan, _grid_lmax(grid_lmax, lmax)))
 end
@@ -664,7 +737,7 @@ _grid_lmax(L::Int, lmax::Int) =
 
 """
     spherical_monogenic_scattering(pts_theta, pts_phi, lmax, J; max_order=2,
-                                   transform=SpectralBackends.AutoSpectralBackend(), solve=true,
+                                   transform=SpectralBackends.AutoSpectralBackend(), analysis=Plans.LeastSquares(),
                                    rtol=SphericalCore.default_rtol(transform), maxiter=500,
                                    weights=nothing, nufft=SpectralBackends.AutoSpectralBackend(),
                                    grid_lmax=2lmax)
@@ -683,14 +756,13 @@ function spherical_monogenic_scattering(pts_theta::AbstractVector{TT}, pts_phi::
                                         rtol::Real = SphericalCore.default_rtol(transform),
                                         maxiter::Int = 500, weights = nothing,
                                         nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
-                                        solve::Bool = true, grid_lmax::Int = 2lmax) where {TT<:Real}
+                                        analysis::Plans.AbstractAnalysis = Plans.LeastSquares(),
+                                        grid_lmax::Int = 2lmax) where {TT<:Real}
     T = float(TT)
-    # `spin = true` builds the spin-weighted plan pair `spherical_monogenic_components` synthesises
-    # through on a NUFSHT plan.
-    plan = SphericalCore.make_spherical_plan(transform, pts_theta, pts_phi, lmax, T;
+    plan = SphericalCore.make_spherical_plan(SphericalCore.SphericalMonogenicScatteringTransform, transform, pts_theta, pts_phi, lmax, T;
                                              rtol = rtol, maxiter = maxiter, weights = weights,
-                                             nufft = nufft, spin = true, solve = solve)
-    return SphericalCore.SphericalMonogenicScattering(lmax, J, max_order, plan,
+                                             nufft = nufft, analysis = analysis)
+    return SphericalCore.SphericalMonogenicScatteringTransform(lmax, J, max_order, plan,
                                                       SphericalCore.dog_sigma2(lmax, J, T),
                                                       SphericalCore.grid_plan(plan, _grid_lmax(grid_lmax, lmax)))
 end
@@ -698,38 +770,42 @@ end
 """
     structured_spherical_scattering([T=Float64,] lmax, J; max_order=2,
                                     transform=SpectralBackends.AutoSpectralBackend(),
-                                    band_headroom=Inf, rtol=1e-8, maxiter=500)
+                                    band_headroom=nothing, rtol=1e-8, maxiter=500)
 
 Build a spherical scattering transform for a scalar field sampled on the structured equiangular grid
 (`Nθ = lmax+1` colatitudes, `Nφ = 2lmax+1` longitudes), using the same smooth difference-of-Gaussians
 band-pass wavelets as [`spherical_scattering`](@ref). Apply it to a `(Nθ, Nφ)` grid of samples; obtain
 the grid points with [`structured_sphere_points`](@ref). `transform` names the spherical-harmonic
 transform:
-`SpectralBackends.DirectSumSpectralBackend` (in-core, dependency-free) by default, or
+`SpectralBackends.DirectSumSpectralBackend` (in-core, dependency-free), or
 `SpectralBackends.FSHTSpectralBackend` (the fast exact SHT, needs `using FastSphericalHarmonics`);
 `SpectralBackends.AutoSpectralBackend` picks the fast path if its extension is loaded, else the
 direct SHT.
 
 On a backend that can narrow its band limit (FastSphericalHarmonics), a finite `band_headroom`
 synthesises band `j` at band limit `band_headroom·ℓ_j`, discarding the tail
-[`SphericalCore.band_lmax`](@ref) describes; the default `Inf` reproduces the full-band-limit
+[`SphericalCore.band_lmax`](@ref) describes; the default `nothing` runs the full-band-limit
 cascade bit for bit. `rtol` and `maxiter` configure the in-core plan's analysis solve.
 """
 structured_spherical_scattering(::Type{T}, lmax::Int, J::Int; max_order::Int = 2,
                                 transform::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
-                                band_headroom::Real = Inf,
+                                band_headroom::Union{Nothing,Real} = nothing,
                                 rtol::Real = 1.0e-8, maxiter::Int = 500) where {T} =
-    _structured_scattering(T, lmax, J, [SphericalCore.band_lmax(lmax, J, j, band_headroom) for j in 1:J];
+    _structured_scattering(T, lmax, J, _band_limits(lmax, J, band_headroom);
                            max_order = max_order, transform = transform, rtol = rtol,
                            maxiter = maxiter)
 
 # The structured transform with scale `j` at band limit `ls[j]`; on a backend that cannot narrow,
 # every scale runs at `lmax`.
-function _structured_scattering(::Type{T}, lmax::Int, J::Int, ls::AbstractVector{<:Integer};
+_band_limits(lmax, J, ::Nothing) = nothing
+_band_limits(lmax, J, headroom::Real) =
+    [SphericalCore.band_lmax(lmax, J, j, headroom) for j in 1:J]
+
+function _structured_scattering(::Type{T}, lmax::Int, J::Int, ls;
                                 max_order::Int, transform::SB.AbstractSpectralBackend,
                                 rtol::Real = 1.0e-8, maxiter::Int = 500) where {T}
     plan = SphericalCore.make_structured_plan(transform, lmax, T; rtol = rtol, maxiter = maxiter)
-    return SphericalCore.SphericalScattering(lmax, J, max_order, plan,
+    return SphericalCore.SphericalScatteringTransform(lmax, J, max_order, plan,
                                              SphericalCore.dog_sigma2(lmax, J, T),
                                              SphericalCore.band_plans(plan, lmax, ls))
 end
@@ -749,7 +825,7 @@ function structured_spherical_monogenic_scattering(::Type{T}, lmax::Int, J::Int;
                                          transform::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
                                          rtol::Real = 1.0e-8, maxiter::Int = 500) where {T}
     plan = SphericalCore.make_structured_plan(transform, lmax, T; rtol = rtol, maxiter = maxiter)
-    return SphericalCore.SphericalMonogenicScattering(lmax, J, max_order, plan,
+    return SphericalCore.SphericalMonogenicScatteringTransform(lmax, J, max_order, plan,
                                                       SphericalCore.dog_sigma2(lmax, J, T))
 end
 structured_spherical_monogenic_scattering(lmax::Int, J::Int; kwargs...) =
@@ -772,16 +848,15 @@ the planar [`monogenic_components`](@ref ScatteringTransforms.Monogenic.monogeni
 the band-pass field `bandpass = U⁰_j`, the spin-1
 Riesz tangent vector `riesz = (u_θ, u_φ)` (`U^R_j = ð∘(−Δ_S)^{-1/2} U⁰_j`), the monogenic `amplitude`
 `√(U⁰² + ‖U^R‖²)`, the `phase = atan(‖U^R‖, U⁰)`, and the local `orientation = atan(u_φ, u_θ)` of the
-Riesz vector. `st` is a [`spherical_monogenic_scattering`](@ref) transform. With the in-core direct SH
+Riesz vector. `st` is a scattered or structured spherical monogenic transform. With the in-core direct SH
 plan (dependency-free) the Riesz field is synthesized as the surface gradient of `g = (−Δ_S)^{-1/2}U⁰`;
 with a NUFSHT-backed plan it uses spin-weighted synthesis — the two agree to solver accuracy.
 """
 spherical_monogenic_components(args...; kwargs...) = throw(ArgumentError(
-    "spherical_monogenic_components expects a `spherical_monogenic_scattering` transform (with an " *
-    "in-core direct SH plan or a NUFSHT-backed plan) plus a field and scale index."))
+    "spherical_monogenic_components expects a spherical monogenic transform, a field and a scale index."))
 
-spherical_monogenic_components(st::SphericalCore.SphericalMonogenicScattering{<:Any, <:SphericalCore.DirectSHTSphericalPlan},
-                               field::AbstractVector, j::Int) =
+spherical_monogenic_components(st::SphericalCore.SphericalMonogenicScatteringTransform{<:Any, <:SphericalCore.DirectSHTSphericalPlan},
+                               field::AbstractArray, j::Int) =
     SphericalCore.direct_monogenic_components(st, field, j)
 
 """
@@ -846,18 +921,18 @@ plot_coefficients(args...; kwargs...) = throw(ArgumentError(
 using PrecompileTools: @setup_workload, @compile_workload
 @setup_workload begin
     @compile_workload begin
-        st1 = Scattering1D.ScatteringTransform1D(32, 3; Q = 1, max_order = 2, transform = SB.DirectSumSpectralBackend())
+        st1 = ScatteringCore.ScatteringTransform(32, 3; Q = 1, max_order = 2, transform = SB.DirectSumSpectralBackend())
         c1 = st1(zeros(Float64, 32))
         Coefficients.flatten1d(c1)
         ScatteringFields.scattering_field(st1, zeros(Float64, 32); subsample = 1)
         scattering_batch(st1, zeros(Float64, 32, 2))
         Reductions.normalized_coefficients(c1)
 
-        st2 = Scattering2D.ScatteringTransform2D((16, 16), 2; L = 4, max_order = 2, transform = SB.DirectSumSpectralBackend())
+        st2 = ScatteringCore.ScatteringTransform((16, 16), 2; L = 4, max_order = 2, transform = SB.DirectSumSpectralBackend())
         c2 = st2(zeros(Float64, 16, 16))
         Scattering2D.compute_shape_sparsity(Coefficients.first_order(c2), Coefficients.second_order(c2), st2.filter_bank.meta)
 
-        st3 = Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient = 6, max_order = 2, transform = SB.DirectSumSpectralBackend())
+        st3 = ScatteringCore.ScatteringTransform((8, 8, 8), 2; n_orient = 6, max_order = 2, transform = SB.DirectSumSpectralBackend())
         st3(zeros(Float64, 8, 8, 8))
     end
 end

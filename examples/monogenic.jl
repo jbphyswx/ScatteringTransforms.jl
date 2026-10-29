@@ -6,7 +6,7 @@ scattering. Instead of fixing discrete orientations and taking an analytic modul
 transform pairs an *isotropic* band-pass with its Riesz components and reports a **monogenic
 amplitude** (a smooth envelope) plus a **continuous local orientation/phase**.
 
-Demonstrates: 1D/2D/3D `MonogenicScattering`, the Riesz-multiplier partition of unity, the
+Demonstrates: 1D/2D/3D `MonogenicScatteringTransform`, the Riesz-multiplier partition of unity, the
 amplitude/orientation decomposition (`monogenic_components`), and rotation behaviour.
 
 Run with: `julia --project=. monogenic.jl`
@@ -30,9 +30,9 @@ println("\nRiesz partition Σ_d|R_d|² = 1 off-DC: ",
 
 # ── 1D / 2D / 3D monogenic scattering ─────────────────────────────────────────
 let
-    c1 = ST.Monogenic.MonogenicScattering(256, 5; Q=1, max_order=2)(randn(256))
-    c2 = ST.Monogenic.MonogenicScattering((48, 48), 3; Q=1, max_order=2)(randn(48, 48))
-    c3 = ST.Monogenic.MonogenicScattering((16, 16, 16), 2; max_order=2)(randn(16, 16, 16))
+    c1 = ST.Monogenic.MonogenicScatteringTransform(256, 5; Q=1, max_order=2)(randn(256))
+    c2 = ST.Monogenic.MonogenicScatteringTransform((48, 48), 3; Q=1, max_order=2)(randn(48, 48))
+    c3 = ST.Monogenic.MonogenicScatteringTransform((16, 16, 16), 2; max_order=2)(randn(16, 16, 16))
     println("1D/2D/3D monogenic S1 lengths: ",
             length(ST.Coefficients.first_order(c1)), " / ", length(ST.Coefficients.first_order(c2)), " / ", length(ST.Coefficients.first_order(c3)))
 end
@@ -43,7 +43,7 @@ M = 128
 cx = cy = (M + 1) / 2
 rr = [sqrt((i - cx)^2 + (j - cy)^2) for i in 1:M, j in 1:M]
 field = cos.(2π .* rr ./ (M / 16))
-st = ST.Monogenic.MonogenicScattering((M, M), 5; Q=1, max_order=1, transform=SB.FFTSpectralBackend())
+st = ST.Monogenic.MonogenicScatteringTransform((M, M), 5; Q=1, max_order=1, transform=SB.FFTSpectralBackend())
 best = argmax([sum(abs2, ST.Monogenic.monogenic_components(st, field, j).bandpass) for j in 1:5])
 comp = ST.Monogenic.monogenic_components(st, field, best)
 

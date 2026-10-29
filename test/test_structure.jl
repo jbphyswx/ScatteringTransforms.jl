@@ -6,12 +6,12 @@ Test.@testset "Cascade issues each first-order transform exactly once" begin
     # The cascade walks `(j1, children)` groups, so a first-order field is convolved once and its
     # spectrum taken once, then reused by every child.
     for (build, input) in (
-            (() -> ScatteringTransforms.Scattering1D.ScatteringTransform1D(64, 4; Q = 2,
+            (() -> ScatteringTransforms.ScatteringCore.ScatteringTransform(64, 4; Q = 2,
                        max_order = 2, transform = SpectralBackends.FFTSpectralBackend()), randn(64)),
-            (() -> ScatteringTransforms.Scattering2D.ScatteringTransform2D((16, 16), 3; L = 4,
+            (() -> ScatteringTransforms.ScatteringCore.ScatteringTransform((16, 16), 3; L = 4,
                        max_order = 2, transform = SpectralBackends.FFTSpectralBackend()),
              randn(16, 16)),
-            (() -> ScatteringTransforms.Scattering3D.ScatteringTransform3D((8, 8, 8), 2;
+            (() -> ScatteringTransforms.ScatteringCore.ScatteringTransform((8, 8, 8), 2;
                        n_orient = 4, max_order = 2,
                        transform = SpectralBackends.FFTSpectralBackend()), randn(8, 8, 8)))
         st = build()
@@ -32,7 +32,7 @@ Test.@testset "Decimation reduces cascade work, not just its shape" begin
     # weighed by its butterfly count.
     dims = (64, 64)
     input = randn(dims)
-    build(α) = ScatteringTransforms.Scattering2D.ScatteringTransform2D(dims, 4; L = 4,
+    build(α) = ScatteringTransforms.ScatteringCore.ScatteringTransform(dims, 4; L = 4,
                    oversampling = α, transform = SpectralBackends.FFTSpectralBackend())
     ref = count_executions((s, x) -> s(x), build(4), input)
     Test.@test ref.work == ref.total * prod(dims) * 12      # 64² · log₂(64²), i.e. nothing decimated
@@ -62,9 +62,9 @@ Test.@testset "Workspace is O(field), not O(nw * field)" begin
         end
         return sum(sizeof, seen)
     end
-    small = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 2; L = 2,
+    small = ScatteringTransforms.ScatteringCore.ScatteringTransform((32, 32), 2; L = 2,
                 transform = SpectralBackends.FFTSpectralBackend())
-    big = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 4; L = 8,
+    big = ScatteringTransforms.ScatteringCore.ScatteringTransform((32, 32), 4; L = 8,
               transform = SpectralBackends.FFTSpectralBackend())
     Test.@test length(big.filter_bank.wavelets) > 7 * length(small.filter_bank.wavelets)
     Test.@test ws_bytes(small) == ws_bytes(big)
@@ -72,14 +72,14 @@ Test.@testset "Workspace is O(field), not O(nw * field)" begin
     # Decimation adds one buffer set per live resolution, but those shrink geometrically, so total
     # scratch stays a small multiple of one field however deep the cascade goes.
     field = 2 * sizeof(ComplexF64) * 32 * 32           # buffer_input + buffer_signal_fft
-    deep = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 4; L = 8,
+    deep = ScatteringTransforms.ScatteringCore.ScatteringTransform((32, 32), 4; L = 8,
                oversampling = 0, transform = SpectralBackends.FFTSpectralBackend())
     Test.@test ws_bytes(deep) < 3 * field
 end
 
 Test.@testset "task_workspace shares read-only state, copies only scratch" begin
     # The filter bank dominates a transform's memory, and every task shares it.
-    st = ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L = 4,
+    st = ScatteringTransforms.ScatteringCore.ScatteringTransform((32, 32), 3; L = 4,
              transform = SpectralBackends.FFTSpectralBackend())
     ws = ScatteringTransforms.ScatteringCore.task_workspace(st)
     Test.@test ws.filter_bank === st.filter_bank
@@ -109,12 +109,14 @@ Test.@testset "Every backend returns the serial result" begin
     # Each task owns disjoint outputs, so there is no reduction to reorder and threaded results are
     # identical to serial.
     for (st, X) in (
-            (ScatteringTransforms.Scattering1D.ScatteringTransform1D(64, 3; Q = 1,
+            (ScatteringTransforms.ScatteringCore.ScatteringTransform(64, 3; Q = 1,
                  transform = SpectralBackends.FFTSpectralBackend()), randn(64, 5)),
-            (ScatteringTransforms.Scattering2D.ScatteringTransform2D((16, 16), 2; L = 4,
+            (ScatteringTransforms.ScatteringCore.ScatteringTransform((16, 16), 2; L = 4,
                  transform = SpectralBackends.FFTSpectralBackend()), randn(16, 16, 4)),
-            (ScatteringTransforms.Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient = 4,
-                 transform = SpectralBackends.FFTSpectralBackend()), randn(8, 8, 8, 3)))
+            (ScatteringTransforms.ScatteringCore.ScatteringTransform((8, 8, 8), 2; n_orient = 4,
+                 transform = SpectralBackends.FFTSpectralBackend()), randn(8, 8, 8, 3)),
+            (ScatteringTransforms.Monogenic.MonogenicScatteringTransform((16, 16), 2;
+                 transform = SpectralBackends.FFTSpectralBackend()), randn(16, 16, 3)))
         ref = ScatteringTransforms.scattering_batch(st, X)
         Test.@test ScatteringTransforms.scattering_batch(st, X; execution = ComputationalBackends.SerialBackend()) == ref
         Test.@test ScatteringTransforms.scattering_batch(st, X; execution = ComputationalBackends.ThreadedBackend()) == ref
@@ -135,21 +137,21 @@ Test.@testset "Plan-owning structs print one line" begin
     # The default `show` of a struct holding an FFTW plan can reach `fftw_sprint_plan`, which can
     # segfault. Every plan-owning struct prints a one-line summary.
     for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.FFTSpectralBackend())
-        sts = (ScatteringTransforms.Scattering1D.ScatteringTransform1D(32, 3; Q = 1, transform = spec),
-               ScatteringTransforms.Scattering2D.ScatteringTransform2D((16, 16), 2; L = 4, transform = spec),
-               ScatteringTransforms.Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient = 4,
+        sts = (ScatteringTransforms.ScatteringCore.ScatteringTransform(32, 3; Q = 1, transform = spec),
+               ScatteringTransforms.ScatteringCore.ScatteringTransform((16, 16), 2; L = 4, transform = spec),
+               ScatteringTransforms.ScatteringCore.ScatteringTransform((8, 8, 8), 2; n_orient = 4,
                                                                       transform = spec),
-               ScatteringTransforms.Monogenic.MonogenicScattering((16, 16), 2; transform = spec))
+               ScatteringTransforms.Monogenic.MonogenicScatteringTransform((16, 16), 2; transform = spec))
         for st in sts
             for x in (st, st.plan)
                 s = sprint(show, x)
                 Test.@test !occursin('\n', s)
                 Test.@test !isempty(s)
             end
-            pw = st isa ScatteringTransforms.Monogenic.MonogenicScattering ? st.mw.pw : st.pw
+            pw = st isa ScatteringTransforms.Monogenic.MonogenicScatteringTransform ? st.mw.pw : st.pw
             Test.@test !occursin('\n', sprint(show, pw))
         end
-        st2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D((16, 16), 2; L = 4,
+        st2 = ScatteringTransforms.ScatteringCore.ScatteringTransform((16, 16), 2; L = 4,
                                                                       transform = spec)
         Test.@test !occursin('\n', sprint(show, ScatteringTransforms.batch_workspace(st2, 2)))
         Test.@test !occursin('\n', sprint(show, ScatteringTransforms.Inverse.ReconstructionWorkspace(st2)))
@@ -171,13 +173,13 @@ end
 Test.@testset "A transform plans its full grid once" begin
     # The cascade's level 1 is the full grid, which the transform's own plan covers.
     FB = SpectralBackends.FFTSpectralBackend()
-    for st in (ScatteringTransforms.Scattering1D.ScatteringTransform1D(64, 3; Q = 2, transform = FB),
-               ScatteringTransforms.Scattering2D.ScatteringTransform2D((32, 32), 3; L = 4, transform = FB),
-               ScatteringTransforms.Scattering3D.ScatteringTransform3D((8, 8, 8), 2; n_orient = 4,
+    for st in (ScatteringTransforms.ScatteringCore.ScatteringTransform(64, 3; Q = 2, transform = FB),
+               ScatteringTransforms.ScatteringCore.ScatteringTransform((32, 32), 3; L = 4, transform = FB),
+               ScatteringTransforms.ScatteringCore.ScatteringTransform((8, 8, 8), 2; n_orient = 4,
                                                                       transform = FB))
         Test.@test st.plan === first(st.pw.plans)
     end
-    mono = ScatteringTransforms.Monogenic.MonogenicScattering((32, 32), 3; transform = FB)
+    mono = ScatteringTransforms.Monogenic.MonogenicScatteringTransform((32, 32), 3; transform = FB)
     Test.@test mono.plan === first(mono.mw.pw.plans)
 end
 
@@ -198,13 +200,13 @@ Test.@testset "Periodized cascade converges to the undecimated one (1D/2D/3D)" b
                      sum(abs, cs.S2[idx] .- ce.S2[idx]) / sum(abs, ce.S2[idx]))
 
     for (mk, x, ov_exact, run!) in (
-            (ov -> ScatteringTransforms.Scattering1D.ScatteringTransform1D(512, 5; Q = 1,
+            (ov -> ScatteringTransforms.ScatteringCore.ScatteringTransform(512, 5; Q = 1,
                        oversampling = ov, transform = FB),
              randn(512), 5, ScatteringTransforms.Scattering1D.scattering_transform!),
-            (ov -> ScatteringTransforms.Scattering2D.ScatteringTransform2D((64, 64), 3; L = 4,
+            (ov -> ScatteringTransforms.ScatteringCore.ScatteringTransform((64, 64), 3; L = 4,
                        oversampling = ov, transform = FB),
              randn(64, 64), 3, ScatteringTransforms.Scattering2D.scattering_transform2d!),
-            (ov -> ScatteringTransforms.Scattering3D.ScatteringTransform3D((16, 16, 16), 2;
+            (ov -> ScatteringTransforms.ScatteringCore.ScatteringTransform((16, 16, 16), 2;
                        n_orient = 4, oversampling = ov, transform = FB),
              randn(16, 16, 16), 2, ScatteringTransforms.Scattering3D.scattering_transform3d!))
         ce = mk(ov_exact)(x)
@@ -220,21 +222,6 @@ Test.@testset "Periodized cascade converges to the undecimated one (1D/2D/3D)" b
     end
 end
 
-# The flat column of a spherical result. Pairs are `(j1, j2 < j1)`, and the flat layout stores one
-# row per unordered pair, so the transposed index is the same slot.
-function _spherical_ref_column(r, J)
-    col = zeros(Float64, ScatteringTransforms.Coefficients.flat_length(J))
-    col[ScatteringTransforms.Coefficients.flat_row_s0()] = r.S0
-    for j in 1:J
-        col[ScatteringTransforms.Coefficients.flat_row_s1(j, J)] = r.S1[j]
-    end
-    for j1 in 1:J, j2 in 1:(j1 - 1)
-        col[ScatteringTransforms.Coefficients.flat_row_s2(j2, j1, J)] =
-            isempty(r.S2) ? 0.0 : r.S2[j1, j2]
-    end
-    return col
-end
-
 Test.@testset "Every surface has a batch entry point, matching its per-field result" begin
     # A batch reuses one plan, one filter bank and one workspace, and returns what transforming each
     # field alone returns.
@@ -242,7 +229,7 @@ Test.@testset "Every surface has a batch entry point, matching its per-field res
     FB = SpectralBackends.FFTSpectralBackend()
 
     # Decimating: the batched cascade carries one divisor per resolution.
-    sub = ScatteringTransforms.Scattering1D.ScatteringTransform1D(256, 4; Q = 1, max_order = 2,
+    sub = ScatteringTransforms.ScatteringCore.ScatteringTransform(256, 4; Q = 1, max_order = 2,
               oversampling = 1, transform = FB)
     Xs = randn(256, 5)
     outs = ScatteringTransforms.scattering_batch(sub, Xs)
@@ -266,7 +253,7 @@ Test.@testset "Every surface has a batch entry point, matching its per-field res
     Xg = randn(length(Θ), length(Φ), B)
     outg = ScatteringTransforms.scattering_batch(ss, Xg)
     for b in 1:B
-        Test.@test view(outg, :, b) ≈ _spherical_ref_column(ss(Xg[:, :, b]), J)
+        Test.@test view(outg, :, b) ≈ ScatteringTransforms.Coefficients.flatten1d(ss(Xg[:, :, b]))
     end
 
     # Analysis is an iterative solve; at `rtol = 1e-12` a batched stack and the fields solved one at a
@@ -276,7 +263,7 @@ Test.@testset "Every surface has a batch entry point, matching its per-field res
     Xc = randn(150, B)
     outc = ScatteringTransforms.scattering_batch(sc, Xc)
     for b in 1:B
-        Test.@test view(outc, :, b) ≈ _spherical_ref_column(sc(Xc[:, b]), J) rtol=1e-6
+        Test.@test view(outc, :, b) ≈ ScatteringTransforms.Coefficients.flatten1d(sc(Xc[:, b])) rtol=1e-6
     end
 
     # A task gets its own workspace and its own copy of the plan's analysis scratch. The subsampled

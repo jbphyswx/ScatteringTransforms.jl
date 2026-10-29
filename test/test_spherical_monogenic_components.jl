@@ -3,17 +3,24 @@
 # single real harmonic Y_{ℓ0,0}, the band-pass and Riesz-vector fields have exact analytic forms.
 using NUFSHT: NUFSHT
 
+function _build_spin_pair(θ, φ, lmax, nufft)
+    p0 = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0; nufft)
+    p1 = NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 1; nufft)
+    foreach(NUFSHT.close!, (p0, p1))
+    return nothing
+end
+
 Test.@testset "Spherical monogenic components (spin-1 orientation/phase on S²)" begin
     lmax, J, M = 16, 3, 900
     gr = (sqrt(5) - 1) / 2                     # deterministic quasi-uniform Fibonacci-sphere points
     θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
     φ = [2π * mod(k * gr, 1) for k in 1:M]
-    st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J)
+    st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J; rtol = 1e-10)
 
     # Choose a degree ℓ0 and the scale j whose band-pass weight b_j(ℓ0) is largest.
     ℓ0 = 5
     sig = ScatteringTransforms.SphericalCore.dog_sigma2(lmax, J, Float64)
-    bvals = [ScatteringTransforms.SphericalCore.band_multiplier(sig[j + 1], sig[j])(ℓ0) for j in 1:J]
+    bvals = [ScatteringTransforms.SphericalCore.band_multiplier(sig[j], sig[j + 1])(ℓ0) for j in 1:J]
     j = argmax(abs.(bvals))
     bl = bvals[j]
 
@@ -26,39 +33,21 @@ Test.@testset "Spherical monogenic components (spin-1 orientation/phase on S²)"
     ref = Complex{Float64}[bl * NUFSHT.sYlm(1, ℓ0, 0, θ[k], φ[k]) for k in 1:M]
     Test.@test maximum(abs.(URc .- ref)) / maximum(abs.(ref)) < 1e-6
 
-    Test.@testset "the spin plans are built with the transform, not per call" begin
+    Test.@testset "spin plans are retained and task copies own their scratch" begin
         SC = ScatteringTransforms.SphericalCore
-        # Only the monogenic constructor builds them.
         Test.@test SC.plan_spin(st.plan) !== nothing
-        Test.@test SC.plan_spin(ScatteringTransforms.spherical_scattering(θ, φ, lmax, J).plan) ===
-                   nothing
-
-        # Bytes against the same decomposition on a plan that carries no spin pair: the difference
-        # is at least one spin-plan build.
-        nospin = SC.nusht_spherical_plan(θ, φ, lmax, Float64; spin = false)
-        Test.@test SC.plan_spin(nospin) === nothing
-        st_nospin = SC.SphericalMonogenicScattering(lmax, J, st.max_order, nospin, st.sigma2)
+        scalar = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J)
+        Test.@test SC.plan_spin(scalar.plan) === nothing
+        ScatteringTransforms.close_transform!(scalar)
         components(s, f, jj) = ScatteringTransforms.spherical_monogenic_components(s, f, jj)
-        components(st, field, j)                                              # warm up both paths
-        components(st_nospin, field, j)
         cached = @allocated components(st, field, j)
-        uncached = @allocated components(st_nospin, field, j)
-        NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0)                      # warm up
-        build_bytes = @allocated NUFSHT.make_spin_plan(ComplexF64, θ, φ, lmax, 0)
-        Test.@test cached < uncached
-        Test.@test uncached - cached > build_bytes
-        Test.@test components(st_nospin, field, j).amplitude ≈ components(st, field, j).amplitude
-
-        # A task's own copy carries its own pair: the spin plans hold the buffers their synthesis
-        # writes through.
-        tl = ScatteringTransforms.Plans.task_local_plan(st.plan)
-        Test.@test SC.plan_spin(tl) !== nothing
-        Test.@test SC.plan_spin(tl) !== SC.plan_spin(st.plan)
-
-        # The spin pair runs on the scalar plan's NUFFT library, in a task's copy and a widened plan too.
+        _build_spin_pair(θ, φ, lmax, st.plan.nufft)
+        build_bytes = @allocated _build_spin_pair(θ, φ, lmax, st.plan.nufft)
+        Test.@test cached < build_bytes
         for lib in (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
             sl = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J; nufft = lib)
             copies = (ScatteringTransforms.Plans.task_local_plan(sl.plan), SC.batch_plan(sl.plan, 2))
+            Test.@test SC.plan_spin(first(copies)) !== SC.plan_spin(sl.plan)
             for p in (sl.plan, copies...)
                 Test.@test p.nufft === lib
                 Test.@test FTB._backend(NUFSHT._nufft2(p.plan).plan) === lib
@@ -68,28 +57,38 @@ Test.@testset "Spherical monogenic components (spin-1 orientation/phase on S²)"
             ScatteringTransforms.close_transform!(sl)
         end
     end
+    ScatteringTransforms.close_transform!(st)
 end
 
 # The same closed forms on the direct SH backend, where the spin-1 Riesz field is the surface gradient
 # of g; `sYlm` is the analytic reference.
-Test.@testset "Spherical monogenic components: dependency-free direct SH backend" begin
+Test.@testset "Spherical monogenic components on direct and structured plans" begin
     lmax, J, M = 16, 3, 1200
     gr = (sqrt(5) - 1) / 2
     θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
     φ = [2π * mod(k * gr, 1) for k in 1:M]
     SC = ScatteringTransforms.SphericalCore
-    st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J; transform = SpectralBackends.DirectSumSpectralBackend())
-    Test.@test st.plan isa SC.DirectSHTSphericalPlan
+    Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)
+    θg, φg = [t for t in Θ, _ in Φ], [f for _ in Θ, f in Φ]
+    direct = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J;
+                                                                transform = SpectralBackends.DirectSumSpectralBackend())
+    grid_direct = ScatteringTransforms.structured_spherical_monogenic_scattering(lmax, J;
+                                                                                 transform = SpectralBackends.DirectSumSpectralBackend())
+    grid_fast = ScatteringTransforms.structured_spherical_monogenic_scattering(lmax, J;
+                                                                               transform = SpectralBackends.FSHTSpectralBackend())
     ℓ0 = 5
     sig = SC.dog_sigma2(lmax, J, Float64)
-    bvals = [SC.band_multiplier(sig[j + 1], sig[j])(ℓ0) for j in 1:J]
+    bvals = [SC.band_multiplier(sig[j], sig[j + 1])(ℓ0) for j in 1:J]
     j = argmax(abs.(bvals)); bl = bvals[j]
-    field = Float64[real(NUFSHT.sYlm(0, ℓ0, 0, θ[k], φ[k])) for k in 1:M]     # band-limited (ℓ = ℓ0)
-    comp = ScatteringTransforms.spherical_monogenic_components(st, field, j)
-    Test.@test comp.bandpass ≈ bl .* field rtol = 1e-5
-    URc = comp.riesz[1] .+ im .* comp.riesz[2]
-    ref = Complex{Float64}[bl * NUFSHT.sYlm(1, ℓ0, 0, θ[k], φ[k]) for k in 1:M]
-    Test.@test maximum(abs.(URc .- ref)) / maximum(abs.(ref)) < 1e-5
+    for (st, θp, φp) in ((direct, θ, φ), (grid_direct, θg, φg), (grid_fast, θg, φg))
+        field = real.(NUFSHT.sYlm.(0, ℓ0, 0, θp, φp))
+        comp = ScatteringTransforms.spherical_monogenic_components(st, field, j)
+        Test.@test comp.bandpass ≈ bl .* field rtol = 1e-5
+        URc = comp.riesz[1] .+ im .* comp.riesz[2]
+        ref = bl .* NUFSHT.sYlm.(1, ℓ0, 0, θp, φp)
+        Test.@test maximum(abs.(URc .- ref)) / maximum(abs.(ref)) < 1e-5
+        ScatteringTransforms.close_transform!(st)
+    end
 end
 
 Test.@testset "Riesz energy |∇_S g|² equals the finite-difference gradient on every backend" begin
@@ -108,9 +107,9 @@ Test.@testset "Riesz energy |∇_S g|² equals the finite-difference gradient on
     φs = [2π * mod(k * (sqrt(5) - 1) / 2, 1) for k in 1:M]
     Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)
     θg, φg = [t for t in Θ, _ in Φ], [f for _ in Θ, f in Φ]
-    cases = (("direct, scattered", SC.make_spherical_plan(SBk.DirectSumSpectralBackend(), θs, φs, lmax,
+    cases = (("direct, scattered", SC.make_spherical_plan(SC.SphericalScatteringTransform, SBk.DirectSumSpectralBackend(), θs, φs, lmax,
                                                           Float64; rtol = 1e-12), θs, φs),
-             ("NUFSHT, scattered", SC.make_spherical_plan(SBk.NUFSHTSpectralBackend(), θs, φs, lmax,
+             ("NUFSHT, scattered", SC.make_spherical_plan(SC.SphericalScatteringTransform, SBk.NUFSHTSpectralBackend(), θs, φs, lmax,
                                                           Float64; rtol = 1e-9), θs, φs),
              ("direct, structured", SC.make_structured_plan(SBk.DirectSumSpectralBackend(), lmax,
                                                             Float64; rtol = 1e-12), θg, φg),
@@ -133,7 +132,8 @@ Test.@testset "Riesz energy |∇_S g|² equals the finite-difference gradient on
     st = ScatteringTransforms.spherical_monogenic_scattering(θs, φs, lmax, J; rtol = 1e-9)
     S1 = st(g.(θs, φs)).S1
     θq, φq, wq = SC.gauss_legendre_grid(SC.grid_band(st.grid), Float64)
-    stq = ScatteringTransforms.spherical_monogenic_scattering(θq, φq, lmax, J; weights = wq, solve = false)
+    stq = ScatteringTransforms.spherical_monogenic_scattering(θq, φq, lmax, J; weights = wq,
+                                                             analysis = ScatteringTransforms.Plans.WeightedAdjoint())
     for j in 1:J
         amp = ScatteringTransforms.spherical_monogenic_components(stq, g.(θq, φq), j).amplitude
         Test.@test S1[j] ≈ sum(wq .* amp) rtol = 1e-6
@@ -151,15 +151,9 @@ Test.@testset "Riesz components equal the surface gradient (finite-difference gr
     θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
     φ = [2π * mod(k * gr, 1) for k in 1:M]
 
-    # A real spherical harmonic in the plan's own convention, from the undifferentiated Legendre
-    # recurrence.
-    tab = SC._LegendreTable(Float64, lmax)
     function realY(ℓ, m, t, f)
-        P = Matrix{Float64}(undef, lmax + 1, lmax + 1)
-        SC._assoc_legendre!(P, tab, cos(t), sin(t))
-        am = abs(m)
-        Pv = P[ℓ + 1, am + 1]
-        return m == 0 ? Pv : (m > 0 ? sqrt(2) * Pv * cos(m * f) : sqrt(2) * Pv * sin(am * f))
+        Y = NUFSHT.sYlm(0, ℓ, abs(m), t, f)
+        return m == 0 ? sqrt(4π) * real(Y) : sqrt(8π) * (m > 0 ? real(Y) : imag(Y))
     end
 
     st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J;
@@ -167,7 +161,7 @@ Test.@testset "Riesz components equal the surface gradient (finite-difference gr
     sig = SC.dog_sigma2(lmax, J, Float64)
     h = 1.0e-6
     for (ℓ0, m) in ((5, 0), (5, 2), (6, -3))
-        bvals = [SC.band_multiplier(sig[j + 1], sig[j])(ℓ0) for j in 1:J]
+        bvals = [SC.band_multiplier(sig[j], sig[j + 1])(ℓ0) for j in 1:J]
         j = argmax(abs.(bvals))
         bl = bvals[j]
         s = sqrt(ℓ0 * (ℓ0 + 1))

@@ -28,7 +28,7 @@ using Test: Test
     Test.@testset "Autodiff through scattering(st,x): Enzyme gradient matches finite differences" begin
         Random.seed!(1)
         N, J = 32, 3
-        st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2,
+        st = ScatteringTransforms.ScatteringCore.ScatteringTransform(N, J; Q=1, max_order=2,
                                                         transform=SpectralBackends.DirectSumSpectralBackend())
         xt = randn(N)
         target = ScatteringTransforms.ScatteringCore.scattering(st, xt)
@@ -56,7 +56,7 @@ using Test: Test
         Random.seed!(1)
         N, J = 48, 4
         iters = 400
-        st = ScatteringTransforms.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2,
+        st = ScatteringTransforms.ScatteringCore.ScatteringTransform(N, J; Q=1, max_order=2,
                                                         transform=SpectralBackends.DirectSumSpectralBackend())
         xtarget = cumsum(randn(N)); xtarget .-= sum(xtarget) / N
         res = ScatteringTransforms.synthesize(st, xtarget;

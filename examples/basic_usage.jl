@@ -24,7 +24,7 @@ println("\n1. 1D averaged coefficients  S0=⟨x⟩, S1[λ]=⟨|x⋆ψ_λ|⟩, S2
 N = 1024
 t = range(0, 2π, length = N)
 x = sin.(10 .* t) .+ 0.5 .* sin.(50 .* t) .+ 0.1 .* randn(N)
-st = ST.Scattering1D.ScatteringTransform1D(N, 6; Q = 1, max_order = 2)   # AutoSpectralBackend → FFTW (loaded above)
+st = ST.ScatteringCore.ScatteringTransform(N, 6; Q = 1, max_order = 2)   # AutoSpectralBackend → FFTW (loaded above)
 c = st(x)
 println("   S0 = ", round(ST.Coefficients.zeroth_order(c), digits = 4),
         " | S1: ", length(ST.Coefficients.first_order(c)), " coeffs | S2: ", size(ST.Coefficients.second_order(c)))
@@ -62,7 +62,7 @@ println("\n5. 2D scattering + reduced sparsity/shape")
 M = 128
 xs = range(0, 8π, length = M)'
 oriented = repeat(sin.(xs), M, 1)                  # horizontal stripes → anisotropic
-st2 = ST.Scattering2D.ScatteringTransform2D((M, M), 3; L = 8, max_order = 2)
+st2 = ST.ScatteringCore.ScatteringTransform((M, M), 3; L = 8, max_order = 2)
 c2 = st2(oriented)
 red = ST.Scattering2D.compute_shape_sparsity(ST.Coefficients.first_order(c2), ST.Coefficients.second_order(c2), st2.filter_bank.meta)
 println("   max sparsity s21 = ", round(maximum(red.sparsity), digits = 4),
@@ -72,14 +72,14 @@ println("   max sparsity s21 = ", round(maximum(red.sparsity), digits = 4),
 # 6. 3D volumetric scattering
 # ---------------------------------------------------------------------------
 println("\n6. 3D volumetric scattering")
-st3 = ST.Scattering3D.ScatteringTransform3D((16, 16, 16), 2; n_orient = 6, max_order = 2)
+st3 = ST.ScatteringCore.ScatteringTransform((16, 16, 16), 2; n_orient = 6, max_order = 2)
 c3 = st3(randn(16, 16, 16))
 println("   3D S1: ", length(ST.Coefficients.first_order(c3)), " coeffs (J × n_orient)")
 
 # ---------------------------------------------------------------------------
 # 7. Element types: Float32 end-to-end
 # ---------------------------------------------------------------------------
-stf = ST.Scattering1D.ScatteringTransform1D(Float32, N, 6; Q = 1, max_order = 2)
+stf = ST.ScatteringCore.ScatteringTransform(Float32, N, 6; Q = 1, max_order = 2)
 cf = stf(Float32.(x))
 println("\n7. Float32 in → ", eltype(ST.Coefficients.first_order(cf)), " out")
 

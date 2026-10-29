@@ -1,78 +1,86 @@
 module ScatteringTransformsDistributedExt
 
-# `scattering_batch` on `DistributedBackend`: each worker rebuilds the transform from
-# `transform_spec(st)`, since spectral plans are not serializable, transforms its column chunk with
-# `local_backend(b)`, and the chunks are concatenated in order. Workers need
-# `@everywhere using ScatteringTransforms`.
-
 using Distributed: Distributed
 using ComputationalBackends: ComputationalBackends as CB
 using FlowTransformBindings: FlowTransformBindings as FTB
 using ScatteringTransforms: ScatteringTransforms as ST
 
-# Partition 1:n into ≤ k contiguous column ranges.
-function _column_chunks(n::Int, k::Int)
-    k = max(1, min(k, n))
-    return [(div((c - 1) * n, k) + 1):(div(c * n, k)) for c in 1:k]
+ST.Execution.available(::CB.AbstractDistributedBackend) = true
+
+struct WorkerTransform{H} <: ST.ScatteringCore.AbstractWorker
+    pid::Int
+    handle::H
 end
 
-# The work `pmap` sends to a worker: a named function of plain data. It must not close over
-# `_distributed_batch`'s scope, where `st` holds native plan pointers that do not survive
-# serialisation; closure conversion can capture more of a scope than the body uses. The rebuilt
-# transform is closed on the way out, freeing its library plans.
-function _chunk(spec, inner, slicer, X, cols)
+function _install_transform(spec)
     st = ST.rebuild_transform(spec)
-    try
-        return ST.scattering_batch(st, slicer(X, cols); execution = inner)
-    finally
-        ST.close_transform!(st)
+    return Distributed.RemoteChannel(Distributed.myid()) do
+        channel = Channel{typeof(st)}(1)
+        put!(channel, st)
+        channel
     end
 end
 
-# On a worker the processes carry the parallelism, so FastTransforms runs on one OpenMP thread there.
-_remote_chunk(spec, inner, slicer, X, cols) =
-    Base.ScopedValues.with(() -> _chunk(spec, inner, slicer, X, cols),
-                           FTB.FASTTRANSFORMS_THREADS => 1)
+function _remote_batch(handle, inner, X)
+    st = take!(handle)
+    try
+        return Base.ScopedValues.with(FTB.FASTTRANSFORMS_THREADS => 1) do
+            ST.scattering_batch(st, X; execution = inner)
+        end
+    finally
+        put!(handle, st)
+    end
+end
 
-# One chunk per worker: `_chunk` rebuilds the transform for every chunk it receives.
-function _distributed_batch(b::CB.AbstractDistributedBackend, st, X, slicer)
-    spec = ST.transform_spec(st)
-    inner = CB.local_backend(b)
+function _release_transform(handle)
+    ST.close_transform!(take!(handle))
+    close(handle)
+    return nothing
+end
+
+function ST.close_worker!(worker::WorkerTransform)
+    worker.pid in Distributed.procs() || return nothing
+    Distributed.remotecall_fetch(_release_transform, worker.pid, worker.handle)
+    return nothing
+end
+
+function _worker_for!(st, pid)
+    workers = st.workspaces.workers
+    index = findfirst(w -> w isa WorkerTransform && w.pid == pid, workers)
+    index === nothing || return workers[index]
+    handle = Distributed.remotecall_fetch(_install_transform, pid, ST.transform_spec(st))
+    worker = WorkerTransform(pid, handle)
+    push!(workers, worker)
+    return worker
+end
+
+function _send_columns!(out, worker::WorkerTransform, inner, block, cols)
+    part = Distributed.remotecall_fetch(_remote_batch, worker.pid, worker.handle, inner, block)
+    copyto!(view(out, :, cols), part)
+    return nothing
+end
+
+function _distributed_batch(b::CB.AbstractDistributedBackend, st, X)
     ncols = size(X)[end]
-    chunks = _column_chunks(ncols, Distributed.nworkers())
-    # With no separate worker processes the chunks run in this process, without serialisation.
-    parts = Distributed.nworkers() == 1 ?
-        [_chunk(spec, inner, slicer, X, cols) for cols in chunks] :
-        Distributed.pmap(cols -> _remote_chunk(spec, inner, slicer, X, cols), chunks)
-    flen = size(first(parts), 1)
-    out = Matrix{eltype(first(parts))}(undef, flen, ncols)
-    @inbounds for (cols, part) in zip(chunks, parts)
-        copyto!(view(out, :, cols), part)
+    T = ST._flat_eltype(ST._coefficient_eltype(st), X)
+    out = Matrix{T}(undef, ST.flat_rows(st), ncols)
+    ncols == 0 && return out
+    pids = Distributed.workers()
+    n = min(ncols, length(pids))
+    inner = CB.local_backend(b)
+    lock(st.workspaces.lock) do
+        @sync for t in 1:n
+            cols = (div((t - 1) * ncols, n) + 1):div(t * ncols, n)
+            worker = _worker_for!(st, pids[t])
+            block = copy(selectdim(X, ndims(X), cols))
+            @async _send_columns!(out, worker, inner, block, cols)
+        end
     end
     return out
 end
 
-ST._scattering_batch(b::CB.AbstractDistributedBackend, st::ST.Scattering1D.ScatteringTransform1D, X::AbstractMatrix) =
-    _distributed_batch(b, st, X, (A, cols) -> view(A, :, cols))
-
-ST._scattering_batch(b::CB.AbstractDistributedBackend, st::ST.Scattering2D.ScatteringTransform2D, X::AbstractArray{<:Any,3}) =
-    _distributed_batch(b, st, X, (A, cols) -> view(A, :, :, cols))
-
-ST._scattering_batch(b::CB.AbstractDistributedBackend, st::ST.Scattering3D.ScatteringTransform3D, X::AbstractArray{<:Any,4}) =
-    _distributed_batch(b, st, X, (A, cols) -> view(A, :, :, :, cols))
-
-# The nonuniform and spherical surfaces rebuild from a spec that carries their sample locations, so
-# they distribute the same way; only the batch axis differs.
 ST._scattering_batch(b::CB.AbstractDistributedBackend,
-                     st::ST.ScatteredPlanar.ScatteredPlanarScattering, X::AbstractMatrix) =
-    _distributed_batch(b, st, X, (A, cols) -> view(A, :, cols))
-
-ST._scattering_batch(b::CB.AbstractDistributedBackend, st::ST.SphericalCore.SphericalScattering,
-                     X::AbstractArray) =
-    _distributed_batch(b, st, X, (A, cols) -> selectdim(A, ndims(A), cols))
-
-ST._scattering_batch(b::CB.AbstractDistributedBackend,
-                     st::ST.SphericalCore.SphericalMonogenicScattering, X::AbstractArray) =
-    _distributed_batch(b, st, X, (A, cols) -> selectdim(A, ndims(A), cols))
+                     st::ST.ScatteringCore.AbstractScatteringTransform, X::AbstractArray) =
+    _distributed_batch(b, st, X)
 
 end # module ScatteringTransformsDistributedExt

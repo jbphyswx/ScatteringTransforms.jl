@@ -1,23 +1,24 @@
 # Nonuniform / scattered planar scattering via NUFFT. On a uniform grid the analysis reduces to the
-# fft, so scattered-planar scattering reproduces the gridded ScatteringTransform2D exactly (to NUFFT
+# fft, so scattered-planar scattering reproduces the gridded ScatteringCore.ScatteringTransform{2} exactly (to NUFFT
 # tolerance); on irregular points the least-squares solve recovers a band-limited field.
 using Random: Random
 
 Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
+    P = ScatteringTransforms.Plans
     Ny, Nx, J, L = 24, 24, 3, 4
 
     # Uniform-grid points (axis-1 index fastest ⇒ matches column-major vec of the (Ny,Nx) image).
     n1 = vec([Float64(i) for i in 0:Ny-1, j in 0:Nx-1])
     n2 = vec([Float64(j) for i in 0:Ny-1, j in 0:Nx-1])
     f = randn(Ny, Nx)
-    grid = ScatteringTransforms.Scattering2D.ScatteringTransform2D((Ny, Nx), J;
+    grid = ScatteringTransforms.ScatteringCore.ScatteringTransform((Ny, Nx), J;
         L=L, max_order=2, transform=SpectralBackends.FFTSpectralBackend())
     ref = ScatteringTransforms.Coefficients.flatten2d(grid(f))
 
     Test.@testset "uniform-grid parity reproduces the gridded FFT transform" begin
-        for solve in (false, true)
+        for analysis in (P.WeightedAdjoint(), P.LeastSquares())
             sca = ScatteringTransforms.scattered_planar_scattering(n1, n2, (Ny, Nx), J;
-                L=L, max_order=2, period=(Ny, Nx), solve=solve)
+                L=L, max_order=2, period=(Ny, Nx), analysis=analysis)
             c = sca(vec(f))
             Test.@test ScatteringTransforms.Coefficients.flatten2d(c) ≈ ref rtol=1e-6
         end
@@ -53,7 +54,7 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
             # Construction warns that the solve is underdetermined.
             st_g = Test.@test_logs (:warn, r"underdetermined") match_mode=:any (
                 ScatteringTransforms.scattered_planar_scattering(T, xg, yg, ms_g, 3;
-                    L = 4, max_order = 2, period = (T(ms_g[1]), T(ms_g[2])), solve = true))
+                    L = 4, max_order = 2, period = (T(ms_g[1]), T(ms_g[2])), analysis = P.LeastSquares()))
             c = st_g(fg)
             Test.@test all(isfinite, ScatteringTransforms.Coefficients.first_order(c))
             Test.@test all(isfinite, ScatteringTransforms.Coefficients.second_order(c))
@@ -86,8 +87,8 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         for spec in (SpectralBackends.DirectSumSpectralBackend(), FTB.FINUFFTBackend(),
                      FTB.NonuniformFFTsBackend()), (x, y) in ((x1, y1), (x2, y2))
             st = ScatteringTransforms.scattered_planar_scattering(x, y, msw, Jw; period = Pw, L = Lw,
-                transform = spec, solve = true, maxiter = 2000, rtol = 1e-12, eps = 1e-12,
-                nufft_nthreads = 1)
+                transform = spec, analysis = P.LeastSquares(), maxiter = 2000, rtol = 1e-12, tol = 1e-12,
+                nthreads = 1)
             c = st(wave.(x, y))
             Test.@test C.first_order(c) ≈ S1wave rtol = 1e-6
             Test.@test maximum(abs, C.second_order(c)) < 1e-6 * maximum(S1wave)
@@ -103,14 +104,16 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         Random.seed!(43)
         Mw = 900
         x, y = Pw[1] .* rand(Mw), Pw[2] .* rand(Mw)
-        nodes = FGG.UnstructuredGrid(geo, (x, y), ones(Mw); periodic = (true, true), period = Pw)
+        nodes = FGG.UnstructuredGrid(geo, (x, y), ones(Mw);
+                                     topology = (FGG.Periodic(), FGG.Periodic()), period = Pw)
         st = ScatteringTransforms.scattered_planar_scattering(nodes, msw, Jw; L = Lw, transform = DS,
-                                                              solve = true, maxiter = 2000, rtol = 1e-12)
+                                                              analysis = P.LeastSquares(), maxiter = 2000, rtol = 1e-12)
         Test.@test C.first_order(st(wave.(x, y))) ≈ S1wave rtol = 1e-6
 
         # Its cell measure is the default quadrature of the mean.
         area = 0.5 .+ rand(Mw)
-        weighted = FGG.UnstructuredGrid(geo, (x, y), area; periodic = (true, true), period = Pw)
+        weighted = FGG.UnstructuredGrid(geo, (x, y), area;
+                                        topology = (FGG.Periodic(), FGG.Periodic()), period = Pw)
         g = randn(Mw)
         stw = ScatteringTransforms.scattered_planar_scattering(weighted, msw, Jw; L = Lw, transform = DS,
                                                                max_order = 1)
@@ -122,7 +125,8 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         xa = range(x0; step = Pw[1] / msw[1], length = msw[1])
         ya = range(y0; step = Pw[2] / msw[2], length = msw[2])
         lattice = FGG.StructuredGrid(geo, xa, ya)
-        stl = ScatteringTransforms.scattered_planar_scattering(lattice, msw, Jw; L = Lw, transform = DS)
+        stl = ScatteringTransforms.scattered_planar_scattering(lattice, msw, Jw;
+                                                              period = Pw, L = Lw, transform = DS)
         fl = [wave(xi - x0, yj - y0) for xi in xa, yj in ya]
         Test.@test C.first_order(stl(vec(fl))) ≈ S1wave rtol = 1e-10
     end
@@ -135,7 +139,7 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         g(x, y) = 1.0 + 0.7cos(x) + 0.5sin(2y) - 0.3cos(x) * sin(y)
         b = [g(px[k], py[k]) for k in 1:M]
         sc = ScatteringTransforms.scattered_planar_scattering(px, py, (Ny, Nx), J;
-            L=L, max_order=2, period=(2π, 2π), solve=true)
+            L=L, max_order=2, period=(2π, 2π), analysis=P.LeastSquares())
         r = sc(b)
         # `S0` is the mean of the fitted field, `g`'s own mean.
         Test.@test ScatteringTransforms.Coefficients.zeroth_order(r) ≈ 1.0 rtol=1e-6
@@ -203,8 +207,8 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         M2, B = 300, 3
         xs, ys = 2π .* rand(M2), 2π .* rand(M2)
         Xb = randn(M2, 5)
-        for solve in (false, true)
-            opts = (; period = 2π, L = 4, solve = solve, maxiter = 1000, rtol = 1e-12,
+        for analysis in (P.WeightedAdjoint(), P.LeastSquares())
+            opts = (; period = 2π, L = 4, analysis, maxiter = 1000, rtol = 1e-12,
                     transform = SpectralBackends.DirectSumSpectralBackend())
             single = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (12, 12), 3; opts...)
             wide = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (12, 12), 3;
@@ -224,9 +228,9 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         for (spec, ntrans) in ((SpectralBackends.DirectSumSpectralBackend(), 1),
                                (FTB.FINUFFTBackend(), 1), (FTB.FINUFFTBackend(), 2))
             st = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (12, 12), 3;
-                period = 1.0, L = 4, transform = spec, ntrans = ntrans, nufft_nthreads = 1)
+                period = 1.0, L = 4, transform = spec, ntrans = ntrans, nthreads = 1, tol = 1e-14)
             single = ScatteringTransforms.scattered_planar_scattering(xs, ys, (12, 12), 3;
-                period = 1.0, L = 4, transform = spec, nufft_nthreads = 1)
+                period = 1.0, L = 4, transform = spec, nthreads = 1, tol = 1e-14)
             for backend in (ComputationalBackends.SerialBackend(), ComputationalBackends.ThreadedBackend())
                 out = ScatteringTransforms.scattering_batch(st, Z; execution = backend)
                 Test.@test eltype(out) == ComplexF64
@@ -264,13 +268,13 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         Test.@test chunked ≈ serial rtol=1e-12
     end
 
-    Test.@testset "an explicit nufft_nthreads survives into the per-task plans" begin
+    Test.@testset "an explicit nthreads survives into the per-task plans" begin
         # A threaded backend applies task-local copies. Unset (`0`), a per-task copy takes one thread.
         M2 = 500
         xs, ys = rand(M2), rand(M2)
         build(n) = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
             period = 1.0, L = 4, max_order = 2, transform = FTB.FINUFFTBackend(),
-            nufft_nthreads = n)
+            nthreads = n)
         for n in (1, 3)
             st = build(n)
             Test.@test st.plan.nthreads == n
@@ -310,8 +314,8 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
                      FTB.NonuniformFFTsBackend())
             # Converged settings, compared against the exact coefficients.
             plan = ScatteringTransforms.Plans.make_scattered_plan(spec, xs, ys, ms_r, Float64;
-                period = (2π, 2π), solve = true, maxiter = 2000, rtol = 1.0e-12,
-                nufft_nthreads = 1)
+                period = (2π, 2π), analysis = P.LeastSquares(), maxiter = 2000, rtol = 1.0e-12,
+                nthreads = 1)
             F = zeros(ComplexF64, ms_r)
             ScatteringTransforms.Plans.forward_transform!(F, plan, fs)
             Test.@test maximum(abs, F .- F0) < 1.0e-6 * maximum(abs, F0)
@@ -327,8 +331,8 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
             gy = [2π * (j - 1) / ms_u[2] for i in 1:ms_u[1], j in 1:ms_u[2]]
             fu = randn(ms_u)
             plan = ScatteringTransforms.Plans.make_scattered_plan(spec, vec(gx), vec(gy), ms_u, Float64;
-                period = (2π, 2π), solve = true, maxiter = 2000, rtol = 1.0e-12, eps = 1.0e-12,
-                nufft_nthreads = 1)
+                period = (2π, 2π), analysis = P.LeastSquares(), maxiter = 2000, rtol = 1.0e-12, tol = 1.0e-12,
+                nthreads = 1)
             F = zeros(ComplexF64, ms_u)
             ScatteringTransforms.Plans.forward_transform!(F, plan, vec(fu))
             Test.@test F ≈ FFTW.fft(fu) rtol = 1.0e-9
@@ -348,14 +352,14 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
                      FTB.FINUFFTBackend(),
                      FTB.NonuniformFFTsBackend())
             plan = ScatteringTransforms.Plans.make_scattered_plan(spec, xs, ys, (16, 16), Float64;
-                period = (2π, 2π), solve = true)
+                period = (2π, 2π), analysis = P.LeastSquares())
             X = zeros(ComplexF64, (16, 16))
             ScatteringTransforms.Plans.forward_transform!(X, plan, b)
             Test.@test b == before
         end
     end
 
-    Test.@testset "solve=true under the threaded backend and batched over ntrans" begin
+    Test.@testset "Least-squares analysis under the threaded backend and batched over ntrans" begin
         # Both fast backends; `batch_width` is asserted on each batched plan.
         Random.seed!(23)
         M2, B2 = 800, 4
@@ -367,14 +371,14 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         for spec in (FTB.FINUFFTBackend(),
                      FTB.NonuniformFFTsBackend())
             single = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
-                L = 4, max_order = 2, period = (2π, 2π), solve = true, transform = spec, conv...)
+                L = 4, max_order = 2, period = (2π, 2π), analysis = P.LeastSquares(), transform = spec, conv...)
             serial = ScatteringTransforms.scattering_batch(
                 single, X; execution = ComputationalBackends.SerialBackend())
             Test.@test ScatteringTransforms.scattering_batch(
                 single, X; execution = ComputationalBackends.ThreadedBackend()) ≈ serial rtol = 1e-8
 
             batched = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (16, 16), 3;
-                L = 4, max_order = 2, period = (2π, 2π), solve = true, transform = spec,
+                L = 4, max_order = 2, period = (2π, 2π), analysis = P.LeastSquares(), transform = spec,
                 ntrans = B2, conv...)
             Test.@test ScatteringTransforms.Plans.batch_width(batched.plan) == B2
             Test.@test ScatteringTransforms.scattering_batch(
@@ -399,14 +403,14 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
                          FTB.NonuniformFFTsBackend())
             st = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
                 L = 4, max_order = 2, period = (2π, 2π), transform = spectral,
-                solve = true, maxiter = 37, rtol = 1.0e-7, eps = 1.0e-8, damp = 0.25)
+                analysis = P.LeastSquares(), maxiter = 37, rtol = 1.0e-7, tol = 1.0e-8, damp = 0.25)
             rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
             a0 = ScatteringTransforms.Plans.plan_analysis(st.plan)
             a1 = ScatteringTransforms.Plans.plan_analysis(rb.plan)
-            Test.@test a1.solve == a0.solve == true
+            Test.@test a1.analysis == a0.analysis == P.LeastSquares()
             Test.@test a1.maxiter == 37
             Test.@test a1.rtol == a0.rtol
-            Test.@test a1.eps == a0.eps
+            Test.@test a1.tol == a0.tol
             # Against the value passed: the default is zero.
             Test.@test a1.damp == a0.damp == 0.25
             Test.@test ScatteringTransforms.Coefficients.flatten2d(rb(fs)) ≈
@@ -433,64 +437,45 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
     end
 
     Test.@testset "A plan carries scratch only for the path it takes" begin
-        # `task_local_plan` builds one plan per task, so anything a plan holds and never uses is
-        # multiplied by the thread count. Gated by counting bytes, with `M ≫ prod(ms)` so point-space
-        # scratch dominates.
         Random.seed!(21)
         ms = (32, 32)
-        M2 = 16 * prod(ms)
+        M2, B = 16 * prod(ms), 4
         xs, ys = rand(M2), rand(M2)
-        B = 4
-        pt_real = M2 * B * sizeof(Float64)             # one (M, B) real point array
-        mode_bytes = prod(ms) * B * sizeof(ComplexF64) # one (ms…, B) full mode array
-        for spec in (FTB.NonuniformFFTsBackend(),
-                     FTB.FINUFFTBackend())
-            plan(solve) = ScatteringTransforms.Plans.make_scattered_plan(
-                spec, xs, ys, ms, Float64; period = (1.0, 1.0), solve = solve, eps = 1e-8,
-                ntrans = B, nufft_nthreads = 1)
-            # A non-solving plan holds none of the solver's six vectors, four of them mode-space.
-            Test.@test Base.summarysize(plan(false)) + 4 * mode_bytes <=
-                       Base.summarysize(plan(true))
-            # Past the NUFFT plans underneath, a non-solving plan holds its two coordinate vectors
-            # and mode-space buffers only.
-            p0 = plan(false)
-            own = Base.summarysize(p0) - Base.summarysize(p0.cplan) - Base.summarysize(p0.rplan)
+        pt_real = M2 * B * sizeof(Float64)
+        mode_bytes = prod(ms) * B * sizeof(ComplexF64)
+        for spec in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
+            plan(analysis) = P.make_scattered_plan(spec, xs, ys, ms, Float64;
+                period = 1.0, analysis, tol = 1e-8, ntrans = B, nthreads = 1)
+            adjoint, fit = plan(P.WeightedAdjoint()), plan(P.LeastSquares())
+            Test.@test Base.summarysize(adjoint) + 4 * mode_bytes <= Base.summarysize(fit)
+            own = Base.summarysize(adjoint) - Base.summarysize(adjoint.cplan) - Base.summarysize(adjoint.rplan)
             Test.@test own < 2 * M2 * sizeof(Float64) + mode_bytes
 
-            # The cascade's own arrays reach the transform without a copy, so running one through a
-            # plan adds no buffer. NonuniformFFTs' plan holds a `TimerOutput` that grows the first time
-            # each section is entered, so this is a bound below one point array.
-            p = plan(false)
-            F = zeros(ComplexF64, ms..., B)
-            pc = zeros(ComplexF64, M2, B)
-            base = Base.summarysize(p)
-            ScatteringTransforms.Plans.forward_transform!(F, p, pc)
-            ScatteringTransforms.Plans.inverse_transform!(pc, p, F)
-            Test.@test Base.summarysize(p) - base < pt_real
-            # An array the transform cannot take lands in a buffer built on demand.
-            ScatteringTransforms.Plans.forward_transform!(F, p, zeros(Float32, M2, B))
-            Test.@test Base.summarysize(p) - base >= pt_real
+            F, pc = zeros(ComplexF64, ms..., B), zeros(ComplexF64, M2, B)
+            base = Base.summarysize(adjoint)
+            P.forward_transform!(F, adjoint, pc)
+            P.inverse_transform!(pc, adjoint, F)
+            P.forward_transform!(F, adjoint, zeros(Float64, M2, B))
+            Test.@test Base.summarysize(adjoint) - base < pt_real
+            P.forward_transform!(F, adjoint, zeros(Float32, M2, B))
+            Test.@test Base.summarysize(adjoint) - base >= pt_real
+            buffer = adjoint.rbuf[]
+            P.forward_transform!(F, adjoint, zeros(Float32, M2, B))
+            Test.@test adjoint.rbuf[] === buffer
+            foreach(P.close_plan!, (adjoint, fit))
         end
 
-        # The cascade analyses real fields after its first step; on the real-data backend that path
-        # needs no complex point buffer.
-        nr = ScatteringTransforms.Plans.make_scattered_plan(
-            FTB.NonuniformFFTsBackend(), xs, ys, ms, Float64;
-            period = (1.0, 1.0), solve = false, eps = 1e-8, ntrans = B, nufft_nthreads = 1)
-        Fr = zeros(ComplexF64, ms..., B)
-        base_r = Base.summarysize(nr)
-        ScatteringTransforms.Plans.forward_transform!(Fr, nr, zeros(Float64, M2, B))
-        Test.@test Base.summarysize(nr) - base_r < pt_real
-
-        # A real field solves on the half grid, so the full-grid solver set is built only for a
-        # complex field.
-        nu = ScatteringTransforms.Plans.make_scattered_plan(
-            FTB.NonuniformFFTsBackend(), xs, ys, ms, Float64;
-            period = (1.0, 1.0), solve = true, eps = 1e-8, maxiter = 20, nufft_nthreads = 1)
-        Xm = zeros(ComplexF64, ms)
-        ScatteringTransforms.Plans.forward_transform!(Xm, nu, randn(M2))
-        Test.@test nu.csolve[] === nothing
-        ScatteringTransforms.Plans.forward_transform!(Xm, nu, randn(ComplexF64, M2))
-        Test.@test nu.csolve[] !== nothing
+        fit = P.make_scattered_plan(FTB.NonuniformFFTsBackend(), xs, ys, ms, Float64;
+            period = 1.0, analysis = P.LeastSquares(), tol = 1e-8, maxiter = 20, nthreads = 1)
+        F = zeros(ComplexF64, ms)
+        P.forward_transform!(F, fit, randn(M2))
+        Test.@test fit.csolve[] === nothing
+        complex_input = randn(ComplexF64, M2)
+        P.forward_transform!(F, fit, complex_input)
+        solver = fit.csolve[]
+        Test.@test solver !== nothing
+        P.forward_transform!(F, fit, complex_input)
+        Test.@test fit.csolve[] === solver
+        P.close_plan!(fit)
     end
 end

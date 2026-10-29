@@ -23,6 +23,8 @@ ScatteringTransforms.Plans.inverse_transform!(out, p::LifecyclePlan, x) =
     ScatteringTransforms.Plans.inverse_transform!(out, p.inner, x)
 ScatteringTransforms.Plans.batch_width(p::LifecyclePlan) =
     ScatteringTransforms.Plans.batch_width(p.inner)
+ScatteringTransforms.Plans.plan_analysis(p::LifecyclePlan) =
+    ScatteringTransforms.Plans.plan_analysis(p.inner)
 ScatteringTransforms.Plans.task_local_plan(p::LifecyclePlan) =
     _derived(p, ScatteringTransforms.Plans.task_local_plan(p.inner))
 ScatteringTransforms.Plans.close_plan!(p::LifecyclePlan) =
@@ -36,10 +38,18 @@ ScatteringTransforms.SphericalCore.sphere_coeffs!(C, p::LifecyclePlan, f) =
     ScatteringTransforms.SphericalCore.sphere_coeffs!(C, p.inner, f)
 ScatteringTransforms.SphericalCore.sphere_coeffs_buffer(p::LifecyclePlan) =
     ScatteringTransforms.SphericalCore.sphere_coeffs_buffer(p.inner)
+ScatteringTransforms.SphericalCore.sphere_field_buffer(p::LifecyclePlan) =
+    ScatteringTransforms.SphericalCore.sphere_field_buffer(p.inner)
+ScatteringTransforms.SphericalCore.sphere_npoints(p::LifecyclePlan) =
+    ScatteringTransforms.SphericalCore.sphere_npoints(p.inner)
 ScatteringTransforms.SphericalCore.sphere_apply!(out, p::LifecyclePlan, C, h) =
     ScatteringTransforms.SphericalCore.sphere_apply!(out, p.inner, C, h)
 ScatteringTransforms.SphericalCore.sphere_mean(p::LifecyclePlan, f) =
     ScatteringTransforms.SphericalCore.sphere_mean(p.inner, f)
+ScatteringTransforms.SphericalCore.sphere_means!(out, p::LifecyclePlan, f) =
+    ScatteringTransforms.SphericalCore.sphere_means!(out, p.inner, f)
+ScatteringTransforms.SphericalCore.coeffs_means!(out, p::LifecyclePlan, C) =
+    ScatteringTransforms.SphericalCore.coeffs_means!(out, p.inner, C)
 ScatteringTransforms.SphericalCore.riesz_scratch(p::LifecyclePlan, f) =
     ScatteringTransforms.SphericalCore.riesz_scratch(p.inner, f)
 ScatteringTransforms.SphericalCore.sphere_riesz_energy!(out, p::LifecyclePlan, C, h, scr) =
@@ -53,12 +63,13 @@ ScatteringTransforms.SphericalCore.coeffs_mean(p::LifecyclePlan, C, b::Int = 1) 
 # shared.
 function with_lifecycle(st)
     T = typeof(st)
-    wrap(i) = (fieldname(T, i) in (:plan, :grid) && getfield(st, i) !== nothing) ?
+    wrap(i) = fieldname(T, i) === :workspaces ? ScatteringTransforms.ScatteringCore.Workspaces(T.name.wrapper) :
+              (fieldname(T, i) in (:plan, :grid) && getfield(st, i) !== nothing) ?
               LifecyclePlan(getfield(st, i)) : getfield(st, i)
     return T.name.wrapper(ntuple(wrap, fieldcount(T))...)
 end
 
-Test.@testset "Every plan a batch builds for itself is closed" begin
+Test.@testset "Batch plans are reused and closed with the transform" begin
     CBk = ComputationalBackends
     M, ms, J = 300, (12, 12), 2
     Random.seed!(17)
@@ -73,9 +84,11 @@ Test.@testset "Every plan a batch builds for itself is closed" begin
                  hcat(ScatteringTransforms.scattering_batch(st, X[:, 1:2]),
                       ScatteringTransforms.scattering_batch(st, X[:, 3:4]))
         Test.@test ScatteringTransforms.scattering_batch(stc, X; execution = CBk.ThreadedBackend()) ≈ serial
-        Test.@test stc.plan.built[] >= 1
-        Test.@test stc.plan.closed[] == stc.plan.built[]
-        ScatteringTransforms.close_transform!(st)
+        built = stc.plan.built[]
+        ScatteringTransforms.scattering_batch(stc, X; execution = CBk.ThreadedBackend())
+        Test.@test stc.plan.built[] == built >= 1
+        ScatteringTransforms.close_transform!(stc)
+        Test.@test stc.plan.closed[] == built + 1
     end
 
     lmax, Ms = 6, 200
@@ -91,9 +104,18 @@ Test.@testset "Every plan a batch builds for itself is closed" begin
             for backend in (CBk.SerialBackend(), CBk.ThreadedBackend())
                 Test.@test ScatteringTransforms.scattering_batch(stc, F; execution = backend) ≈ serial rtol = 1e-8
             end
-            Test.@test stc.plan.closed[] == stc.plan.built[]
+            if build === ScatteringTransforms.spherical_scattering
+                retained = length(stc.workspaces.batches)
+                ScatteringTransforms.scattering_batch(stc, view(F, :, 1:2))
+                built = stc.plan.built[]
+                ScatteringTransforms.scattering_batch(stc, view(F, :, 1:2))
+                Test.@test stc.plan.built[] == built
+                Test.@test length(stc.workspaces.batches) == retained
+            end
+            ScatteringTransforms.close_transform!(stc)
+            Test.@test stc.plan.closed[] == stc.plan.built[] + 1
             Test.@test stc.grid.built[] >= 1
-            Test.@test stc.grid.closed[] == stc.grid.built[]
+            Test.@test stc.grid.closed[] == stc.grid.built[] + 1
             ScatteringTransforms.close_transform!(st)
         end
     end

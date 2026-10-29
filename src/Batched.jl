@@ -10,7 +10,6 @@ using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
 using ..Cascade: Cascade
 using ..Coefficients: Coefficients
-using ..PathGraph: PathGraph
 
 export BatchWorkspace, batch_cascade!
 
@@ -51,22 +50,16 @@ function slice_modulus_mean!(::Array{T}, redvec::AbstractVector{T}, rmod::Array{
 end
 
 """
-    BatchWorkspace{T,D}
+    SpectralBatchWorkspace{T,D}
 
-Preallocated state for repeated batched transforms at a fixed batch size `B`: a periodized cascade
-workspace whose arrays all carry a trailing stack axis, the real staging and reduction buffers, and
-the precomputed order-2 groups. Once built, a batched transform does no data-proportional allocation.
+Periodized cascade buffers and per-field reductions for a stack of spectra.
 
-`red` is the spatial-reduction target, shaped `(1…, 1, B)` so `sum!` contracts every axis but the
-batch; that one shape serves every resolution. `invN[l]` is `1/∏(spatial ÷ r)` at level `l`, since
-each mean is over its own decimated grid.
+`red` has shape `(1…, B)`; `invN[l]` normalizes the mean at resolution `l`.
 """
-struct BatchWorkspace{T, D, PW <: Cascade.PeriodizedWorkspace{T, D}, RA, CA,
+struct SpectralBatchWorkspace{T, D, PW <: Cascade.PeriodizedWorkspace{T, D}, RA,
                       MV <: AbstractVector{RA}, RV <: AbstractVector{T},
                       IV <: AbstractVector{T}, G, FB}
     pw::PW
-    xr::RA         # real input staging, (spatial…, B)
-    xf::CA         # signal spectrum at full resolution, preserved across the cascade
     rmod::MV       # per level: modulus staging; empty where that level is never a parent
     red::RA        # (1…, B) reduction target for `sum!`
     redvec::RV     # the same memory viewed as (B,), so the hot loop reshapes nothing
@@ -76,35 +69,68 @@ struct BatchWorkspace{T, D, PW <: Cascade.PeriodizedWorkspace{T, D}, RA, CA,
     bank::FB       # a computed bank refills the shared filter scratch on demand
 end
 
-BatchWorkspace(pw::Cascade.PeriodizedWorkspace{T, D}, xr, xf, rmod, red, redvec, invN,
+SpectralBatchWorkspace(pw::Cascade.PeriodizedWorkspace{T, D}, rmod, red, redvec, invN,
                n::Integer, groups, bank) where {T, D} =
-    BatchWorkspace{T, D, typeof(pw), typeof(xr), typeof(xf), typeof(rmod), typeof(redvec),
+    SpectralBatchWorkspace{T, D, typeof(pw), typeof(red), typeof(rmod), typeof(redvec),
                    typeof(invN), typeof(groups), typeof(bank)}(
-        pw, xr, xf, rmod, red, redvec, invN, Int(n), groups, bank)
+        pw, rmod, red, redvec, invN, Int(n), groups, bank)
 
-Base.show(io::IO, ws::BatchWorkspace{T, D}) where {T, D} =
-    print(io, "BatchWorkspace{", T, ", ", D, "}(B=", length(ws.redvec), ", ", ws.pw, ")")
+Base.show(io::IO, ws::SpectralBatchWorkspace{T, D}) where {T, D} =
+    print(io, "SpectralBatchWorkspace{", T, ", ", D, "}(B=", length(ws.redvec), ", ", ws.pw, ")")
+
+"""
+    BatchWorkspace
+
+A spectral batch workspace with real-input staging and a full-resolution input spectrum.
+"""
+struct BatchWorkspace{S,R,C}
+    spectral::S
+    xr::R
+    xf::C
+end
+
+Base.show(io::IO, ws::BatchWorkspace) = print(io, "BatchWorkspace(", ws.spectral, ")")
 
 # The batched workspace of transform `st` at batch size `B`. `zeros_like(S, dims)` allocates a zeroed
 # buffer and `makeplan(rd)` a plan over the leading axes of an `(rd…, B)` stack, both where the
 # workspace is to live; `shapefilter` gives a filter the trailing singleton that broadcasts it across
 # the stack.
 function build_workspace(st, B::Int, ::Type{T}; zeros_like, makeplan, shapefilter) where {T}
-    spatial = st.dims
-    D = length(spatial)
-    pw = Cascade.build(st.filter_bank, st.groups, spatial, T, st.pw.oversampling;
+    return build_workspace(st.filter_bank, st.groups, st.dims, st.pw.oversampling, B, T;
+                            zeros_like, makeplan, shapefilter)
+end
+
+function build_workspace(fb, groups, spatial::NTuple{D,Int}, oversampling::Int, B::Int, ::Type{T};
+                          zeros_like, makeplan, shapefilter) where {T,D}
+    spectral = build_spectral_workspace(fb, groups, spatial, oversampling, B, T;
+                                        zeros_like, makeplan, shapefilter)
+    return BatchWorkspace(spectral, zeros_like(T, (spatial..., B)), zeros_like(Complex{T}, (spatial..., B)))
+end
+
+function build_spectral_workspace(fb, groups, spatial::NTuple{D,Int}, oversampling::Int, B::Int, ::Type{T};
+                                   zeros_like, makeplan, shapefilter) where {T,D}
+    pw = Cascade.build(fb, groups, spatial, T, oversampling;
                        alloc = rd -> zeros_like(Complex{T}, (rd..., B)), makeplan = makeplan,
                        shapefilter = shapefilter)
-    rdims(l) = ntuple(d -> spatial[d] ÷ pw.resolutions[l][d], D)
+    rdims(l) = ntuple(d -> spatial[d] ÷ pw.resolutions[l][d], Val(D))
     # A level is a parent exactly where the cascade gave it a `Û₁` buffer, and only a parent's
     # modulus is ever read again.
-    rmod = [isempty(pw.spec[l]) ? zeros_like(T, ntuple(_ -> 0, D + 1)) : zeros_like(T, (rdims(l)..., B))
+    rmod = [isempty(pw.spec[l]) ? zeros_like(T, ntuple(_ -> 0, Val(D + 1))) : zeros_like(T, (rdims(l)..., B))
             for l in eachindex(pw.resolutions)]
     invN = [T(1) / prod(rdims(l)) for l in eachindex(pw.resolutions)]
-    red = zeros_like(T, (ntuple(_ -> 1, D)..., B))
-    return BatchWorkspace(pw, zeros_like(T, (spatial..., B)), zeros_like(Complex{T}, (spatial..., B)),
-                          rmod, red, reshape(red, B), invN, FilterBanks.nwavelets(st.filter_bank),
-                          st.groups, st.filter_bank)
+    red = zeros_like(T, (ntuple(_ -> 1, Val(D))..., B))
+    return SpectralBatchWorkspace(pw, rmod, red, reshape(red, B), invN,
+                                  FilterBanks.nwavelets(fb), groups, fb)
+end
+
+task_copy(ws::BatchWorkspace) = BatchWorkspace(task_copy(ws.spectral), similar(ws.xr), similar(ws.xf))
+
+function task_copy(ws::SpectralBatchWorkspace)
+    bank = FilterBanks.task_bank(ws.bank)
+    pw = Cascade.task_copy(ws.pw, bank)
+    red = similar(ws.red)
+    return SpectralBatchWorkspace(pw, map(similar, ws.rmod), red,
+                                  reshape(red, length(ws.redvec)), ws.invN, ws.n, ws.groups, bank)
 end
 
 # The stack into the cascade's complex input buffer `c0`. A real stack crosses to the workspace's
@@ -127,19 +153,22 @@ needs complex columns, for its complex `S0`.
 The batched form of [`Cascade.cascade!`](@ref), with each mean replaced by a per-slice reduction and
 each decimation tuple extended by a `1` for the stack axis.
 """
-function batch_cascade!(out::AbstractMatrix, ws::BatchWorkspace{T, D}, X::AbstractArray) where {T, D}
+function batch_cascade!(out::AbstractMatrix, ws::BatchWorkspace, X::AbstractArray)
+    c0 = ws.spectral.pw.work[1]
+    _stage!(c0, ws.xr, X)
+    Plans.forward_transform!(ws.xf, ws.spectral.pw.plans[1], c0)
+    return batch_spectral_cascade!(out, ws.spectral, ws.xf)
+end
+
+function batch_spectral_cascade!(out::AbstractMatrix, ws::SpectralBatchWorkspace{T,D}, spectrum) where {T,D}
     pw = ws.pw
     fb = ws.bank
     n = ws.n
     rv = ws.redvec
     Tout = eltype(out)
 
-    c0 = pw.work[1]
-    _stage!(c0, ws.xr, X)
-    Plans.forward_transform!(ws.xf, pw.plans[1], c0)
-
     # S0, and clear the S2 block so inadmissible pairs read as zero (matching `flatten*!`).
-    _put_s0!(view(out, Coefficients.flat_row_s0(), :), view(ws.xf, ntuple(_ -> 1, Val(D))..., :),
+    _put_s0!(view(out, Coefficients.flat_row_s0(), :), view(spectrum, ntuple(_ -> 1, Val(D))..., :),
              Tout(ws.invN[1]), Tout)
     @views out[(n + 2):end, :] .= zero(Tout)
 
@@ -147,7 +176,7 @@ function batch_cascade!(out::AbstractMatrix, ws::BatchWorkspace{T, D}, X::Abstra
         l1 = pw.level[j1]
         r1 = pw.resolutions[l1]
         w1, o1 = pw.work[l1], pw.out[l1]
-        ScatteringCore.periodize_mul!(w1, ws.xf, Cascade._filter(pw, fb, 1, pw.filters[1], j1),
+        ScatteringCore.periodize_mul!(w1, spectrum, Cascade._filter(pw, fb, 1, pw.filters[1], j1),
                                       (r1..., 1))
         Plans.inverse_transform!(o1, pw.plans[l1], w1)
         inv1 = Tout(ws.invN[l1])
@@ -169,7 +198,7 @@ function batch_cascade!(out::AbstractMatrix, ws::BatchWorkspace{T, D}, X::Abstra
             r2 = pw.resolutions[l2]
             w2, o2 = pw.work[l2], pw.out[l2]
             ScatteringCore.periodize_mul!(w2, u1f, Cascade._filter(pw, fb, l1, fpar, j2),
-                                          (ntuple(d -> r2[d] ÷ r1[d], D)..., 1))
+                                          (ntuple(d -> r2[d] ÷ r1[d], Val(D))..., 1))
             Plans.inverse_transform!(o2, pw.plans[l2], w2)
             slice_modulus_mean!(ws.red, rv, o2)
             @views out[Coefficients.flat_row_s2(j1, j2, n), :] .= rv .* Tout(ws.invN[l2])

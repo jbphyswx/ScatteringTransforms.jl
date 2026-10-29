@@ -112,17 +112,18 @@ function study(label, st, X, spatial)
 end
 
 function main()
+    println("project=", Base.active_project())
     println("threads=", Threads.nthreads(), "  FFTW threads available=", FFTW.get_num_threads())
     FB = SB.FFTSpectralBackend()
     for (label, st, X, spatial) in (
         ("1D N=1024 J=6 Q=1",
-         ST.Scattering1D.ScatteringTransform1D(1024, 6; Q = 1, transform = FB), randn(1024, 64), (1024,)),
+         ST.ScatteringCore.ScatteringTransform(1024, 6; Q = 1, transform = FB), randn(1024, 64), (1024,)),
         ("1D N=4096 J=8 Q=1",
-         ST.Scattering1D.ScatteringTransform1D(4096, 8; Q = 1, transform = FB), randn(4096, 64), (4096,)),
+         ST.ScatteringCore.ScatteringTransform(4096, 8; Q = 1, transform = FB), randn(4096, 64), (4096,)),
         ("2D 64^2 J=4 L=8",
-         ST.Scattering2D.ScatteringTransform2D((64, 64), 4; L = 8, transform = FB), randn(64, 64, 32), (64, 64)),
+         ST.ScatteringCore.ScatteringTransform((64, 64), 4; L = 8, transform = FB), randn(64, 64, 32), (64, 64)),
         ("2D 128^2 J=4 L=8",
-         ST.Scattering2D.ScatteringTransform2D((128, 128), 4; L = 8, transform = FB), randn(128, 128, 16), (128, 128)))
+         ST.ScatteringCore.ScatteringTransform((128, 128), 4; L = 8, transform = FB), randn(128, 128, 16), (128, 128)))
         study(label, st, X, spatial)
     end
     println("\n  'vs roof' is time / (transform count x one-full-step time x B / threads).")
@@ -133,4 +134,34 @@ function main()
     return nothing
 end
 
-main()
+function scheduled_groups!(S1, S2, st, workspaces, scheduler)
+    OhMyThreads.@tasks for i in eachindex(st.groups)
+        @set scheduler = scheduler
+        @local ws = workspaces[OhMyThreads.@task_index]
+        ST.Cascade.group!(S1, S2, ws.pw, ws.filter_bank, st.groups[i], st.buffer_signal_fft)
+    end
+    return nothing
+end
+
+function scheduler_study()
+    println("project=", Base.active_project(), " threads=", Threads.nthreads(), " FFT threads=1")
+    st = ST.ScatteringCore.ScatteringTransform((256, 256), 5; L = 8,
+                                               transform = SB.FFTSpectralBackend())
+    println(st)
+    st.buffer_input .= randn(256, 256)
+    ST.Plans.forward_transform!(st.buffer_signal_fft, st.plan, st.buffer_input)
+    coefficients = ST.batch_coeffs(st, Float64)
+    n = min(length(st.groups), Threads.nthreads())
+    ST.ScatteringCore.with_task_workspaces(st, n) do workspaces
+        for (label, scheduler) in (
+            ("dynamic consecutive", OhMyThreads.DynamicScheduler(; ntasks = n)),
+            ("dynamic roundrobin", OhMyThreads.DynamicScheduler(; ntasks = n, split = :roundrobin)),
+            ("greedy", OhMyThreads.GreedyScheduler(; ntasks = n)))
+            t = bench(() -> scheduled_groups!(coefficients.S1, coefficients.S2, st, workspaces, scheduler), 5)
+            Printf.@printf("%-24s %.3f ms\n", label, t * 1e3)
+        end
+    end
+    ST.close_transform!(st)
+end
+
+!isempty(ARGS) && first(ARGS) == "scheduler" ? scheduler_study() : main()

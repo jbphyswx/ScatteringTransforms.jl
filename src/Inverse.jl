@@ -8,17 +8,9 @@ module Inverse
 using ..Plans: Plans
 using ..FilterBanks: FilterBanks
 using ..ScatteringCore: ScatteringCore
-using ..Scattering1D: Scattering1D
-using ..Scattering2D: Scattering2D
-using ..Scattering3D: Scattering3D
 
 export wavelet_transform, wavelet_transform!, iwavelet, iwavelet!, reconstruct_phase
 export ReconstructionWorkspace
-
-# The gridded transforms; the linear inverse reads only `.plan` and `.filter_bank`.
-const GriddedScattering = Union{Scattering1D.ScatteringTransform1D,
-                                Scattering2D.ScatteringTransform2D,
-                                Scattering3D.ScatteringTransform3D}
 
 """
     ReconstructionWorkspace(st)
@@ -38,7 +30,7 @@ struct ReconstructionWorkspace{CA, CV, RA}
     frame::RA              # Littlewood–Paley sum `A`
 end
 
-function ReconstructionWorkspace(st::GriddedScattering)
+function ReconstructionWorkspace(st::ScatteringCore.ScatteringTransform)
     fb = st.filter_bank
     proto = fb.averaging
     T = eltype(proto)
@@ -76,7 +68,7 @@ The linear (pre-modulus) wavelet layer underlying the scattering transform: the 
 coefficient fields `wavelet[λ] = x ⋆ ψ_λ` and the low-pass field `lowpass = x ⋆ φ`, which together
 determine `x` exactly (see [`iwavelet!`](@ref)). The `!` form returns arrays owned by `ws`.
 """
-function wavelet_transform!(ws::ReconstructionWorkspace, st::GriddedScattering, x::AbstractArray)
+function wavelet_transform!(ws::ReconstructionWorkspace, st::ScatteringCore.ScatteringTransform, x::AbstractArray)
     fb, plan = st.filter_bank, st.plan
     ws.buf .= complex.(x)
     Plans.forward_transform!(ws.Xf, plan, ws.buf)
@@ -88,7 +80,7 @@ function wavelet_transform!(ws::ReconstructionWorkspace, st::GriddedScattering, 
     return (; wavelet = ws.wavelet, lowpass = ws.lowpass)
 end
 
-wavelet_transform(st::GriddedScattering, x::AbstractArray) =
+wavelet_transform(st::ScatteringCore.ScatteringTransform, x::AbstractArray) =
     wavelet_transform!(ReconstructionWorkspace(st), st, x)
 
 """
@@ -101,7 +93,7 @@ Inverse of [`wavelet_transform!`](@ref) for a real field by the canonical dual f
 takes `C(k)` to `(C(k) + conj C(−k))/2`, which turns `C = (φ̂² + Σ_λ ψ̂_λ²)·x̂` into `A·x̂`. Returns
 the reconstructed **real** field; `iwavelet(st, wavelet_transform(st, x)) ≈ x` to rounding.
 """
-function iwavelet!(ws::ReconstructionWorkspace, st::GriddedScattering, wavelet, lowpass::AbstractArray)
+function iwavelet!(ws::ReconstructionWorkspace, st::ScatteringCore.ScatteringTransform, wavelet, lowpass::AbstractArray)
     fb, plan = st.filter_bank, st.plan
     ws.buf .= lowpass
     Plans.forward_transform!(ws.Xrec, plan, ws.buf)
@@ -117,10 +109,10 @@ function iwavelet!(ws::ReconstructionWorkspace, st::GriddedScattering, wavelet, 
     return ws.field
 end
 
-iwavelet(st::GriddedScattering, wavelet, lowpass::AbstractArray) =
+iwavelet(st::ScatteringCore.ScatteringTransform, wavelet, lowpass::AbstractArray) =
     copy(iwavelet!(ReconstructionWorkspace(st), st, wavelet, lowpass))
 
-iwavelet(st::GriddedScattering, wt::NamedTuple) = iwavelet(st, wt.wavelet, wt.lowpass)
+iwavelet(st::ScatteringCore.ScatteringTransform, wt::NamedTuple) = iwavelet(st, wt.wavelet, wt.lowpass)
 
 """
     reconstruct_phase(st, moduli; iters=200, init=nothing, seed_lowpass=nothing) -> x
@@ -138,7 +130,7 @@ global sign/phase. `init` (defaults to a random field matched in energy to the m
 estimate; pass one for reproducibility. Returns the real reconstructed field, on the array type of
 the transform's filters. The loop reuses one workspace.
 """
-function reconstruct_phase(st::GriddedScattering, moduli;
+function reconstruct_phase(st::ScatteringCore.ScatteringTransform, moduli;
                            iters::Int=200, init=nothing, seed_lowpass=nothing)
     fb = st.filter_bank
     length(moduli) == FilterBanks.nwavelets(fb) ||

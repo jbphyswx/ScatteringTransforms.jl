@@ -23,13 +23,13 @@ Fast, generic wavelet scattering transforms in Julia.
   retrieval (`reconstruct_phase`), and gradient-descent `synthesize` from coefficients
   (DifferentiationInterface extension; any `ADTypes` backend — with Enzyme, pass
   `AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`).
-- **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
+- **Monogenic (Riesz) scattering**: `MonogenicScatteringTransform` (1D/2D/3D) with the rotation-covariant
   monogenic amplitude + continuous orientation/phase (`monogenic_components`); on S²,
   `spherical_monogenic_scattering` (amplitude from the exact surface-gradient energy) plus
   `spherical_monogenic_components` for pointwise orientation/phase (spin-1 Riesz vector, dependency-free
   via the surface gradient, or NUFSHT's spin-weighted synthesis when loaded).
 - **Grid-support matrix**: Cartesian × spherical, on uniform/structured and nonuniform/scattered
-  sampling — gridded `ScatteringTransform{1,2,3}D` (FFT), scattered-planar `scattered_planar_scattering`
+  sampling — gridded `ScatteringTransform{D}` (FFT), scattered-planar `scattered_planar_scattering`
   (exact direct NUDFT), structured-sphere `structured_spherical_scattering` (exact direct SHT), and
   scattered-sphere `spherical_scattering` (exact direct SHT). **Every cell has an in-core,
   dependency-free default**; `using NonuniformFFTs` or `using FINUFFT` / `using NUFSHT` /
@@ -37,8 +37,8 @@ Fast, generic wavelet scattering transforms in Julia.
 - **Pluggable spectral backend**: dependency-free direct-sum default; `using FFTW` switches on
   an `O(N log N)` fast path automatically
   (`transform = AutoSpectralBackend() | DirectSumSpectralBackend() | FFTSpectralBackend()`).
-- **Batching & threading**: `scattering_batch` reuses one plan/workspace across the batch, on every
-  surface — gridded 1D/2D/3D, scattered planar, and the sphere; `using OhMyThreads` enables
+- **Batching & threading**: `scattering_batch` retains plans and workspaces for gridded 1D/2D/3D,
+  monogenic, scattered-planar, and spherical transforms; `using OhMyThreads` enables
   `scattering_batch(…; execution = ThreadedBackend())`, equal to serial bit for bit on the gridded
   surfaces and to the solve tolerance on the scattered ones.
 - **Periodized cascade**: every convolution is produced directly on the decimated grid its band
@@ -46,15 +46,14 @@ Fast, generic wavelet scattering transforms in Julia.
   bit for bit, and lower values trade accuracy for speed.
 - **Vendor-neutral GPU**: `using KernelAbstractions, AbstractFFTs` + a device backend (e.g.
   `using CUDA`) gives a device-resident transform via `GPUBackend(CUDA.CUDABackend())` and a
-  batched-throughput `scattering_batch(st, X; execution = gpu)` — CUDA/ROCm/oneAPI/Metal, validated
-  on `KA.CPU()`.
+  batched-throughput `scattering_batch(st, X; execution = gpu)`.
   Covers the gridded 1D/2D/3D surfaces (with their localized fields and the wavelet-frame inverse),
-  `MonogenicScattering`, and the scattered-planar surface. On scattered points everything
+  `MonogenicScatteringTransform`, and scattered planar and spherical transforms. On scattered points everything
   downstream of the points follows their array type — bank, buffers, cascade — so the same cascade
   runs on the device, and only the NUFFT is bound per vendor: `NonuniformFFTs` is
   KernelAbstractions-native and runs on any of them, `cuFINUFFT` is bound for CUDA. The
-  vendor-neutral chain is exercised on `KA.CPU()`; the CUDA bindings themselves are not covered by
-  CI, which has no device. Structured-grid spherical scattering is host-only, since
+  array paths are tested with JLArrays and scalar indexing disabled. Hardware GPU performance is
+  outside these tests. The FastSphericalHarmonics structured-grid route runs on the host, since
   `FastSphericalHarmonics` has no device path.
 - **Generic & type-stable**: `Float32`/`Float64`, autodiff-friendly, GPU-array-ready hot path,
   in-place `!` methods over pre-allocated buffers.
@@ -70,7 +69,7 @@ using OhMyThreads: OhMyThreads  # → ST.scattering_batch(st, X; execution = CB.
 # 1D Scattering
 N = 1024
 signal = randn(N)
-st = ST.Scattering1D.ScatteringTransform1D(N, 8; Q=1, max_order=2)
+st = ST.ScatteringCore.ScatteringTransform(N, 8; Q=1, max_order=2)
 coeffs = st(signal)
 
 ST.Coefficients.zeroth_order(coeffs)   # 0th order (average)
@@ -79,11 +78,11 @@ ST.Coefficients.second_order(coeffs)   # 2nd order (scale interactions)
 
 # 2D Scattering
 image = randn(256, 256)
-st2d = ST.Scattering2D.ScatteringTransform2D((256, 256), 4; L=8, max_order=2)
+st2d = ST.ScatteringCore.ScatteringTransform((256, 256), 4; L=8, max_order=2)
 coeffs_2d = st2d(image)
 
 # 3D volumetric scattering
-st3d = ST.Scattering3D.ScatteringTransform3D((32, 32, 32), 3; n_orient=6, max_order=2)
+st3d = ST.ScatteringCore.ScatteringTransform((32, 32, 32), 3; n_orient=6, max_order=2)
 coeffs_3d = st3d(randn(32, 32, 32))
 
 # Localized (Mallat) field, reduced descriptors, batching
@@ -157,12 +156,17 @@ Off-lattice / gappy planar data (scattered `(x, y)` points) is analysed onto a u
 grid by a nonuniform DFT (`scattered_planar_scattering`), and the gridded transform's cascade, with its
 Morlet wavelet bank, runs on that grid.
 The caller gives the domain's size, `period`, which sets every mode's wavelength, or a FlowGeometries
-grid that carries it. On a uniform grid it reproduces the gridded FFT transform exactly, and `solve=true` recovers the
+grid that carries it. On a uniform grid it reproduces the gridded FFT transform to transform accuracy.
+`analysis = ST.Plans.LeastSquares()` recovers the
 band-limited coefficients for irregular sampling by LSMR least squares — minimum-norm where the
 samples do not determine the modes, with `damp` for explicit Tikhonov regularisation. The default is
 an in-core exact direct NUDFT (no dependencies); `using NonuniformFFTs` or `using FINUFFT` enables the
 nonuniform FFT, and with both loaded `transform = FlowTransformBindings.NonuniformFFTsBackend()` or
 `FlowTransformBindings.FINUFFTBackend()` names one.
+
+The default analysis is `ST.Plans.WeightedAdjoint()`. `tol` sets NUFFT accuracy and `nthreads`
+sets its library thread count. A FlowGeometries periodic axis supplies its period; a bounded axis
+uses its extent plus the coarsest wavelet width. An explicit `period` overrides these values.
 
 ![Scattered planar scattering](docs/src/assets/scattered_planar.png)
 
@@ -172,6 +176,11 @@ path with `using NUFSHT`) and a **structured** equiangular grid (`structured_sph
 via the fast SHT in FastSphericalHarmonics) give matching multi-scale coefficients. Scattered samples
 are analysed once, and the cascade runs on the Gauss–Legendre grid of the band limit, so each
 coefficient is that grid's mean of a modulus of the field the analysis recovers:
+
+Spherical results use `ST.Coefficients.ScatteringCoefficients1D`, with scale 1 finest and
+`S2[j1, j2]` populated for `j2 > j1`. The scattered constructors also accept a spherical
+FlowGeometries grid. Their default `LeastSquares()` input fit returns its best iterate at an
+iteration or condition limit; diagnostics stay in the fit workspace.
 
 ![Spherical scattering](docs/src/assets/spherical_scattering.png)
 ![Structured spherical scattering](docs/src/assets/structured_spherical.png)
@@ -216,7 +225,7 @@ julia --project=. basic_usage.jl
 For large datasets, use the in-place API:
 
 ```julia
-st = ST.Scattering1D.ScatteringTransform1D(N, 8; Q=1, max_order=2)
+st = ST.ScatteringCore.ScatteringTransform(N, 8; Q=1, max_order=2)
 coeffs = ST.Coefficients.ScatteringCoefficients1D(length(st.filter_bank.wavelets), Float64)
 
 for slice in dataset

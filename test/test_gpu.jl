@@ -1,157 +1,130 @@
-# Vendor-neutral GPU path, validated on the KernelAbstractions CPU backend.
-#
-# `GPUBackend(KA.CPU())` runs the device-resident constructors and batched path used on CUDA/ROCm,
-# with `Array` as the device array type, so AbstractFFTs builds an FFTW plan.
 using KernelAbstractions: KernelAbstractions as KA
 using AbstractFFTs: AbstractFFTs
+using GPUArraysCore: GPUArraysCore
+using JLArrays: JLArrays
+using LinearAlgebra: LinearAlgebra
+using ScatteringTransforms: ScatteringTransforms as ST
 
-Test.@testset "GPU vendor-neutral path (GPUBackend(KA.CPU()))" begin
-    gpu = ComputationalBackends.GPUBackend(KA.CPU())
-    FB = SpectralBackends.FFTSpectralBackend()
+# JLArrays has no FFT; these plans copy whole arrays through FFTW.
+struct JLFFT{T,P<:AbstractFFTs.Plan{T}} <: AbstractFFTs.Plan{T}
+    inner::P
+    inplace::Bool
+end
+JLFFT(p::AbstractFFTs.Plan{T}, inplace) where {T} = JLFFT{T,typeof(p)}(p, inplace)
 
-    Test.@testset "1D single-image parity vs serial" begin
-        N, J = 128, 4
-        x = randn(Float32, N)
-        ref = ScatteringTransforms.Scattering1D.ScatteringTransform1D(Float32, N, J; Q=1, max_order=2, transform=FB)
-        gst = ScatteringTransforms.Scattering1D.ScatteringTransform1D(Float32, N, J, gpu; Q=1, max_order=2)
-        Test.@test ScatteringTransforms.Coefficients.flatten1d(gst(x)) ≈ ScatteringTransforms.Coefficients.flatten1d(ref(x)) rtol=1e-4
-    end
+AbstractFFTs.plan_fft(x::JLArrays.JLArray, region = 1:ndims(x); kwargs...) =
+    JLFFT(FFTW.plan_fft(Array(x), region; kwargs...), false)
+AbstractFFTs.plan_fft!(x::JLArrays.JLArray, region = 1:ndims(x); kwargs...) =
+    JLFFT(FFTW.plan_fft!(Array(x), region; kwargs...), true)
+AbstractFFTs.plan_ifft(x::JLArrays.JLArray, region = 1:ndims(x); kwargs...) =
+    JLFFT(FFTW.plan_ifft(Array(x), region; kwargs...), false)
+AbstractFFTs.plan_ifft!(x::JLArrays.JLArray, region = 1:ndims(x); kwargs...) =
+    JLFFT(FFTW.plan_ifft!(Array(x), region; kwargs...), true)
+AbstractFFTs.plan_bfft!(x::JLArrays.JLArray, region = 1:ndims(x); kwargs...) =
+    JLFFT(FFTW.plan_bfft!(Array(x), region; kwargs...), true)
 
-    Test.@testset "2D single-image parity vs serial" begin
-        Ny, Nx, J, L = 32, 32, 3, 4
-        x = randn(Float32, Ny, Nx)
-        ref = ScatteringTransforms.Scattering2D.ScatteringTransform2D(Float32, (Ny, Nx), J; L=L, max_order=2, transform=FB)
-        gst = ScatteringTransforms.Scattering2D.ScatteringTransform2D(Float32, (Ny, Nx), J, gpu; L=L, max_order=2)
-        Test.@test ScatteringTransforms.Coefficients.flatten2d(gst(x)) ≈ ScatteringTransforms.Coefficients.flatten2d(ref(x)) rtol=1e-4
-    end
+LinearAlgebra.mul!(out::JLArrays.JLArray, p::JLFFT, x::JLArrays.JLArray) =
+    copyto!(out, p.inner * Array(x))
+Base.:*(p::JLFFT, x::JLArrays.JLArray) =
+    p.inplace ? LinearAlgebra.mul!(x, p, x) : JLArrays.JLArray(p.inner * Array(x))
+Base.size(p::JLFFT) = size(p.inner)
+KA.synchronize(::JLArrays.JLBackend) = nothing
 
-    Test.@testset "3D single-image parity vs serial" begin
-        N3, J = (8, 8, 8), 2
-        x = randn(Float32, N3...)
-        ref = ScatteringTransforms.Scattering3D.ScatteringTransform3D(Float32, N3, J; n_orient=4, max_order=2, transform=FB)
-        gst = ScatteringTransforms.Scattering3D.ScatteringTransform3D(Float32, N3, J, gpu; n_orient=4, max_order=2)
-        # 3D uses the scales×orientations (2D) coefficient container.
-        Test.@test ScatteringTransforms.Coefficients.flatten2d(gst(x)) ≈ ScatteringTransforms.Coefficients.flatten2d(ref(x)) rtol=1e-4
-    end
+_gpu_flat(c::ST.Coefficients.ScatteringCoefficients1D) = ST.Coefficients.flatten1d(c)
+_gpu_flat(c::ST.Coefficients.ScatteringCoefficients2D) = ST.Coefficients.flatten2d(c)
 
-    Test.@testset "batched throughput parity (1D + 2D + 3D)" begin
-        # 1D batch
-        N, J, B = 96, 4, 8
-        X = randn(Float32, N, B)
-        ref = ScatteringTransforms.Scattering1D.ScatteringTransform1D(Float32, N, J; Q=1, max_order=2, transform=FB)
-        gst = ScatteringTransforms.Scattering1D.ScatteringTransform1D(Float32, N, J, gpu; Q=1, max_order=2)
-        Test.@test Array(ScatteringTransforms.scattering_batch(gst, X; execution = gpu)) ≈
-                   ScatteringTransforms.scattering_batch(ref, X) rtol=1e-4
+Test.@testset "Device transforms with scalar indexing disabled (JLArray)" begin
+    task_local_storage(:ScalarIndexing, GPUArraysCore.ScalarDisallowed) do
+        gpu = ComputationalBackends.GPUBackend(JLArrays.JLBackend())
+        FB = SpectralBackends.FFTSpectralBackend()
+        stored, computed = ST.FilterBanks.StoredFilters(), ST.FilterBanks.ComputedFilters()
 
-        # 2D batch
-        Ny, Nx, J2, L, B2 = 24, 24, 3, 4, 6
-        X2 = randn(Float32, Ny, Nx, B2)
-        ref2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D(Float32, (Ny, Nx), J2; L=L, max_order=2, transform=FB)
-        gst2 = ScatteringTransforms.Scattering2D.ScatteringTransform2D(Float32, (Ny, Nx), J2, gpu; L=L, max_order=2)
-        Test.@test Array(ScatteringTransforms.scattering_batch(gst2, X2; execution = gpu)) ≈
-                   ScatteringTransforms.scattering_batch(ref2, X2) rtol=1e-4
-
-        # 3D batch
-        N3, J3, B3 = (8, 8, 8), 2, 4
-        X3 = randn(Float32, N3..., B3)
-        ref3 = ScatteringTransforms.Scattering3D.ScatteringTransform3D(Float32, N3, J3; n_orient=4, max_order=2, transform=FB)
-        gst3 = ScatteringTransforms.Scattering3D.ScatteringTransform3D(Float32, N3, J3, gpu; n_orient=4, max_order=2)
-        Test.@test Array(ScatteringTransforms.scattering_batch(gst3, X3; execution = gpu)) ≈
-                   ScatteringTransforms.scattering_batch(ref3, X3) rtol=1e-4
-    end
-
-    Test.@testset "scattering_field! order-2 runs on device arrays (guards the scalar-index fix)" begin
-        Ny, Nx, J, L = 32, 32, 3, 4
-        x = randn(Float32, Ny, Nx)
-        gst = ScatteringTransforms.Scattering2D.ScatteringTransform2D(Float32, (Ny, Nx), J, gpu; L=L, max_order=2)
-        field = ScatteringTransforms.ScatteringFields.scattering_field(gst, x)
-        ref = ScatteringTransforms.Scattering2D.ScatteringTransform2D(Float32, (Ny, Nx), J; L=L, max_order=2, transform=FB)
-        fref = ScatteringTransforms.ScatteringFields.scattering_field(ref, x)
-        Test.@test Array(field.data) ≈ Array(fref.data) rtol=1e-4
-    end
-    Test.@testset "scattered planar builds on a device backend and matches the host" begin
-        # Everything downstream of the points follows their array type, so the device constructor
-        # only relocates the points. NonuniformFFTs runs on any KernelAbstractions backend.
-        SP = ScatteringTransforms.ScatteredPlanar
-        M, ms, J, L = 400, (16, 16), 3, 4
-        Random.seed!(11)
-        px, py, f = rand(M), rand(M), randn(M)
-        spec = FTB.NonuniformFFTsBackend()
-        host = SP.build(Float64, px, py, ms, J; period = 1.0, L = L, transform = spec)
-        dev = SP.build(Float64, px, py, ms, J, gpu; period = 1.0, L = L, transform = spec)
-        Test.@test Array(ScatteringTransforms.Coefficients.flatten2d(dev(f))) ≈
-                   Array(ScatteringTransforms.Coefficients.flatten2d(host(f)))
-        X = randn(M, 4)
-        Test.@test Array(ScatteringTransforms.scattering_batch(dev, X)) ≈
-                   Array(ScatteringTransforms.scattering_batch(host, X))
-
-        # `solve = true` on device points: the solve runs in `copyto!`, `fill!`, `norm` and fused
-        # broadcasts, and the batched form reduces through `mapreducedim!` into preallocated slices.
-        #
-        # The field is band limited, so the solve has an exact answer, and `maxiter` exceeds
-        # `prod(ms) = 256`, the step count at which the Krylov process terminates. A threaded NUFFT
-        # spreads in nondeterministic order, and an unconverged solve amplifies that by about
-        # `cond(A)²`.
-        fb = [1 + 0.7cos(2π * px[k]) + 0.5sin(4π * py[k]) for k in 1:M]
-        host_s = SP.build(Float64, px, py, ms, J; period = 1.0, L = L, transform = spec, solve = true,
-                          maxiter = 400)
-        dev_s = SP.build(Float64, px, py, ms, J, gpu; period = 1.0, L = L, transform = spec,
-                         solve = true, maxiter = 400)
-        Test.@test Array(ScatteringTransforms.Coefficients.flatten2d(dev_s(fb))) ≈
-                   Array(ScatteringTransforms.Coefficients.flatten2d(host_s(fb))) rtol = 1e-8
-        Xb = hcat([[1 + 0.7cos(2π * px[k]) + 0.5c * sin(4π * py[k]) for k in 1:M] for c in 1:4]...)
-        Test.@test Array(ScatteringTransforms.scattering_batch(dev_s, Xb)) ≈
-                   Array(ScatteringTransforms.scattering_batch(host_s, Xb)) rtol = 1e-8
-    end
-
-    Test.@testset "monogenic scattering on the device matches the host" begin
-        Mono = ScatteringTransforms.Monogenic
-        for (dims, J) in (((64,), 4), ((32, 32), 3), ((12, 12, 12), 2)), α in (J, 1)
-            x = randn(Float32, dims...)
-            ref = Mono.MonogenicScattering(Float32, dims, J; Q = 1, max_order = 2, oversampling = α,
-                                           transform = FB)
-            gst = Mono.MonogenicScattering(Float32, dims, J, gpu; Q = 1, max_order = 2, oversampling = α)
-            flat(c) = vcat(c.S0, vec(c.S1), vec(c.S2))
-            Test.@test flat(gst(x)) ≈ flat(ref(x)) rtol = 1e-4
-            Test.@test Array(Mono.monogenic_components(gst, x, 1).amplitude) ≈
-                       Mono.monogenic_components(ref, x, 1).amplitude rtol = 1e-4
+        Test.@testset "gridded and monogenic coefficients, batches and localized fields" begin
+            cases = (
+                (ST.ScatteringCore.ScatteringTransform{1}, 64, (64,), 3, (Q = 1,), computed),
+                (ST.ScatteringCore.ScatteringTransform{2}, (16, 16), (16, 16), 2, (L = 4,), stored),
+                (ST.ScatteringCore.ScatteringTransform{2}, (16, 16), (16, 16), 2, (L = 4,), computed),
+                (ST.ScatteringCore.ScatteringTransform{3}, (8, 8, 8), (8, 8, 8), 2, (n_orient = 4,), computed),
+                (ST.Monogenic.MonogenicScatteringTransform, (64,), (64,), 3, (Q = 1,), computed),
+                (ST.Monogenic.MonogenicScatteringTransform, (16, 16), (16, 16), 2, (Q = 1,), stored),
+                (ST.Monogenic.MonogenicScatteringTransform, (8, 8, 8), (8, 8, 8), 2, (Q = 1,), computed))
+            for (build, arg, dims, J, options, filters) in cases
+                host = build(Float32, arg, J; filters, options..., transform = FB)
+                dev = build(Float32, arg, J, gpu; filters, options...)
+                x = randn(Float32, dims...)
+                xj = JLArrays.JLArray(x)
+                Test.@test _gpu_flat(dev(xj)) ≈ _gpu_flat(host(x)) rtol = 1e-4
+                X = randn(Float32, dims..., 3)
+                Test.@test Array(ST.scattering_batch(dev, JLArrays.JLArray(X); execution = gpu)) ≈
+                           ST.scattering_batch(host, X) rtol = 1e-4
+                f = ST.ScatteringFields.scattering_field(dev, xj; subsample = 2)
+                ref = ST.ScatteringFields.scattering_field(host, x; subsample = 2)
+                Test.@test Array(f.data) ≈ ref.data rtol = 1e-4
+            end
         end
-    end
 
-    Test.@testset "phase retrieval and the frame inverse run on a device transform" begin
-        Inv = ScatteringTransforms.Inverse
-        N, J = 128, 5
-        x = randn(Float32, N)
-        ref = ScatteringTransforms.Scattering1D.ScatteringTransform1D(Float32, N, J; Q = 1,
-                                                                      max_order = 1, transform = FB)
-        gst = ScatteringTransforms.Scattering1D.ScatteringTransform1D(Float32, N, J, gpu; Q = 1,
-                                                                      max_order = 1)
-        Test.@test Array(Inv.iwavelet(gst, Inv.wavelet_transform(gst, x))) ≈ x rtol = 1e-4
-        # The true field is a fixed point of the projections; a random seed is drawn for the device.
-        wt = Inv.wavelet_transform(ref, x)
-        moduli = [abs.(w) for w in wt.wavelet]
-        Test.@test Array(Inv.reconstruct_phase(gst, moduli; iters = 5, init = x,
-                                               seed_lowpass = wt.lowpass)) ≈ x rtol = 1e-4
-        xr = Array(Inv.reconstruct_phase(gst, moduli; iters = 2))
-        Test.@test size(xr) == (N,)
-        Test.@test all(isfinite, xr)
-    end
+        Test.@testset "scattered planar adjoints and fits" begin
+            M, ms, J = 180, (8, 8), 2
+            x, y = rand(M), rand(M)
+            X = [1 + 0.4cos(2π * x[k]) + 0.2b * sin(2π * y[k]) for k in 1:M, b in 1:3]
+            transform = SpectralBackends.DirectSumSpectralBackend()
+            for analysis in (ST.Plans.WeightedAdjoint(), ST.Plans.LeastSquares())
+                options = (; period = 1.0, L = 4, transform, analysis, ntrans = 2,
+                            filters = computed, maxiter = 200, rtol = 1e-8)
+                host = ST.ScatteredPlanar.build(Float64, x, y, ms, J; options...)
+                dev = ST.ScatteredPlanar.build(Float64, x, y, ms, J, gpu; options...)
+                Test.@test Array(ST.scattering_batch(dev, JLArrays.JLArray(X); execution = gpu)) ≈
+                           ST.scattering_batch(host, X) rtol = 1e-6
+                foreach(ST.close_transform!, (host, dev))
+            end
+        end
 
-    Test.@testset "a device transform builds its own batch workspace; complex stacks keep S0" begin
-        Ny, Nx, J, L, B = 24, 24, 3, 4, 5
-        ref = ScatteringTransforms.Scattering2D.ScatteringTransform2D(Float32, (Ny, Nx), J; L = L,
-                                                                      max_order = 2, transform = FB)
-        gst = ScatteringTransforms.Scattering2D.ScatteringTransform2D(Float32, (Ny, Nx), J, gpu; L = L,
-                                                                      max_order = 2)
-        X = randn(Float32, Ny, Nx, B)
-        ws = ScatteringTransforms.batch_workspace(gst, B)
-        out = similar(gst.buffer_input, Float32, (size(ScatteringTransforms.scattering_batch(ref, X), 1), B))
-        ScatteringTransforms.scattering_batch!(out, gst, X; workspace = ws)
-        Test.@test Array(out) ≈ ScatteringTransforms.scattering_batch(ref, X) rtol = 1e-4
+        Test.@testset "spherical batches and monogenic components" begin
+            M, lmax, J = 100, 4, 2
+            θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+            φ = [2π * mod(k * (sqrt(5) - 1) / 2, 1) for k in 1:M]
+            X = [cos(θ[k]) + 0.2b * sin(θ[k]) * cos(φ[k]) for k in 1:M, b in 1:3]
+            for build in (ST.spherical_scattering, ST.spherical_monogenic_scattering)
+                nufft = SpectralBackends.DirectSumSpectralBackend()
+                host = build(θ, φ, lmax, J; nufft)
+                dev = build(JLArrays.JLArray(θ), JLArrays.JLArray(φ), lmax, J;
+                            nufft)
+                Test.@test _gpu_flat(dev(JLArrays.JLArray(X[:, 1]))) ≈ _gpu_flat(host(X[:, 1])) rtol = 1e-6
+                Test.@test Array(ST.scattering_batch(dev, JLArrays.JLArray(X); execution = gpu)) ≈
+                           ST.scattering_batch(host, X) rtol = 1e-6
+                if build === ST.spherical_monogenic_scattering
+                    got = ST.spherical_monogenic_components(dev, JLArrays.JLArray(X[:, 1]), 1)
+                    ref = ST.spherical_monogenic_components(host, X[:, 1], 1)
+                    Test.@test Array(got.amplitude) ≈ ref.amplitude rtol = 1e-6
+                end
+                foreach(ST.close_transform!, (host, dev))
+            end
+        end
 
-        Z = randn(ComplexF32, Ny, Nx, B)
-        got = Array(ScatteringTransforms.scattering_batch(gst, Z; execution = gpu))
-        Test.@test eltype(got) <: Complex
-        Test.@test got ≈ ScatteringTransforms.scattering_batch(ref, Z) rtol = 1e-4
+        Test.@testset "complex batches retain the field mean" begin
+            dims, B = (16, 16), 3
+            host = ST.ScatteringCore.ScatteringTransform(Float32, dims, 2; L = 4, transform = FB)
+            dev = ST.ScatteringCore.ScatteringTransform(Float32, dims, 2, gpu; L = 4)
+            X = randn(ComplexF32, dims..., B)
+            Test.@test Array(ST.scattering_batch(dev, JLArrays.JLArray(X); execution = gpu)) ≈
+                       ST.scattering_batch(host, X) rtol = 1e-4
+        end
+
+        Test.@testset "phase retrieval and the frame inverse" begin
+            Inv = ST.Inverse
+            N, J = 128, 5
+            x = randn(Float32, N)
+            xj = JLArrays.JLArray(x)
+            host = ST.ScatteringCore.ScatteringTransform(Float32, N, J; max_order = 1, transform = FB)
+            dev = ST.ScatteringCore.ScatteringTransform(Float32, N, J, gpu; max_order = 1)
+            Test.@test Array(Inv.iwavelet(dev, Inv.wavelet_transform(dev, xj))) ≈ x rtol = 1e-4
+            wt = Inv.wavelet_transform(host, x)
+            moduli = map(w -> JLArrays.JLArray(abs.(w)), wt.wavelet)
+            Test.@test Array(Inv.reconstruct_phase(dev, moduli; iters = 5, init = xj,
+                                                   seed_lowpass = JLArrays.JLArray(wt.lowpass))) ≈ x rtol = 1e-4
+            xr = Array(Inv.reconstruct_phase(dev, moduli; iters = 2))
+            Test.@test size(xr) == (N,)
+            Test.@test all(isfinite, xr)
+        end
     end
 end

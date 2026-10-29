@@ -23,6 +23,21 @@ Supertype for spectral transform plans. A plan implements [`forward_transform!`]
 abstract type AbstractScatteringPlan end
 
 """
+    AbstractAnalysis
+
+Policy for recovering spectral coefficients from scattered samples.
+"""
+abstract type AbstractAnalysis end
+
+"Analyze samples by a quadrature-weighted adjoint transform."
+struct WeightedAdjoint <: AbstractAnalysis end
+
+"Analyze samples by a least-squares fit."
+struct LeastSquares <: AbstractAnalysis end
+
+public AbstractAnalysis, WeightedAdjoint, LeastSquares
+
+"""
     forward_transform!(out, plan, x) -> out
 
 In-place forward (fft-convention) spectral transform. Methods provided by concrete plans.
@@ -91,75 +106,23 @@ when positive, else `1`, since the tasks already occupy the cores.
 per_task_nthreads(requested::Integer) = requested > 0 ? Int(requested) : 1
 
 """
-    AnalysisNotConverged <: Exception
-
-Thrown when an iterative analysis has no usable answer: a non-finite residual, a condition estimate
-past what the precision represents, or a solve that must converge and did not.
-
-The scattered planar solve returns at `maxiter` without throwing: LSMR decreases `‖r‖` and `‖A†r‖`
-monotonically, so the truncated iterate is the best one reached.
-"""
-struct AnalysisNotConverged{T <: Real} <: Exception
-    residual::T
-    rtol::T
-    iters::Int
-    maxiter::Int
-    detail::String
-end
-
-AnalysisNotConverged(residual::Real, rtol::Real, iters::Integer, maxiter::Integer,
-                     detail::AbstractString) =
-    AnalysisNotConverged{promote_type(typeof(residual), typeof(rtol))}(
-        residual, rtol, Int(iters), Int(maxiter), String(detail))
-
-function Base.showerror(io::IO, e::AnalysisNotConverged)
-    print(io, "AnalysisNotConverged: reached relative residual ", e.residual, " after ", e.iters,
-          " of ", e.maxiter, " iterations, against rtol = ", e.rtol, ". ")
-    return print(io, e.detail)
-end
-
-# A column is unusable when its condition estimate reached `conlim` or `1/eps`
-# (`FTB.LSMR_CONDITION`) or its residual is not finite; every other stop, the iteration limit
-# included, leaves a usable iterate.
-function _check_solve(ws::FTB.LSMRWorkspace, M::Integer, ms::Tuple, rtol::Real, maxiter::Integer)
-    @inbounds for k in eachindex(ws.status)
-        (ws.status[k] == FTB.LSMR_CONDITION || !isfinite(ws.normr[k])) &&
-            _refuse_solve(ws, k, M, ms, rtol, maxiter)
-    end
-    return nothing
-end
-
-@noinline function _refuse_solve(ws::FTB.LSMRWorkspace, k::Int, M::Integer, ms::Tuple, rtol::Real,
-                                 maxiter::Integer)
-    n = prod(ms)
-    advice = n > M ?
-        "The mode grid asks for more coefficients than there are samples ($n modes, $M points), so " *
-        "$(n - M) mode directions are constrained by no sample: reduce `ms`, supply more points, or " *
-        "raise `damp` to regularise them." :
-        "The sampling may not determine the mode grid ($n modes, $M points) — check the point set " *
-        "for gaps, reduce `ms`, or raise `damp`."
-    throw(AnalysisNotConverged(ws.normr[k], rtol, ws.iterations[k], maxiter,
-                              "cond(A) ≈ $(Float32(ws.condA[k])), stopped on $(ws.status[k]). " * advice))
-end
-
-"""
-    default_solver_rtol(::Type{T}, spectral, eps) -> T
+    default_solver_rtol(::Type{T}, spectral, tol) -> T
 
 Stopping tolerance for the scattered least-squares solve, set by the accuracy of the transform under
 it.
 
 The direct sum evaluates an exact adjoint pair, so the target is `sqrt(Base.eps(T))`. A fast NUFFT's
-type-1 and type-2 are adjoints only to its tolerance `eps` (the library default for `T` when
-`nothing`), so the target is `max(10·eps, sqrt(Base.eps(T)))`.
+type-1 and type-2 are adjoints only to its tolerance `tol` (the library default for `T` when
+`nothing`), so the target is `max(10·tol, sqrt(Base.eps(T)))`.
 """
-default_solver_rtol(::Type{T}, ::SB.AbstractDirectSumSpectralBackend, eps) where {T} =
+default_solver_rtol(::Type{T}, ::SB.AbstractDirectSumSpectralBackend, tol) where {T} =
     T(sqrt(Base.eps(real(float(T)))))
-default_solver_rtol(::Type{T}, ::SB.AbstractSpectralBackend, eps) where {T} =
-    T(max(10 * Float64(eps === nothing ? FTB.default_tolerance(real(float(T))) : eps),
+default_solver_rtol(::Type{T}, ::SB.AbstractSpectralBackend, tol) where {T} =
+    T(max(10 * Float64(tol === nothing ? FTB.default_tolerance(real(float(T))) : tol),
           sqrt(Base.eps(real(float(T))))))
 
 """
-    warn_underdetermined(M, ms, solve, damp) -> nothing
+    warn_underdetermined(M, ms, analysis, damp) -> nothing
 
 Warn, once, that a solve has more modes than samples and no damping.
 
@@ -168,9 +131,11 @@ returns the minimum-norm iterate. Whether that is the answer wanted, or whether 
 samples, or set `damp` for Tikhonov regularisation, is the caller's choice; no `λ` is chosen for
 them.
 """
-function warn_underdetermined(M::Integer, ms::Tuple, solve::Bool, damp::Real)
+warn_underdetermined(M::Integer, ms::Tuple, ::WeightedAdjoint, damp::Real) = nothing
+
+function warn_underdetermined(M::Integer, ms::Tuple, ::LeastSquares, damp::Real)
     n = prod(ms)
-    (!solve || n <= M || damp > 0) && return nothing
+    (n <= M || damp > 0) && return nothing
     @warn "Scattered solve is underdetermined: $n modes from $M samples leaves at least $(n - M) " *
           "mode directions unconstrained. LSMR returns the minimum-norm solution; pass `damp` for " *
           "Tikhonov regularisation, or reduce `ms`." maxlog = 1
@@ -287,24 +252,26 @@ builder. A device plan has no spectral-backend tag, so its method plans on `prot
 """
 plan_like(plan::AbstractScatteringPlan, prototype::AbstractArray) =
     make_plan(spectral_backend(plan), real(eltype(prototype)), size(prototype))
-plan_like(plan::AbstractScatteringPlan, prototype::AbstractArray, D::Int; kwargs...) =
-    make_plan(spectral_backend(plan), real(eltype(prototype)), ntuple(d -> size(prototype, d), D);
+plan_like(plan::AbstractScatteringPlan, prototype::AbstractArray, ::Val{D}; kwargs...) where {D} =
+    make_plan(spectral_backend(plan), real(eltype(prototype)), ntuple(d -> size(prototype, d), Val(D));
               batch = size(prototype, D + 1), kwargs...)
 
+spatial_rank(::NTuple{D,Int}) where {D} = Val(D)
+
 """
-    plan_analysis(plan) -> (; solve, maxiter, rtol, damp, eps, nufft_nthreads)
+    plan_analysis(plan) -> (; analysis, maxiter, rtol, damp, tol, nthreads)
 
 How a scattered-planar plan turns samples into modes, as the keyword arguments its constructor takes.
 
 A plan rebuilt on the same points needs these too: on irregular sampling the type-1 adjoint and the
-least-squares inversion (`solve = true`) are different transforms. `eps` is `nothing` for the exact
+least-squares inversion are different transforms. `tol` is `nothing` for the exact
 direct sum.
 """
 function plan_analysis end
 
 """
-    make_scattered_plan(spectral, x, y, ms, T; period, origin = (0, 0), solve, maxiter, rtol, damp,
-                        eps, ntrans, nufft_nthreads) -> AbstractScatteringPlan
+    make_scattered_plan(spectral, x, y, ms, T; period, origin = (0, 0), analysis, maxiter, rtol, damp,
+                        tol, ntrans, nthreads) -> AbstractScatteringPlan
 
 Build the scattered/nonuniform planar plan selected by `spectral` over points `(x, y)` and a uniform
 mode grid of size `ms`. `SpectralBackends.DirectSumSpectralBackend` is the dependency-free exact
@@ -316,15 +283,16 @@ loaded and FINUFFT when only it is, and the exact direct sum when neither is.
 axes or a 2-tuple. A point lies at `2π·mod(x - origin, period)/period` on the plan's `2π`-periodic
 domain, so mode `k` has wavelength `period/k` whatever the point set.
 
-`ntrans` is the batch width and `nufft_nthreads` the library's own thread count (`0`, the default,
+`ntrans` is the batch width and `nthreads` the library's own thread count (`0`, the default,
 takes `Threads.nthreads()`). The exact direct sum has no tolerance and runs on one thread, so it
-accepts `eps` and `nufft_nthreads` and ignores them.
+accepts `tol` and `nthreads` and ignores them.
 """
 make_scattered_plan(spectral::SB.AbstractDirectSumSpectralBackend, x, y, ms, ::Type{T};
-                    period, origin = (0, 0), solve::Bool = false, maxiter::Int = 100,
-                    eps = nothing, rtol::Real = default_solver_rtol(T, spectral, eps),
-                    damp::Real = 0, ntrans::Int = 1, nufft_nthreads::Int = 0) where {T} =
-    DirectNUFFTPlan(x, y, ms, T; period, origin, solve, maxiter, rtol, damp, ntrans)
+                    period, origin = (0, 0), analysis::AbstractAnalysis = WeightedAdjoint(),
+                    maxiter::Int = 100, tol = nothing,
+                    rtol::Real = default_solver_rtol(T, spectral, tol),
+                    damp::Real = 0, ntrans::Int = 1, nthreads::Int = 0) where {T} =
+    DirectNUFFTPlan(x, y, ms, T; period, origin, analysis, maxiter, rtol, damp, ntrans)
 
 make_scattered_plan(b::Union{FTB.FINUFFTBackend, FTB.NonuniformFFTsBackend}, x, y, ms, ::Type{T};
                     kwargs...) where {T} = nufft_scattered_plan(b, x, y, ms, T; kwargs...)
@@ -540,7 +508,7 @@ end
 # ---------------------------------------------------------------------------
 # Exact direct-summation NUDFT for scattered planar points, `O(M·prod(ms))`, with the contract of
 # `NUFFTScatteringPlan`: `forward_transform!` is the type-1 adjoint (points → mode grid), or an LSMR
-# least-squares inversion when `solve`; `inverse_transform!` is the type-2 synthesis (modes → points)
+# least-squares inversion under `LeastSquares()`; `inverse_transform!` is type-2 synthesis (modes → points)
 # scaled by `1/prod(ms)`. Modes are in FFT order, so on a uniform `0:m-1` grid these are exactly
 # `fft`/`ifft` and the lattice matches the wavelet bank's `fftfreq` layout.
 #
@@ -620,12 +588,12 @@ Exact direct-summation NUDFT between `M` scattered points and an `ms` mode grid,
 `batch_width(plan)` co-located fields per call. Memory is `O(M·(ms₁ + ms₂))`: one exponential table
 per axis.
 """
-struct DirectNUFFTPlan{T, TB <: _NUDFTTables{T}, CV <: AbstractVector{Complex{T}},
-                       RV <: AbstractVector{T}, WS} <: AbstractScatteringPlan
+struct DirectNUFFTPlan{T, TB <: _NUDFTTables{T}, CV <: AbstractMatrix{Complex{T}},
+                       RV <: AbstractVector{T}, A, WS} <: AbstractScatteringPlan
     ms::NTuple{2, Int}
     M::Int
     invN::T                 # 1/prod(ms) — makes synthesis the ifft-convention inverse
-    solve::Bool
+    analysis::A
     maxiter::Int
     rtol::T
     damp::T                 # Tikhonov λ
@@ -638,43 +606,58 @@ end
 
 batch_width(p::DirectNUFFTPlan) = p.tab.B
 
-# `eps` and `nufft_nthreads` configure a fast library; the exact direct sum has neither a tolerance nor
+# `tol` and `nthreads` configure a fast library; the exact direct sum has neither a tolerance nor
 # a thread count.
 function DirectNUFFTPlan(x::AbstractVector, y::AbstractVector, ms::NTuple{2, Int}, ::Type{T};
-                         period, origin = (0, 0), solve::Bool = false, maxiter::Int = 100,
+                         period, origin = (0, 0), analysis::AbstractAnalysis = WeightedAdjoint(),
+                         maxiter::Int = 100,
                          rtol::Real = default_solver_rtol(T, SB.DirectSumSpectralBackend(), nothing),
-                         damp::Real = 0, eps = nothing, ntrans::Int = 1,
-                         nufft_nthreads::Int = 0) where {T}
+                         damp::Real = 0, tol = nothing, ntrans::Int = 1,
+                         nthreads::Int = 0) where {T}
+    return _direct_nufft_plan(x, y, ms, T, analysis; period, origin, maxiter, rtol, damp, ntrans)
+end
+
+function _direct_nufft_plan(x, y, ms, ::Type{T}, analysis::AbstractAnalysis;
+                            period, origin, maxiter, rtol, damp, ntrans) where {T}
     M = length(x)
     ntrans >= 1 || throw(ArgumentError("ntrans must be at least 1; got $ntrans"))
     sx, sy = _folded_points(x, y, period, origin, T)
-    warn_underdetermined(M, ms, solve, damp)
+    warn_underdetermined(M, ms, analysis, damp)
     f(k, m) = FTB.mode_frequency(FTB.FFTModes(), k, m)
-    Ex = Complex{T}[cis(-f(k, ms[1]) * sx[n]) for k in 1:ms[1], n in 1:M]
-    Ey = Complex{T}[cis(-f(k, ms[2]) * sy[n]) for n in 1:M, k in 1:ms[2]]
-    tab = _NUDFTTables{T, Matrix{Complex{T}}, Matrix{Complex{T}}, Array{Complex{T}, 3}}(
-        ms, M, ntrans, Ex, Ey, conj.(Ex), Matrix(conj.(transpose(Ey))),
-        Matrix{Complex{T}}(undef, M, ms[2]), Matrix{Complex{T}}(undef, ms[1], M),
-        Matrix{Complex{T}}(undef, M, ntrans), Array{Complex{T}, 3}(undef, ms..., ntrans))
-    ls = solve ? FTB.LSMRWorkspace(tab) : nothing
-    return DirectNUFFTPlan{T, typeof(tab), Vector{Complex{T}}, typeof(sx), typeof(ls)}(
-        ms, M, one(T) / prod(ms), solve, maxiter, T(rtol), T(damp), sx, sy, tab,
-        Vector{Complex{T}}(undef, M), ls)
+    fx = _copy_like(sx, T[f(k, ms[1]) for k in 1:ms[1]])
+    fy = _copy_like(sx, T[f(k, ms[2]) for k in 1:ms[2]])
+    ypoints = _copy_like(sx, sy)
+    Ex = cis.(-reshape(fx, :, 1) .* reshape(sx, 1, :))
+    Ey = cis.(-reshape(ypoints, :, 1) .* reshape(fy, 1, :))
+    t = similar(sx, Complex{T}, M, ntrans)
+    w = similar(sx, Complex{T}, ms..., ntrans)
+    tab = _NUDFTTables{T, typeof(Ex), typeof(t), typeof(w)}(
+        ms, M, ntrans, Ex, Ey, conj.(Ex), permutedims(conj.(Ey)),
+        similar(Ex, M, ms[2]), similar(Ex, ms[1], M), t, w)
+    ls = _analysis_workspace(analysis, tab)
+    cj = similar(t)
+    return DirectNUFFTPlan{T, typeof(tab), typeof(cj), typeof(sx), typeof(analysis),
+                           typeof(ls)}(
+        ms, M, one(T) / prod(ms), analysis, maxiter, T(rtol), T(damp), sx, sy, tab, cj, ls)
 end
 
+_copy_like(ref, a) = copyto!(similar(ref, eltype(a), size(a)), a)
+_analysis_workspace(::WeightedAdjoint, op) = nothing
+_analysis_workspace(::LeastSquares, op) = FTB.LSMRWorkspace(op)
+
 Base.show(io::IO, p::DirectNUFFTPlan{T}) where {T} =
-    print(io, "DirectNUFFTPlan{", T, "}(ms=", p.ms, ", M=", p.M, ", ntrans=", p.tab.B, ", solve=",
-          p.solve, ")")
+    print(io, "DirectNUFFTPlan{", T, "}(ms=", p.ms, ", M=", p.M, ", ntrans=", p.tab.B,
+          ", analysis=", p.analysis, ")")
 
 spectral_backend(::DirectNUFFTPlan) = SB.DirectSumSpectralBackend()
 
-function task_local_plan(p::DirectNUFFTPlan{T, TB, CV, RV, WS}) where {T, TB, CV, RV, WS}
+function task_local_plan(p::DirectNUFFTPlan{T, TB, CV, RV, A, WS}) where {T, TB, CV, RV, A, WS}
     t = p.tab
     tab = TB(t.ms, t.M, t.B, t.Ex, t.Ey, t.Exc, t.Eyc, similar(t.Sbuf), similar(t.T1), similar(t.t),
              similar(t.w))
-    ls = p.ls === nothing ? nothing : FTB.LSMRWorkspace(tab)
-    return DirectNUFFTPlan{T, TB, CV, RV, WS}(p.ms, p.M, p.invN, p.solve, p.maxiter, p.rtol, p.damp,
-                                              p.sx, p.sy, tab, similar(p.cj), ls)
+    ls = _analysis_workspace(p.analysis, tab)
+    return DirectNUFFTPlan{T, TB, CV, RV, A, WS}(p.ms, p.M, p.invN, p.analysis, p.maxiter,
+        p.rtol, p.damp, p.sx, p.sy, tab, similar(p.cj), ls)
 end
 
 """
@@ -689,14 +672,12 @@ plan_points(p::DirectNUFFTPlan) = (p.sx, p.sy)
 # Direct summation is exact and single-threaded by construction, so it reports no tolerance and no
 # thread count — both are `nothing`/`0`, the values its constructor ignores.
 plan_analysis(p::DirectNUFFTPlan) =
-    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp, eps = nothing,
-     nufft_nthreads = 0)
+    (analysis = p.analysis, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp, tol = nothing,
+     nthreads = 0)
 
 # Type-1 (points → modes): X = Ex · (c ⊙ Ey), all preallocated.
 function _nudft_type1!(X::AbstractMatrix, tab::_NUDFTTables, c::AbstractVector)
-    @inbounds for k2 in 1:tab.ms[2], n in 1:tab.M
-        tab.Sbuf[n, k2] = c[n] * tab.Ey[n, k2]
-    end
+    tab.Sbuf .= reshape(c, :, 1) .* tab.Ey
     LinearAlgebra.mul!(X, tab.Ex, tab.Sbuf)
     return X
 end
@@ -704,13 +685,8 @@ end
 # Type-2 (modes → points): c_n = Σ_{k₁} Exc[k₁,n]·(X·Eyc)[k₁,n].
 function _nudft_type2!(c::AbstractVector, tab::_NUDFTTables{T}, X::AbstractMatrix) where {T}
     LinearAlgebra.mul!(tab.T1, X, tab.Eyc)
-    @inbounds for n in 1:tab.M
-        acc = zero(Complex{T})
-        for k1 in 1:tab.ms[1]
-            acc += tab.Exc[k1, n] * tab.T1[k1, n]
-        end
-        c[n] = acc
-    end
+    tab.T1 .*= tab.Exc
+    Base.sum!(reshape(c, 1, tab.M), tab.T1)
     return c
 end
 
@@ -734,22 +710,27 @@ end
 function inverse_transform!(out_pts::AbstractArray, plan::DirectNUFFTPlan, Xmodes::AbstractArray)
     _check_stacks(plan, Xmodes, out_pts)
     for k in 1:plan.tab.B
-        _nudft_type2!(plan.cj, plan.tab, _mcol(Xmodes, k))
+        cj = _pcol(plan.cj, k)
+        _nudft_type2!(cj, plan.tab, _mcol(Xmodes, k))
         o = _pcol(out_pts, k)
-        @. o = plan.cj * plan.invN
+        @. o = cj * plan.invN
     end
     return out_pts
 end
 
 function forward_transform!(Xmodes::AbstractArray, plan::DirectNUFFTPlan, x_pts::AbstractArray)
     _check_stacks(plan, Xmodes, x_pts)
-    if plan.solve
-        _lsmr_solve_nudft!(Xmodes, plan, x_pts)
-    else
-        for k in 1:plan.tab.B
-            copyto!(plan.cj, _pcol(x_pts, k))
-            _nudft_type1!(_mcol(Xmodes, k), plan.tab, plan.cj)
-        end
+    _forward_nudft!(Xmodes, plan, x_pts, plan.analysis)
+    return Xmodes
+end
+
+_forward_nudft!(Xmodes, plan, x_pts, ::LeastSquares) = _lsmr_solve_nudft!(Xmodes, plan, x_pts)
+
+function _forward_nudft!(Xmodes, plan, x_pts, ::WeightedAdjoint)
+    for k in 1:plan.tab.B
+        cj = _pcol(plan.cj, k)
+        copyto!(cj, _pcol(x_pts, k))
+        _nudft_type1!(_mcol(Xmodes, k), plan.tab, cj)
     end
     return Xmodes
 end
@@ -761,9 +742,8 @@ end
 # that is `conlim`.
 function _lsmr_solve_nudft!(f::AbstractArray, plan::DirectNUFFTPlan{T},
                             x_pts::AbstractArray) where {T}
-    FTB.lsmr!(f, plan.tab, x_pts, plan.ls; atol = plan.rtol, btol = plan.rtol, rtol = 0,
-              damp = plan.damp, conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
-    _check_solve(plan.ls, plan.M, plan.ms, plan.rtol, plan.maxiter)
+    FTB.lsmr!(f, plan.tab, x_pts, plan.ls; rtol = plan.rtol,
+        damp = plan.damp, conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     f .*= one(T) / plan.invN
     return f
 end

@@ -1,10 +1,10 @@
 # Structured (uniform) spherical scattering via the fast SHT path, on the
-# FastSphericalHarmonics Clenshaw–Curtis grid. Shares SphericalCore's DoG bank + cascade with the
+# FastSphericalHarmonics Fejér grid. Shares SphericalCore's DoG bank + cascade with the
 # scattered NUFSHT backend; only the spectral transform (exact fast SHT) differs.
 using FastSphericalHarmonics: FastSphericalHarmonics
 using NUFSHT: NUFSHT   # scattered backend for the cross-backend agreement test + closed-form sYlm
 
-Test.@testset "Structured spherical scattering (fast SHT on a Clenshaw–Curtis grid)" begin
+Test.@testset "Structured spherical scattering (fast SHT on a Fejér grid)" begin
     lmax, J = 24, 3
     Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)
 
@@ -24,9 +24,7 @@ Test.@testset "Structured spherical scattering (fast SHT on a Clenshaw–Curtis 
     Test.@test length(res.S1) == J
     Test.@test all(res.S1 .>= 0)
     Test.@test size(res.S2) == (J, J)
-    for j1 in 1:J, j2 in j1:J                                    # strictly coarser j2 < j1 only
-        Test.@test res.S2[j1, j2] == 0
-    end
+    Test.@test all(res.S2[j1, j2] == 0 for j1 in 1:J for j2 in 1:j1)
 
     # z-rotation covariance. The modulus is not band limited, so the grid mean of it is invariant only
     # to the quadrature's accuracy.
@@ -87,7 +85,7 @@ Test.@testset "Per-band band limits converge to the full-band-limit cascade" beg
     # A headroom covering the whole bank narrows nothing.
     stw = ScatteringTransforms.structured_spherical_scattering(lmax, J; max_order = 2,
                                                                band_headroom = 4 * 2^J)
-    Test.@test stw.bands === nothing
+    Test.@test all(p -> p === stw.plan, stw.bands)
 end
 
 Test.@testset "Structured (SHT) and scattered (NUFSHT) spherical scattering agree" begin
@@ -158,7 +156,7 @@ Test.@testset "The in-core direct SHT is the least-squares fit onto degree ≤ l
     h(ℓ) = exp(-0.3ℓ)
     cref = A \ F
 
-    plan = SC.make_spherical_plan(DS, θ, φ, lmax, Float64; rtol = 1e-13, maxiter = 2000)
+    plan = SC.make_spherical_plan(SC.SphericalScatteringTransform, DS, θ, φ, lmax, Float64; rtol = 1e-13, maxiter = 2000)
     out = zeros(M)
     for b in 1:B
         C = SC.sphere_coeffs(plan, F[:, b])
@@ -169,12 +167,14 @@ Test.@testset "The in-core direct SHT is the least-squares fit onto degree ≤ l
     end
 
     # A plan `B` fields wide fits each column as a single-field one does.
-    wide = SC.make_spherical_plan(DS, θ, φ, lmax, Float64; rtol = 1e-13, maxiter = 2000, ntrans = B)
+    wide = SC.make_spherical_plan(SC.SphericalScatteringTransform, DS, θ, φ, lmax, Float64; rtol = 1e-13, maxiter = 2000, ntrans = B)
     Test.@test ScatteringTransforms.Plans.batch_width(wide) == B
     outw = zeros(M, B)
     SC.sphere_apply!(outw, wide, SC.sphere_coeffs(wide, F), h)
     Test.@test outw ≈ A * (h.(degs) .* cref) rtol = 1e-9
-    Test.@test SC.sphere_mean(wide, F) ≈ vec(sum(F; dims = 1)) ./ M rtol = 1e-12
+    means = zeros(B)
+    SC.sphere_means!(means, wide, F)
+    Test.@test means ≈ vec(sum(F; dims = 1)) ./ M rtol = 1e-12
 
     # The plan holds `O(M + (lmax+1)²)` numbers, no matrix of harmonics at the points.
     Test.@test Base.summarysize(plan) < sizeof(A) ÷ 4
@@ -197,13 +197,14 @@ Test.@testset "Scattered analysis by the weighted adjoint" begin
                           for m in 0:ℓ for c in (m == 0 ? (real,) : (real, imag)))
         F = A * randn(size(A, 2), 3)
         for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
-            plan = SC.make_spherical_plan(spec, θ, φ, lmax, Float64; weights = w, solve = false, ntrans = 3)
+            plan = SC.make_spherical_plan(SC.SphericalScatteringTransform, spec, θ, φ, lmax, Float64;
+                                           weights = w, analysis = ScatteringTransforms.Plans.WeightedAdjoint(), ntrans = 3)
             out = similar(F)
             SC.sphere_apply!(out, plan, SC.sphere_coeffs(plan, F), Returns(1.0))
             Test.@test out ≈ F rtol = (plan isa SC.DirectSHTSphericalPlan ? 1e-12 : 2 * plan.plan.tol)
             # A transform rebuilt from its spec, as on a Distributed worker, computes the same coefficients.
             st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, weights = w,
-                                                           solve = false)
+                                                           analysis = ScatteringTransforms.Plans.WeightedAdjoint())
             rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
             Test.@test rb(F[:, 1]).S1 ≈ st(F[:, 1]).S1 rtol = 1e-8
             foreach(ScatteringTransforms.close_transform!, (st, rb))
@@ -221,10 +222,12 @@ Test.@testset "Scattered spherical means take the given quadrature weights" begi
     Random.seed!(6)
     w = 0.5 .+ rand(M)
     f = 1 .+ randn(M)
+    grid = FlowGeometries.Grids.UnstructuredGrid(FlowGeometries.Geometry.SphericalGeometry(1.0),
+                                                 (φ, π / 2 .- θ), w)
     for (spec, tol) in ((SpectralBackends.DirectSumSpectralBackend(), 1e-12),
                         (SpectralBackends.NUFSHTSpectralBackend(), 1e-6))
-        st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, weights = w,
-                                                       solve = false)
+        st = ScatteringTransforms.spherical_scattering(grid, lmax, J; transform = spec,
+                                                       analysis = ScatteringTransforms.Plans.WeightedAdjoint())
         Test.@test st(f).S0 ≈ sum(w .* f) / sum(w) rtol = tol
         rb = ScatteringTransforms.rebuild_transform(ScatteringTransforms.transform_spec(st))
         Test.@test rb(f).S0 ≈ sum(w .* f) / sum(w) rtol = tol

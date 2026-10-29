@@ -153,7 +153,7 @@ local phase of each wavelet coefficient. Three reconstruction levels are availab
 
 ## Monogenic (Riesz) scattering
 
-`MonogenicScattering` replaces the oriented analytic modulus with the rotation-covariant
+`MonogenicScatteringTransform` replaces the oriented analytic modulus with the rotation-covariant
 **monogenic amplitude**. From an *isotropic* band-pass `ψ_j` (radial in frequency, real,
 zero-mean) and the Riesz multipliers `R_d(k) = -i\,k_d/|k|` (`Σ_d|R_d|²=1` off the DC bin;
 `R_d = 0` on axis `d`'s Nyquist bin, the mean of its two aliases):
@@ -171,6 +171,13 @@ band-pass and its Riesz components carry `|\hatψ_j|^2(1 + Σ_d|R_d|^2)` per fre
 `|∇_S g|^2 = |L_+ g|^2 + (∂_φ g)^2`, and `L_+ Y_{ℓm} = \sqrt{(ℓ-m)(ℓ+m+1)}\,Y_{ℓ,m+1}` keeps the
 degree, so the energy is three scalar syntheses at the band limit, exact for band-limited `g`. The
 in-core direct plan takes the gradient from `∂_θ P̄_ℓ^m` and `∂_φ` evaluated at each point.
+
+## Spherical scale convention
+
+The low-pass cutoffs are `ℓ_k = lmax / 2^k`, `k = 0,…,J`. Band `j` is the difference
+`G_{j-1}(ℓ) - G_j(ℓ)`, where `G_k(ℓ) = exp(-ℓ(ℓ+1)/(2ℓ_k(ℓ_k+1)))`.
+Scale 1 is finest; the second-order cascade uses `j2 > j1`. Both spherical variants return
+`ScatteringCoefficients1D` with this ordering.
 
 ## Computation
 

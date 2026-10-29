@@ -121,7 +121,7 @@ function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Coeffici
         MK.barplot!(ax_b, 1:J_eff, c.S1 .+ 1e-10, color=:steelblue)
 
         ax_c = MK.Axis(fig[1:2, 2]; title="(c) S₂: cross-scale coupling  ⟨‖x⋆ψⱼ₁‖⋆ψⱼ₂‖⟩",
-                       xlabel="finer scale  j₂", ylabel="coarser scale  j₁",
+                       xlabel="finer scale  j₁", ylabel="coarser scale  j₂",
                        xticks=(1:J_eff, scale_labels), yticks=(1:J_eff, scale_labels),
                        aspect=MK.DataAspect())
         hm = MK.heatmap!(ax_c, S2_display(c.S2), colormap=_ENERGY_CMAP, nan_color=_NAN_COLOR)
@@ -144,8 +144,8 @@ function ScatteringTransforms.plot_coefficients(c::ScatteringTransforms.Coeffici
         # Panel (b): S2 heatmap
         ax_b = CairoMakie.Axis(fig[1, 2],
             title="(b) S₂: Second-Order Cross-Scale Coupling",
-            xlabel="Finer scale j₂",
-            ylabel="Coarser scale j₁",
+            xlabel="Finer scale j₁",
+            ylabel="Coarser scale j₂",
             xticks=(1:J_eff, scale_labels),
             yticks=(1:J_eff, scale_labels),
             aspect=CairoMakie.AxisAspect(1)

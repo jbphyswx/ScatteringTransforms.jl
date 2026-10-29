@@ -17,9 +17,11 @@ using ..PathGraph: PathGraph
 using ..Coefficients: Coefficients
 using ..ScatteringCore: ScatteringCore
 using ..Cascade: Cascade
+using ..ScatteringFields: ScatteringFields
 
-export MonogenicFilterBank, ComputedMonogenicFilterBank, MonogenicScattering
+export MonogenicFilterBank, ComputedMonogenicFilterBank, MonogenicScatteringTransform
 export build_monogenic_bank, riesz_multipliers, monogenic_amplitude, monogenic_components
+export monogenic_scattering!
 
 # Radial (isotropic) band-pass response over a D-dim frequency grid: a Gaussian bump on |k| at
 # center ξ with width σ, minus a low-pass term pinning the DC bin to zero (admissibility).
@@ -29,17 +31,18 @@ _radial_bandpass(dims::NTuple{D,Int}, ξ::T, σ::T) where {D,T} =
 function _radial_bandpass!(ψ::AbstractArray{T,D}, ξ::T, σ::T) where {D,T}
     κ = exp(-(ξ / σ)^2 / 2)
     dims = size(ψ)
-    @inbounds for I in CartesianIndices(dims)
+    function response(I)
         kk = zero(T)
-        for d in 1:D
+        @inbounds for d in 1:D
             f = T(Filters._frequency(dims[d], I[d]))
             kk += f * f
         end
         kn = sqrt(kk)
         g = exp(-((kn - ξ) / σ)^2 / 2)
         lp = exp(-(kn / σ)^2 / 2)
-        ψ[I] = g - κ * lp
+        return g - κ * lp
     end
+    ψ .= response.(CartesianIndices(ψ))
     return ψ
 end
 
@@ -60,7 +63,7 @@ function riesz_multipliers(dims::NTuple{D,Int}, ::Type{T}=Float64) where {D,T}
             kk += ks[d]^2
         end
         kn = sqrt(kk)
-        for d in 1:D
+        @inbounds for d in 1:D
             nyq = Filters._isnyquist(dims[d], I[d])
             R[d][I] = kn == zero(T) || nyq ? zero(Complex{T}) : Complex{T}(zero(T), -ks[d] / kn)
         end
@@ -225,19 +228,24 @@ struct MonogenicWorkspace{T, D, PW <: Cascade.PeriodizedWorkspace{T, D},
     rfilters::FV   # rfilters[l][j][d]; empty at level 1 and wherever `j` is not applied at `l`
 end
 
+MonogenicWorkspace(pw::Cascade.PeriodizedWorkspace{T,D}, amp, rfilters) where {T,D} =
+    MonogenicWorkspace{T,D,typeof(pw),typeof(amp),typeof(rfilters)}(pw, amp, rfilters)
+
 Base.show(io::IO, mw::MonogenicWorkspace{T, D}) where {T, D} =
     print(io, "MonogenicWorkspace{", T, ", ", D, "}(", mw.pw, ")")
 
 """
-    MonogenicScattering{D,T,FB,Tree,P,G,CB,MW}
+    MonogenicScatteringTransform{D}
 
 Monogenic scattering transform on a `D`-dimensional grid: an isotropic [`MonogenicFilterBank`](@ref),
 the scattering path tree (strictly-increasing scale), a spectral `plan`, and the periodized
 [`MonogenicWorkspace`](@ref) the cascade runs in.
+
+`D` is the number of spatial axes in `dims`.
 """
-struct MonogenicScattering{D, T, FB<:AnyMonogenicBank, Tree<:PathGraph.ScatteringTree,
+struct MonogenicScatteringTransform{D, T, FB<:AnyMonogenicBank, Tree<:PathGraph.ScatteringTree,
                            P<:Plans.AbstractScatteringPlan, G<:AbstractVector,
-                           CB<:AbstractArray{Complex{T},D}, MW<:MonogenicWorkspace{T,D}}
+                           CB<:AbstractArray{Complex{T},D}, MW<:MonogenicWorkspace{T,D}, W} <: ScatteringCore.AbstractScatteringTransform
     filter_bank::FB
     tree::Tree
     groups::G               # (j1, children, path ids), longest-first — the cascade's work list
@@ -246,7 +254,18 @@ struct MonogenicScattering{D, T, FB<:AnyMonogenicBank, Tree<:PathGraph.Scatterin
     dims::NTuple{D,Int}
     buffer_signal_fft::CB   # preserved signal FFT, at full resolution
     mw::MW
+    workspaces::W
 end
+
+MonogenicScatteringTransform(fb, tree, groups, max_order, plan, dims,
+                    buffer::AbstractArray{Complex{T},D}, mw) where {T,D} =
+    MonogenicScatteringTransform(fb, tree, groups, max_order, plan, dims, buffer, mw,
+                         ScatteringCore.Workspaces(MonogenicScatteringTransform))
+
+MonogenicScatteringTransform(fb, tree, groups, max_order, plan, dims,
+                    buffer::AbstractArray{Complex{T},D}, mw, workspaces) where {T,D} =
+    MonogenicScatteringTransform{D,T,typeof(fb),typeof(tree),typeof(plan),typeof(groups),typeof(buffer),typeof(mw),typeof(workspaces)}(
+        fb, tree, groups, max_order, plan, dims, buffer, mw, workspaces)
 
 # The path tree of bank `fb` and the cascade's work list over it.
 function tree_groups(fb, max_order::Int)
@@ -292,23 +311,21 @@ function assemble(fb, tree, groups, max_order::Int, plan,
                   pw::Cascade.PeriodizedWorkspace{T, D}) where {T, D}
     mw = _monogenic_workspace(fb, pw)
     buf = fill!(similar(fb.averaging, Complex{T}, pw.dims), zero(Complex{T}))
-    return MonogenicScattering{D, T, typeof(fb), typeof(tree), typeof(plan), typeof(groups),
-                               typeof(buf), typeof(mw)}(
-        fb, tree, groups, max_order, plan, pw.dims, buf, mw)
+    return MonogenicScatteringTransform(fb, tree, groups, max_order, plan, pw.dims, buf, mw)
 end
 
 """
-    MonogenicScattering([T=Float64,] dims, J; Q=1, max_order=2, filters=StoredFilters(),
+    MonogenicScatteringTransform([T=Float64,] dims, J; Q=1, max_order=2, filters=StoredFilters(),
                         oversampling=J, transform=AutoSpectralBackend())
 
 Construct a monogenic scattering transform for fields of size `dims` (`Int` or `NTuple{D,Int}`).
 The element type is positional, as for `zeros(T, …)`; omit it for `Float64`.
 `filters = FilterBanks.ComputedFilters()` evaluates the band-passes on demand
 ([`ComputedMonogenicFilterBank`](@ref)); `oversampling` and `transform` are as for the gridded
-transforms. The KernelAbstractions extension adds `MonogenicScattering([T,] dims, J, gpu::GPUBackend; …)`,
+transforms. The KernelAbstractions extension adds `MonogenicScatteringTransform([T,] dims, J, gpu::GPUBackend; …)`,
 a transform on that device.
 """
-function MonogenicScattering(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1, max_order::Int=2,
+function MonogenicScatteringTransform(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1, max_order::Int=2,
                              filters::FilterBanks.AbstractFilterStorage=FilterBanks.StoredFilters(),
                              oversampling::Int=J,
                              transform::SB.AbstractSpectralBackend=SB.AutoSpectralBackend()) where {T,D}
@@ -318,14 +335,14 @@ function MonogenicScattering(::Type{T}, dims::NTuple{D,Int}, J::Int; Q::Int=1, m
     pw = Cascade.build(fb, groups, dims, T, oversampling, plan)
     return assemble(fb, tree, groups, max_order, plan, pw)
 end
-MonogenicScattering(::Type{T}, N::Int, J::Int; kwargs...) where {T} =
-    MonogenicScattering(T, (N,), J; kwargs...)
-MonogenicScattering(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
-    MonogenicScattering(Float64, dims, J; kwargs...)
-MonogenicScattering(N::Int, J::Int; kwargs...) = MonogenicScattering(Float64, (N,), J; kwargs...)
+MonogenicScatteringTransform(::Type{T}, N::Int, J::Int; kwargs...) where {T} =
+    MonogenicScatteringTransform(T, (N,), J; kwargs...)
+MonogenicScatteringTransform(dims::NTuple{D,Int}, J::Int; kwargs...) where {D} =
+    MonogenicScatteringTransform(Float64, dims, J; kwargs...)
+MonogenicScatteringTransform(N::Int, J::Int; kwargs...) = MonogenicScatteringTransform(Float64, (N,), J; kwargs...)
 
-Base.show(io::IO, st::MonogenicScattering{D, T}) where {D, T} =
-    print(io, "MonogenicScattering{", D, ", ", T, "}(dims=", st.dims, ", J=", st.filter_bank.J, ", Q=",
+Base.show(io::IO, st::MonogenicScatteringTransform{D, T}) where {D, T} =
+    print(io, "MonogenicScatteringTransform{", D, ", ", T, "}(dims=", st.dims, ", J=", st.filter_bank.J, ", Q=",
           st.filter_bank.Q, ", max_order=", st.max_order, ", oversampling=", st.mw.pw.oversampling, ", ",
           st.plan, ")")
 
@@ -382,20 +399,30 @@ function _amp_from_parent!(dst, mw::MonogenicWorkspace{T, D}, fb, u1f, j::Int, l
 end
 
 """
-    (st::MonogenicScattering)(x) -> ScatteringCoefficients1D
+    (st::MonogenicScatteringTransform)(x) -> ScatteringCoefficients1D
 
 Apply the monogenic scattering transform; returns averaged coefficients in a
 `ScatteringCoefficients1D` (`S0` mean, `S1` over scales, `S2` over scale pairs). A complex field
 `x = a + ib` has amplitude `√(|m₀|² + Σ_d |m_d|²)`, which is `√(A(a)² + A(b)²)` in terms of the
 amplitudes of its real and imaginary parts, and a complex `S0`.
 """
-function (st::MonogenicScattering{D})(x::AbstractArray) where {D}
+function (st::MonogenicScatteringTransform{D})(x::AbstractArray) where {D}
+    T = real(eltype(st.buffer_signal_fft))
+    n = FilterBanks.nwavelets(st.filter_bank)
+    coeffs = Coefficients.ScatteringCoefficients1D(n, T; compute_S2=st.max_order >= 2)
+    return monogenic_scattering!(coeffs, st, x)
+end
+
+"""
+    monogenic_scattering!(coeffs, st, x) -> coeffs
+
+Write the averaged monogenic coefficients of `x` into `coeffs`.
+"""
+function monogenic_scattering!(coeffs::Coefficients.ScatteringCoefficients1D,
+                                st::MonogenicScatteringTransform, x::AbstractArray)
     mw = st.mw
     pw = mw.pw
-    T = eltype(first(mw.amp))
     fb = st.filter_bank
-    n = FilterBanks.nwavelets(fb)
-    coeffs = Coefficients.ScatteringCoefficients1D(n, T; compute_S2=st.max_order >= 2)
 
     c0 = pw.work[1]
     @. c0 = complex(x)
@@ -430,6 +457,59 @@ function (st::MonogenicScattering{D})(x::AbstractArray) where {D}
     return Coefficients.update_S0(coeffs, S0)
 end
 
+function ScatteringCore.task_workspace(st::MonogenicScatteringTransform)
+    fb = FilterBanks.task_bank(st.filter_bank)
+    pw = Cascade.task_copy(st.mw.pw, fb)
+    mw = MonogenicWorkspace(pw, map(similar, st.mw.amp), st.mw.rfilters)
+    return MonogenicScatteringTransform(fb, st.tree, st.groups, st.max_order, first(pw.plans),
+                                st.dims, similar(st.buffer_signal_fft), mw)
+end
+
+function ScatteringFields.scattering_field(st::MonogenicScatteringTransform{D}, x::AbstractArray;
+        subsample::Int = ScatteringFields.default_subsample(st.dims, st.filter_bank.J)) where {D}
+    all(n -> n % subsample == 0, st.dims) ||
+        throw(ArgumentError("subsample must divide each field dimension"))
+    buf = st.buffer_signal_fft
+    T = real(eltype(buf))
+    alloc(rd) = similar(buf, Complex{T}, rd)
+    fw = Cascade.build_field(st.filter_bank, st.groups, st.dims, T, st.mw.pw.oversampling,
+                              subsample, st.filter_bank.averaging; alloc,
+                              makeplan = rd -> Plans.plan_like(st.plan, alloc(rd)))
+    mw = _monogenic_workspace(st.filter_bank, fw.pw)
+    dims = map(n -> n ÷ subsample, st.dims)
+    S = promote_type(T, eltype(x))
+    data = fill!(similar(buf, S, (dims..., PathGraph.npaths(st.tree))), zero(S))
+    field = ScatteringFields.field_container(st.tree, data, subsample, (field = fw, monogenic = mw))
+    return ScatteringFields.scattering_field!(field, st, x)
+end
+
+function ScatteringFields.scattering_field!(field, st::MonogenicScatteringTransform{D}, x::AbstractArray) where {D}
+    fw, mw = field.ws.field, field.ws.monogenic
+    pw = mw.pw
+    @. pw.work[1] = complex(x)
+    Plans.forward_transform!(st.buffer_signal_fft, pw.plans[1], pw.work[1])
+    Xf = st.buffer_signal_fft
+    p1 = first(PathGraph.order_range(st.tree, 1))
+    root = first(PathGraph.order_range(st.tree, 0))
+    Cascade.localize!(Cascade._pathview(field.data, Val(D), root), fw, Xf, 1)
+    for (j1, children, paths) in st.groups
+        l1 = pw.level[j1]
+        a1 = _amp_from_full!(mw.amp[l1], mw, st.filter_bank, Xf, j1, l1)
+        @. pw.work[l1] = complex(a1)
+        u1f = isempty(children) ? pw.out[l1] : pw.spec[l1]
+        Plans.forward_transform!(u1f, pw.plans[l1], pw.work[l1])
+        Cascade.localize!(Cascade._pathview(field.data, Val(D), p1 + j1 - 1), fw, u1f, l1)
+        for (j2, path) in zip(children, paths)
+            l2 = pw.level[j2]
+            a2 = _amp_from_parent!(mw.amp[l2], mw, st.filter_bank, u1f, j2, l1, l2)
+            @. pw.work[l2] = complex(a2)
+            Plans.forward_transform!(pw.out[l2], pw.plans[l2], pw.work[l2])
+            Cascade.localize!(Cascade._pathview(field.data, Val(D), path), fw, pw.out[l2], l2)
+        end
+    end
+    return field
+end
+
 """
     monogenic_components(st, x, j) -> (; bandpass, riesz, amplitude, phase)
 
@@ -438,7 +518,7 @@ band-pass field `bandpass = x ⋆ ψ_j`, the `D` Riesz component fields `riesz`,
 `amplitude` `√(bandpass² + Σ|riesz|²)`, and the local monogenic `phase = atan(‖riesz‖, bandpass)`. The
 Riesz vector's direction gives the local orientation (e.g. `atan(riesz[2], riesz[1])` in 2D).
 """
-function monogenic_components(st::MonogenicScattering{D}, x::AbstractArray, j::Integer) where {D}
+function monogenic_components(st::MonogenicScatteringTransform{D}, x::AbstractArray, j::Integer) where {D}
     eltype(x) <: Real || throw(ArgumentError(
         "monogenic_components takes a real field, whose local phase and orientation the monogenic " *
         "signal defines; pass the real and imaginary parts of a complex field separately"))

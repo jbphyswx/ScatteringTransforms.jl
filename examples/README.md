@@ -36,7 +36,7 @@ coefficients (`synthesize`, via DifferentiationInterface + Mooncake), which prod
 sample with matching multiscale statistics.
 
 ## `monogenic.jl` — monogenic (Riesz) scattering
-`MonogenicScattering` in 1D/2D/3D, the Riesz-multiplier partition of unity, and
+`MonogenicScatteringTransform` in 1D/2D/3D, the Riesz-multiplier partition of unity, and
 `monogenic_components` — the smooth amplitude envelope and the continuously-recovered local
 orientation/phase (vs the oriented-modulus transform).
 

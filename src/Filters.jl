@@ -101,9 +101,7 @@ function frequency_response!(Ψ::AbstractVector{T}, m::Morlet1D{T}) where T<:Rea
     kappa = exp(-(ξ / σ)^2 * inv2)
     resp(f) = (ω = T(f[1]); ω < 0 ? zero(T) :
                exp(-((ω - ξ) / σ)^2 * inv2) - kappa * exp(-(ω / σ)^2 * inv2))
-    @inbounds for I in CartesianIndices(Ψ)
-        Ψ[I] = _alias_rms(resp, (N,), I)
-    end
+    Ψ .= _alias_rms.(Ref(resp), Ref((N,)), CartesianIndices(Ψ))
     return Ψ
 end
 
@@ -178,9 +176,7 @@ function frequency_response!(Ψ::AbstractMatrix{T}, m::Morlet2D{T}) where T<:Rea
         return exp(-(kxr - k0)^2 * σx2_div2 - kyr^2 * σy2_div2) -
                β * exp(-kxr^2 * σx2_div2 - kyr^2 * σy2_div2)
     end
-    @inbounds for I in CartesianIndices(Ψ)
-        Ψ[I] = _alias_rms(resp, m.N, I)
-    end
+    Ψ .= _alias_rms.(Ref(resp), Ref(m.N), CartesianIndices(Ψ))
     return Ψ
 end
 
@@ -255,9 +251,7 @@ function frequency_response!(Ψ::AbstractArray{T,3}, m::Morlet3D{T}) where T<:Re
         return exp(-((kpar - k0)^2 * σpar2 + kperp2 * σperp2) * inv2) -
                β * exp(-(kpar^2 * σpar2 + kperp2 * σperp2) * inv2)
     end
-    @inbounds for I in CartesianIndices(Ψ)
-        Ψ[I] = _alias_rms(resp, m.N, I)
-    end
+    Ψ .= _alias_rms.(Ref(resp), Ref(m.N), CartesianIndices(Ψ))
     return Ψ
 end
 

@@ -15,7 +15,7 @@ println("Zero-allocation streaming")
 println("="^64)
 
 N, J, nsig = 1024, 6, 200
-st = ST.Scattering1D.ScatteringTransform1D(N, J; Q=1, max_order=2)
+st = ST.ScatteringCore.ScatteringTransform(N, J; Q=1, max_order=2)
 nw = length(st.filter_bank.wavelets)
 signals = [randn(N) for _ in 1:nsig]
 

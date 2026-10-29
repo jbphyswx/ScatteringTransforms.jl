@@ -19,7 +19,7 @@ are the same.
 - **Domains**: 1D, 2D (oriented Morlet), 3D (oriented 3D Morlet), and spherical (S², smooth
   difference-of-Gaussians bands).
 - **Grid-support matrix**: Cartesian × spherical, on uniform/structured and nonuniform/scattered
-  sampling — gridded `ScatteringTransform{1,2,3}D` (FFT), scattered-planar `scattered_planar_scattering`
+  sampling — gridded `ScatteringTransform{D}` (FFT), scattered-planar `scattered_planar_scattering`
   (exact direct NUDFT), structured-sphere `structured_spherical_scattering` (exact direct SHT),
   scattered-sphere `spherical_scattering` (exact direct SHT). Every cell has an in-core,
   dependency-free default; FFTW, NonuniformFFTs or FINUFFT, FastSphericalHarmonics and NUFSHT are
@@ -32,7 +32,7 @@ are the same.
 - **Reconstruction**: exact linear wavelet-frame inverse (`wavelet_transform`/`iwavelet`),
   phase retrieval (`reconstruct_phase`), and gradient-descent `synthesize` from coefficients
   (DifferentiationInterface extension, any `ADTypes` backend).
-- **Monogenic (Riesz) scattering**: `MonogenicScattering` (1D/2D/3D) with the rotation-covariant
+- **Monogenic (Riesz) scattering**: `MonogenicScatteringTransform` (1D/2D/3D) with the rotation-covariant
   monogenic amplitude + continuous orientation/phase (`monogenic_components`); on S²,
   `spherical_monogenic_scattering` (amplitude) and `spherical_monogenic_components` (pointwise
   orientation/phase via the spin-1 Riesz vector).
@@ -57,13 +57,13 @@ using ScatteringTransforms: ScatteringTransforms as ST
 using FFTW: FFTW   # optional: loading it switches on the O(N log N) fast path automatically
 
 # 1D
-st = ST.Scattering1D.ScatteringTransform1D(1024, 8; Q=1, max_order=2)
+st = ST.ScatteringCore.ScatteringTransform(1024, 8; Q=1, max_order=2)
 c  = st(randn(1024))
 ST.Coefficients.zeroth_order(c); ST.Coefficients.first_order(c); ST.Coefficients.second_order(c)
 
 # 2D / 3D
-c2 = ST.Scattering2D.ScatteringTransform2D((256, 256), 4; L=8)(randn(256, 256))
-c3 = ST.Scattering3D.ScatteringTransform3D((32, 32, 32), 3; n_orient=6)(randn(32, 32, 32))
+c2 = ST.ScatteringCore.ScatteringTransform((256, 256), 4; L=8)(randn(256, 256))
+c3 = ST.ScatteringCore.ScatteringTransform((32, 32, 32), 3; n_orient=6)(randn(32, 32, 32))
 
 # localized field, reductions, batching
 field = ST.ScatteringFields.scattering_field(st, randn(1024))   # per-path low-passed, subsampled maps
@@ -108,7 +108,7 @@ FFT rules.
 ![Reconstruction & synthesis (2D)](assets/reconstruction_2d.png)
 
 ### Monogenic (Riesz) scattering
-`MonogenicScattering` uses the rotation-covariant monogenic amplitude in place of the oriented
+`MonogenicScatteringTransform` uses the rotation-covariant monogenic amplitude in place of the oriented
 modulus, and `monogenic_components` recovers the local amplitude envelope and a **continuous**
 orientation (not quantized into bins).
 
@@ -123,6 +123,10 @@ or `using FINUFFT` enables the nonuniform FFT, and with both loaded
 `transform = FlowTransformBindings.NonuniformFFTsBackend()` or `FlowTransformBindings.FINUFFTBackend()`
 names one.
 
+`analysis = ST.Plans.WeightedAdjoint()` is the planar default. Choose `ST.Plans.LeastSquares()`
+for a spectral fit, with `rtol` controlling its relative normal residual. `tol` sets NUFFT accuracy
+and `nthreads` sets the library thread count.
+
 ![Scattered planar scattering](assets/scattered_planar.png)
 
 ### Spherical scattering
@@ -131,6 +135,10 @@ path when loaded) and a **structured**
 equiangular grid (`structured_spherical_scattering`, fast SHT) give matching coefficients; the
 monogenic Riesz energy `|∇_S g|²` is synthesised exactly from scalar transforms, and
 `spherical_monogenic_components` synthesizes the spin-1 Riesz vector for pointwise orientation/phase.
+
+Spherical coefficients follow the finest-first convention: scale 1 is finest and second-order
+pairs satisfy `j2 > j1`. The result is a `ScatteringCoefficients1D`. The scattered constructors
+accept spherical FlowGeometries grids and default to `analysis = ST.Plans.LeastSquares()`.
 
 ![Spherical scattering](assets/spherical_scattering.png)
 ![Structured spherical scattering](assets/structured_spherical.png)
@@ -155,6 +163,10 @@ ST.scattering_batch(sp, X; execution = ThreadedBackend())   # composes with thre
 
 A plan's batch width is fixed when it is built, so such a transform runs a stack of any width 8
 columns at a time, the last group padded with zero columns.
+
+Task workspaces and widened spherical plans are retained across calls. Changing a cached batch
+width releases its old plans; `ST.close_transform!(st)` releases retained plans, including plans
+held on Distributed workers. Each worker receives its assigned columns.
 
 ![Backend performance](assets/backend_performance.png)
 

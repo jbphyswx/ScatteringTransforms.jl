@@ -2,7 +2,7 @@
 # Scattered planar transform by nonuniform FFT, through FlowTransformBindings
 #
 # The numeric contract of `DirectNUFFTPlan`: `forward_transform!` is the Type-1 adjoint onto the
-# `fftfreq` mode grid, or an LSMR least-squares inversion when `solve`; `inverse_transform!` is the
+# `fftfreq` mode grid, or an LSMR inversion under `LeastSquares()`; `inverse_transform!` is the
 # Type-2 synthesis scaled by `1/prod(ms)`.
 #
 # Real samples have a Hermitian spectrum, so they are analysed on a real-data plan over the half
@@ -14,42 +14,43 @@
 # ---------------------------------------------------------------------------
 
 """
-    NUFFTScatteringPlan{T,B}
+    NUFFTScatteringPlan
 
 Scattered-planar plan over FlowTransformBindings NUFFT plans on fixed points: a complex plan for
 synthesis and for complex samples, and a real plan for real samples and the real solve. `B` is the
 number of co-located fields each execution transforms, and `transform` the NUFFT library tag the
 plans run on.
 """
-struct NUFFTScatteringPlan{T, B, L, PC, PR, CV <: AbstractArray{Complex{T}}, HX <: AbstractArray{Complex{T}},
-                           PT <: AbstractArray{T}, RV <: AbstractVector{T}, IV <: AbstractVector{Int},
-                           DC <: AbstractArray{Complex{T}}, RS, CS} <: AbstractScatteringPlan
+struct NUFFTScatteringPlan{T, L, PC, PR, CV <: AbstractMatrix{Complex{T}}, HX <: AbstractArray{Complex{T}},
+                           PT <: AbstractMatrix{T}, RV <: AbstractVector{T}, IV <: AbstractVector{Int},
+                           DC <: AbstractArray{Complex{T}}, A, RS, CS, RB, CB} <: AbstractScatteringPlan
     transform::L
     cplan::PC
     rplan::PR
     ms::NTuple{2, Int}
     M::Int
+    B::Int
     invN::T                 # 1/prod(ms): synthesis is the ifft-convention inverse
-    solve::Bool
+    analysis::A
     maxiter::Int
     rtol::T
     damp::T                 # Tikhonov λ
     sx::RV                  # (M) points on the 2π-periodic domain, kept so a task can build its own
     sy::RV
-    eps::T
+    tol::T
     nthreads::Int
     hx::HX                  # the real plan's half spectrum, (ms[1] ÷ 2 + 1, n₂[, B])
     dc::DC                  # (1, n₂, B) scratch for the conjugate-symmetric rows
     rsolve::RS              # the half-grid solve's operator and `FTB.LSMRWorkspace`, or `nothing`
-    csolve::Base.RefValue{Union{Nothing, CS}}   # the full-grid solve's, built on first use
-    rbuf::Base.RefValue{Union{Nothing, PT}}
-    cbuf::Base.RefValue{Union{Nothing, CV}}
+    csolve::CS
+    rbuf::RB
+    cbuf::CB
     col::IV                 # (ms[2]) column of the half holding each `fftfreq(ms[2])` frequency
     negcol::IV              # (ms[2]) column holding its negative
     negcol_half::IV         # (n₂) column holding the negative of each column's frequency
 end
 
-batch_width(::NUFFTScatteringPlan{T, B}) where {T, B} = B
+batch_width(p::NUFFTScatteringPlan) = p.B
 
 _fft_index(f::Int, n::Int) = f >= 0 ? f + 1 : n + f + 1
 
@@ -60,55 +61,62 @@ function _like_ints(ref::AbstractArray, v::Vector{Int})
 end
 
 """
-    nufft_scattered_plan(backend, x, y, ms, T; period, origin = (0, 0), solve, maxiter, rtol, damp,
-                         eps, ntrans, nufft_nthreads) -> NUFFTScatteringPlan
+    nufft_scattered_plan(backend, x, y, ms, T; period, origin = (0, 0), analysis, maxiter, rtol, damp,
+                         tol, ntrans, nthreads) -> NUFFTScatteringPlan
 
 The scattered-planar plan over points `(x, y)` and mode grid `ms` on a FlowTransformBindings NUFFT
 `backend`, on a domain of length `period` with lower corner `origin` (see
-[`make_scattered_plan`](@ref)). `nufft_nthreads = 0` takes the session's `Threads.nthreads()`.
+[`make_scattered_plan`](@ref)). `nthreads = 0` takes the session's `Threads.nthreads()`.
 """
 function nufft_scattered_plan(backend::SB.AbstractNUFFTSpectralBackend, x, y, ms::NTuple{2, Int}, ::Type{T};
-                              period, origin = (0, 0), solve::Bool = false, maxiter::Int = 100,
-                              eps = nothing, rtol::Real = default_solver_rtol(T, backend, eps),
-                              damp::Real = 0, ntrans::Int = 1, nufft_nthreads::Int = 0) where {T}
+                              period, origin = (0, 0), analysis::AbstractAnalysis = WeightedAdjoint(),
+                              maxiter::Int = 100, tol = nothing,
+                              rtol::Real = default_solver_rtol(T, backend, tol),
+                              damp::Real = 0, ntrans::Int = 1, nthreads::Int = 0) where {T}
     M = length(x)
     sx, sy = _folded_points(x, y, period, origin, T)
-    warn_underdetermined(M, ms, solve, damp)
-    tol = eps === nothing ? FTB.default_tolerance(T) : T(eps)
-    return _nufft_plan_at(backend, ms, M, sx, sy, T(tol), T, solve, maxiter, T(rtol), ntrans, nufft_nthreads, T(damp))
+    warn_underdetermined(M, ms, analysis, damp)
+    tolerance = tol === nothing ? FTB.default_tolerance(T) : T(tol)
+    return _nufft_plan_at(backend, ms, M, sx, sy, T(tolerance), T, analysis, maxiter,
+                          T(rtol), ntrans, nthreads, T(damp))
 end
 
-function _nufft_plan_at(backend, ms::NTuple{2, Int}, M::Int, sx, sy, eps::T, ::Type{T}, solve, maxiter,
+function _nufft_plan_at(backend, ms::NTuple{2, Int}, M::Int, sx, sy, tol::T, ::Type{T},
+                        analysis::AbstractAnalysis, maxiter,
                         rtol::T, B::Int, nthreads::Int, damp::T) where {T}
     n2 = ms[2] + iseven(ms[2])
-    kw = (; ntrans = B, tol = eps, order = FTB.FFTModes(), nthreads = nthreads > 0 ? nthreads : Threads.nthreads())
+    kw = (; ntrans = B, tol, order = FTB.FFTModes(), nthreads = nthreads > 0 ? nthreads : Threads.nthreads())
     cplan = FTB.plan_nufft(backend, Complex{T}, (sx, sy), ms; kw...)
     rplan = FTB.plan_nufft(backend, T, (sx, sy), (ms[1], n2); kw...)
     m1h = ms[1] ÷ 2 + 1
-    half() = B == 1 ? similar(sx, Complex{T}, m1h, n2) : similar(sx, Complex{T}, m1h, n2, B)
     f2 = [FTB.mode_frequency(FTB.FFTModes(), j, ms[2]) for j in 1:ms[2]]
     col = _like_ints(sx, [_fft_index(f, n2) for f in f2])
     negcol = _like_ints(sx, [_fft_index(-f, n2) for f in f2])
     negcol_half = _like_ints(sx, [_fft_index(-FTB.mode_frequency(FTB.FFTModes(), k, n2), n2) for k in 1:n2])
-    hx = half()
+    hx = similar(sx, Complex{T}, m1h, n2, B)
     dc = similar(sx, Complex{T}, 1, n2, B)
-    rsolve = solve ? _solver(_HalfSolve(FTB.NUFFTOperator(rplan), ms, dc, negcol_half)) : nothing
-    # Types of what is built on first use: buffers from zero-length arrays `similar` to the points, so a
-    # device plan's types follow its points, and the full-grid solver as inferred.
-    PTT = typeof(B == 1 ? similar(sx, T, 0) : similar(sx, T, 0, 0))
-    CVT = typeof(B == 1 ? similar(sx, Complex{T}, 0) : similar(sx, Complex{T}, 0, 0))
-    CST = Base.promote_op(_complex_solver, typeof(cplan))
-    return NUFFTScatteringPlan{T, B, typeof(backend), typeof(cplan), typeof(rplan), CVT, typeof(hx), PTT,
-                               typeof(sx), typeof(col), typeof(dc), typeof(rsolve), CST}(
-        backend, cplan, rplan, ms, M, one(T) / prod(ms), solve, maxiter, rtol, damp, sx, sy, eps, nthreads,
-        hx, dc, rsolve, Base.RefValue{Union{Nothing, CST}}(nothing),
-        Base.RefValue{Union{Nothing, PTT}}(nothing), Base.RefValue{Union{Nothing, CVT}}(nothing),
-        col, negcol, negcol_half)
+    rsolve, csolve = _nufft_solvers(analysis, cplan, rplan, ms, dc, negcol_half)
+    PT = typeof(similar(sx, T, 0, 0))
+    CV = typeof(similar(sx, Complex{T}, 0, 0))
+    rbuf = Base.RefValue{Union{Nothing,PT}}(nothing)
+    cbuf = Base.RefValue{Union{Nothing,CV}}(nothing)
+    return NUFFTScatteringPlan{T, typeof(backend), typeof(cplan), typeof(rplan), CV,
+                               typeof(hx), PT, typeof(sx), typeof(col), typeof(dc),
+                               typeof(analysis), typeof(rsolve), typeof(csolve), typeof(rbuf), typeof(cbuf)}(
+        backend, cplan, rplan, ms, M, B, one(T) / prod(ms), analysis, maxiter, rtol, damp, sx, sy,
+        tol, nthreads, hx, dc, rsolve, csolve, rbuf, cbuf, col, negcol, negcol_half)
 end
 
 # An operator and the workspace of its solve.
 _solver(op) = (op, FTB.LSMRWorkspace(op))
 _complex_solver(cplan) = _solver(FTB.NUFFTOperator(cplan))
+
+_nufft_solvers(::WeightedAdjoint, cplan, rplan, ms, dc, negcol) = (nothing, nothing)
+function _nufft_solvers(::LeastSquares, cplan, rplan, ms, dc, negcol)
+    rsolve = _solver(_HalfSolve(FTB.NUFFTOperator(rplan), ms, dc, negcol))
+    CS = Base.promote_op(_complex_solver, typeof(cplan))
+    return rsolve, Base.RefValue{Union{Nothing,CS}}(nothing)
+end
 
 # The half-grid solve's operator: the real plan's type 2 over the half spectrum, with type 1 projected
 # onto the subspace the solve runs in (`_project_half!`). The projection acts within rows, so it is
@@ -131,20 +139,21 @@ function FTB.lsmr_adjoint!(v, s::_HalfSolve, u, c, n)
     return _project_half!(v, s.ms, s.dc, s.negcol_half)
 end
 
-Base.show(io::IO, p::NUFFTScatteringPlan{T, B}) where {T, B} =
+Base.show(io::IO, p::NUFFTScatteringPlan{T}) where {T} =
     print(io, "NUFFTScatteringPlan{", T, "}(", nameof(typeof(p.transform)), ", ms=", p.ms, ", M=", p.M,
-          ", ntrans=", B, ", solve=", p.solve, ")")
+          ", ntrans=", p.B, ", analysis=", p.analysis, ")")
 Base.show(io::IO, ::MIME"text/plain", p::NUFFTScatteringPlan) = show(io, p)
 
 spectral_backend(p::NUFFTScatteringPlan) = p.transform
 plan_points(p::NUFFTScatteringPlan) = (p.sx, p.sy)
 plan_analysis(p::NUFFTScatteringPlan) =
-    (solve = p.solve, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp, eps = p.eps, nufft_nthreads = p.nthreads)
+    (analysis = p.analysis, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp,
+     tol = p.tol, nthreads = p.nthreads)
 
 # The FlowTransformBindings plans hold the scratch every execution writes through, so a task builds its
 # own over the same points, at one thread unless one was asked for.
-task_local_plan(p::NUFFTScatteringPlan{T, B}) where {T, B} =
-    _nufft_plan_at(p.transform, p.ms, p.M, p.sx, p.sy, p.eps, T, p.solve, p.maxiter, p.rtol, B,
+task_local_plan(p::NUFFTScatteringPlan{T}) where {T} =
+    _nufft_plan_at(p.transform, p.ms, p.M, p.sx, p.sy, p.tol, T, p.analysis, p.maxiter, p.rtol, p.B,
                    per_task_nthreads(p.nthreads), p.damp)
 
 close_plan!(p::NUFFTScatteringPlan) = (FTB.close!(p.cplan); FTB.close!(p.rplan); nothing)
@@ -155,25 +164,47 @@ close_plan!(p::NUFFTScatteringPlan) = (FTB.close!(p.cplan); FTB.close!(p.rplan);
 # buffer made on its first use.
 # ---------------------------------------------------------------------------
 
-@inline _real_in(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV, HX, PT}, x::AbstractArray{<:Real}) where {T, B, L, PC, PR, CV, HX, PT} =
-    x isa PT ? x : copyto!(_rbuf(p), x)
+_point_matrix(x::AbstractVector) = reshape(x, :, 1)
+_point_matrix(x::AbstractMatrix) = x
 
-@noinline function _rbuf(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV, HX, PT}) where {T, B, L, PC, PR, CV, HX, PT}
-    buf = p.rbuf[]
-    buf === nothing && (buf = B == 1 ? similar(p.sx, T, p.M) : similar(p.sx, T, p.M, B); p.rbuf[] = buf)
-    return buf::PT
+@inline function _real_in(p::NUFFTScatteringPlan{T,L,PC,PR,CV,HX,PT,RV},
+                          x::AbstractArray{<:Real}) where {T,L,PC,PR,CV,HX,PT,RV}
+    return x isa Union{PT,RV} ? x : copyto!(_point_buffer!(p.rbuf, p.sx, p.M, p.B, PT), x)
 end
 
-@inline _pts_out(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV}, out::AbstractArray) where {T, B, L, PC, PR, CV} =
-    out isa CV ? out : _cbuf(p)
+@inline function _pts_out(p::NUFFTScatteringPlan{T,L,PC,PR,CV},
+                          out::AbstractArray) where {T,L,PC,PR,CV}
+    values = _point_matrix(out)
+    return values isa CV ? values : _point_buffer!(p.cbuf, p.sx, p.M, p.B, CV)
+end
 
-@inline _cplx_in(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV}, x::AbstractArray) where {T, B, L, PC, PR, CV} =
-    x isa CV ? x : copyto!(_cbuf(p), x)
+@inline function _cplx_in(p::NUFFTScatteringPlan, x::AbstractArray)
+    values = _point_matrix(x)
+    destination = _pts_out(p, values)
+    return destination === values ? values : copyto!(destination, values)
+end
 
-@noinline function _cbuf(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV}) where {T, B, L, PC, PR, CV}
-    buf = p.cbuf[]
-    buf === nothing && (buf = B == 1 ? similar(p.sx, Complex{T}, p.M) : similar(p.sx, Complex{T}, p.M, B); p.cbuf[] = buf)
-    return buf::CV
+@inline _cplx_in(::NUFFTScatteringPlan{T,L,PC,PR,Matrix{Complex{T}}},
+                 x::Vector{Complex{T}}) where {T,L,PC,PR} = x
+@inline _pts_out(::NUFFTScatteringPlan{T,L,PC,PR,Matrix{Complex{T}}},
+                 out::Vector{Complex{T}}) where {T,L,PC,PR} = out
+
+@noinline function _point_buffer!(cache, ref, M, B, ::Type{A}) where {A}
+    buffer = cache[]
+    if buffer === nothing
+        buffer = similar(ref, eltype(A), M, B)
+        cache[] = buffer
+    end
+    return buffer::A
+end
+
+@noinline function _complex_solver!(cache, cplan)
+    solver = cache[]
+    if solver === nothing
+        solver = _complex_solver(cplan)
+        cache[] = solver
+    end
+    return solver
 end
 
 # ---------------------------------------------------------------------------
@@ -182,12 +213,16 @@ end
 
 # Rows `1:np` of the full grid hold `k₁ = 0 … np - 1`, read from the half; the rest hold `k₁ < 0`, the
 # conjugates of the half at `(-k₁, -k₂)`.
-function _expand_hermitian!(F::AbstractArray, p::NUFFTScatteringPlan, H::AbstractArray)
+_half_view(H, rows, cols, ::Val{2}) = view(H, rows, cols, 1)
+_half_view(H, rows, cols, ::Val{3}) = view(H, rows, cols, :)
+
+function _expand_hermitian!(F::AbstractArray{T,N}, p::NUFFTScatteringPlan, H::AbstractArray{<:Any,3}) where {T,N}
     m1 = p.ms[1]
     np = (m1 - 1) ÷ 2 + 1
-    tail = ntuple(_ -> Colon(), ndims(F) - 2)
-    view(F, 1:np, :, tail...) .= view(H, 1:np, p.col, tail...)
-    np < m1 && (view(F, (np + 1):m1, :, tail...) .= conj.(view(H, (m1 + 1 - np):-1:2, p.negcol, tail...)))
+    tail = ntuple(_ -> Colon(), Val(N - 2))
+    view(F, 1:np, :, tail...) .= _half_view(H, 1:np, p.col, Val(N))
+    np < m1 && (view(F, (np + 1):m1, :, tail...) .=
+                conj.(_half_view(H, (m1 + 1 - np):-1:2, p.negcol, Val(N))))
     return F
 end
 
@@ -195,13 +230,14 @@ end
 # grid frequency; along an even axis the grid's `-m/2` also receives `G` at `+m/2`, which the series
 # holds and the grid does not, and the corner `(-m₁/2, -m₂/2)` receives `G(+m₁/2, +m₂/2)` as well. On
 # the uniform nodes `2πj/m` the two frequencies coincide, so the grid coefficients are the DFT there.
-function _expand_solution!(F::AbstractArray, p::NUFFTScatteringPlan, H::AbstractArray)
+function _expand_solution!(F::AbstractArray{T,N}, p::NUFFTScatteringPlan, H::AbstractArray{<:Any,3}) where {T,N}
     _expand_hermitian!(F, p, H)
     m1, m2 = p.ms
     np = (m1 - 1) ÷ 2 + 1
-    tail = ntuple(_ -> Colon(), ndims(F) - 2)
+    tail = ntuple(_ -> Colon(), Val(N - 2))
     # Row k₁ = -m₁/2 (grid row np + 1) takes G(+m₁/2, k₂), the half's last row.
-    iseven(m1) && (view(F, (np + 1):(np + 1), :, tail...) .+= view(H, (np + 1):(np + 1), p.col, tail...))
+    iseven(m1) && (view(F, (np + 1):(np + 1), :, tail...) .+=
+                   _half_view(H, (np + 1):(np + 1), p.col, Val(N)))
     if iseven(m2)
         n2 = m2 + 1
         c = m2 ÷ 2 + 1                         # grid column of k₂ = -m₂/2
@@ -209,9 +245,11 @@ function _expand_solution!(F::AbstractArray, p::NUFFTScatteringPlan, H::Abstract
         hm = _fft_index(-(m2 ÷ 2), n2)         # half column of -m₂/2
         # Column k₂ = -m₂/2 takes G(k₁, +m₂/2): the half itself for k₁ ≥ 0, the conjugate of
         # G(-k₁, -m₂/2) for k₁ < 0.
-        view(F, 1:np, c:c, tail...) .+= view(H, 1:np, hp:hp, tail...)
-        np < m1 && (view(F, (np + 1):m1, c:c, tail...) .+= conj.(view(H, (m1 + 1 - np):-1:2, hm:hm, tail...)))
-        iseven(m1) && (view(F, (np + 1):(np + 1), c:c, tail...) .+= view(H, (np + 1):(np + 1), hp:hp, tail...))
+        view(F, 1:np, c:c, tail...) .+= _half_view(H, 1:np, hp:hp, Val(N))
+        np < m1 && (view(F, (np + 1):m1, c:c, tail...) .+=
+                    conj.(_half_view(H, (m1 + 1 - np):-1:2, hm:hm, Val(N))))
+        iseven(m1) && (view(F, (np + 1):(np + 1), c:c, tail...) .+=
+                       _half_view(H, (np + 1):(np + 1), hp:hp, Val(N)))
     end
     return F
 end
@@ -222,25 +260,24 @@ end
 # which keeps its cosine: the row `k₁ = m₁/2` is made conjugate-symmetric in the same way, and the
 # columns `±m₂/2` are replaced by their mean. `dc` is `(1, n₂, B)` scratch and `negcol_half` the column
 # of each column's negative frequency.
-function _project_half!(H::AbstractArray, ms::NTuple{2, Int}, dc::AbstractArray, negcol_half::AbstractVector)
+function _project_half!(H::AbstractArray{<:Any,3}, ms::NTuple{2, Int}, dc::AbstractArray, negcol_half::AbstractVector)
     m1, m2 = ms
-    tail = ntuple(_ -> Colon(), ndims(H) - 2)
     if iseven(m2)
         n2 = m2 + 1
         hp, hm = _fft_index(m2 ÷ 2, n2), _fft_index(-(m2 ÷ 2), n2)
-        a, b = view(H, :, hp:hp, tail...), view(H, :, hm:hm, tail...)
+        a, b = view(H, :, hp:hp, :), view(H, :, hm:hm, :)
         a .= (a .+ b) ./ 2
         b .= a
     end
-    _symmetric_row!(H, 1, dc, negcol_half, tail)
-    iseven(m1) && _symmetric_row!(H, m1 ÷ 2 + 1, dc, negcol_half, tail)
+    _symmetric_row!(H, 1, dc, negcol_half)
+    iseven(m1) && _symmetric_row!(H, m1 ÷ 2 + 1, dc, negcol_half)
     return H
 end
 
 # Row `r` of the half replaced by its conjugate-symmetric part `(h[r, k₂] + conj(h[r, -k₂]))/2`.
-function _symmetric_row!(H::AbstractArray, r::Int, dc::AbstractArray, negcol_half::AbstractVector, tail)
-    row = view(H, r:r, :, tail...)
-    dc .= (row .+ conj.(view(H, r:r, negcol_half, tail...))) ./ 2
+function _symmetric_row!(H::AbstractArray{<:Any,3}, r::Int, dc::AbstractArray, negcol_half::AbstractVector)
+    row = view(H, r:r, :, :)
+    dc .= (row .+ conj.(view(H, r:r, negcol_half, :))) ./ 2
     row .= dc
     return H
 end
@@ -252,61 +289,47 @@ end
 function inverse_transform!(out_pts::AbstractArray, plan::NUFFTScatteringPlan, Xmodes::AbstractArray)
     dst = _pts_out(plan, out_pts)
     FTB.nufft_type2!(dst, plan.cplan, Xmodes)
-    @. out_pts = dst * plan.invN
+    dst === out_pts || copyto!(out_pts, dst)
+    out_pts .*= plan.invN
     return out_pts
 end
 
 function forward_transform!(Xmodes::AbstractArray, plan::NUFFTScatteringPlan, x_pts::AbstractArray{<:Real})
     b = _real_in(plan, x_pts)
-    if plan.solve
-        _lsmr_solve_real!(Xmodes, plan, b)
-    else
-        FTB.nufft_type1!(plan.hx, plan.rplan, b)
-        _expand_hermitian!(Xmodes, plan, plan.hx)
-    end
+    _forward_real!(Xmodes, plan, b, plan.analysis)
     return Xmodes
 end
 
 function forward_transform!(Xmodes::AbstractArray, plan::NUFFTScatteringPlan, x_pts::AbstractArray{<:Complex})
-    if plan.solve
-        _lsmr_solve_complex!(Xmodes, plan, _cplx_in(plan, x_pts))
-    else
-        FTB.nufft_type1!(Xmodes, plan.cplan, _cplx_in(plan, x_pts))
-    end
+    _forward_complex!(Xmodes, plan, _cplx_in(plan, x_pts), plan.analysis)
     return Xmodes
 end
 
-@inline function _rsolve(plan::NUFFTScatteringPlan)
-    rs = plan.rsolve
-    rs === nothing && throw(ArgumentError("plan was not built with `solve = true`"))
-    return rs
+_forward_real!(f, plan, b, ::LeastSquares) = _lsmr_solve_real!(f, plan, b)
+_forward_complex!(f, plan, b, ::LeastSquares) = _lsmr_solve_complex!(f, plan, b)
+
+function _forward_real!(f, plan, b, ::WeightedAdjoint)
+    FTB.nufft_type1!(plan.hx, plan.rplan, b)
+    return _expand_hermitian!(f, plan, plan.hx)
 end
 
-@noinline function _csolve(p::NUFFTScatteringPlan{T, B, L, PC, PR, CV, HX, PT, RV, IV, DC, RS, CS}) where {T, B, L, PC, PR, CV, HX, PT, RV, IV, DC, RS, CS}
-    got = p.csolve[]
-    got === nothing || return got
-    made = _complex_solver(p.cplan)
-    p.csolve[] = made
-    return made::CS
-end
+_forward_complex!(f, plan, b, ::WeightedAdjoint) = FTB.nufft_type1!(f, plan.cplan, b)
 
 # `A f̃ = x` is solved and scaled by `N` afterwards, which keeps intermediates at the field's own
 # magnitude. At `cond(A) = 1/eps` the smallest singular direction carries nothing the precision can
 # represent, so that is `conlim`.
 function _lsmr_solve_real!(f::AbstractArray, plan::NUFFTScatteringPlan{T}, b::AbstractArray) where {T}
-    op, ws = _rsolve(plan)
-    FTB.lsmr!(plan.hx, op, b, ws; atol = plan.rtol, btol = plan.rtol, rtol = 0, damp = plan.damp,
-              conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
-    _check_solve(ws, plan.M, size(plan.hx)[1:2], plan.rtol, plan.maxiter)
+    op, ws = plan.rsolve
+    FTB.lsmr!(plan.hx, op, b, ws; rtol = plan.rtol, damp = plan.damp,
+        conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     plan.hx .*= one(T) / plan.invN
     return _expand_solution!(f, plan, plan.hx)
 end
 
 function _lsmr_solve_complex!(f::AbstractArray, plan::NUFFTScatteringPlan{T}, x_pts::AbstractArray) where {T}
-    op, ws = _csolve(plan)
-    FTB.lsmr!(f, op, x_pts, ws; atol = plan.rtol, btol = plan.rtol, rtol = 0, damp = plan.damp,
-              conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
-    _check_solve(ws, plan.M, plan.ms, plan.rtol, plan.maxiter)
+    op, ws = _complex_solver!(plan.csolve, plan.cplan)
+    FTB.lsmr!(f, op, x_pts, ws; rtol = plan.rtol, damp = plan.damp,
+        conlim = inv(Base.eps(T)), maxiter = plan.maxiter)
     f .*= one(T) / plan.invN
     return f
 end
