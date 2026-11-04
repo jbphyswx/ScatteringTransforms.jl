@@ -163,10 +163,12 @@ _put_means!(S0, ::AbstractArray{<:Real}, X0, s) = (S0 .= real.(X0) .* s; S0)
 _put_means!(S0, ::AbstractArray{<:Complex}, X0, s) = (S0 .= X0 .* s; S0)
 
 """
-    (st::ScatteredPlanarScatteringTransform)(x) -> ScatteringCoefficients2D
+    (st::ScatteredPlanarScatteringTransform)(x) -> ScatteringCoefficients2D or (; coefficients, fit)
 
 Apply the scattered planar scattering transform to a length-`M` vector of samples at the plan's points.
-Allocates a coefficient container per call; use [`scattered_planar_scattering!`](@ref) to reuse one.
+Under `analysis = Plans.LeastSquares()` the result is `(; coefficients, fit)`, `fit` the
+`FlowTransformBindings.SolverResult` of the samples' fit. Allocates a coefficient container per call; use
+[`scattered_planar_scattering!`](@ref) to reuse one.
 """
 function (st::ScatteredPlanarScatteringTransform{T})(x::AbstractVector) where {T}
     fb = st.filter_bank
@@ -175,11 +177,11 @@ function (st::ScatteredPlanarScatteringTransform{T})(x::AbstractVector) where {T
 end
 
 """
-    scattered_planar_scattering!(coeffs, st, x) -> coeffs
+    scattered_planar_scattering!(coeffs, st, x) -> coeffs or (; coefficients, fit)
 
-In-place counterpart of the callable: write into a preallocated `ScatteringCoefficients2D`.
-Allocation-free when `coeffs` carries a 1-element `S0`, which [`Coefficients.update_S0`](@ref)
-writes in place.
+In-place counterpart of the callable: write into a preallocated `ScatteringCoefficients2D`, with the
+fit's outcome beside it under `LeastSquares()`. Allocation-free when `coeffs` carries a 1-element `S0`,
+which [`Coefficients.update_S0`](@ref) writes in place.
 """
 function scattered_planar_scattering!(coeffs::Coefficients.ScatteringCoefficients2D,
                                       st::ScatteredPlanarScatteringTransform{T}, x::AbstractVector) where {T}
@@ -195,14 +197,16 @@ function scattered_planar_scattering!(coeffs::Coefficients.ScatteringCoefficient
             coeffs.S2[j1, j2] = real(h[row, 1])
         end
     end
-    return Coefficients.update_S0(coeffs, _field_mean(x, h[1, 1]))
+    c = Coefficients.update_S0(coeffs, _field_mean(x, h[1, 1]))
+    return Plans._with_fit(c, Plans._plan_fit(st.plan, x, 1))
 end
 
 """
-    scattered_planar_scattering_batch!(S0, S1, S2, st, X) -> (; S0, S1, S2)
+    scattered_planar_scattering_batch!(S0, S1, S2, st, X) -> (; S0, S1, S2[, fit])
 
 Cascade over a stack of `B` fields sampled at the same points: `X` is `(M, B)`, `S0` is `(B)`, `S1`
-is `(nw, B)` and `S2` is `(nw, nw, B)`, `(0, 0, B)` without a second order.
+is `(nw, B)` and `S2` is `(nw, nw, B)`, `(0, 0, B)` without a second order. Under `LeastSquares()`,
+`fit` holds each field's `FlowTransformBindings.SolverResult`.
 
 The analysis covers the whole stack in one execution, and each field's cascade then runs on the mode
 grid; `st` must have been built with `ntrans = B`.
@@ -222,7 +226,7 @@ function scattered_planar_scattering_batch!(S0::AbstractVector, S1::AbstractMatr
         end
     end
     _put_means!(S0, X, view(Xm, 1, 1, :), inv(T(prod(st.dims))))
-    return (S0 = S0, S1 = S1, S2 = S2)
+    return Plans._with_fits((S0 = S0, S1 = S1, S2 = S2), Plans._fit_vector(st.plan, X, size(X, 2)))
 end
 
 end # module ScatteredPlanar

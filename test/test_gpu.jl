@@ -32,6 +32,10 @@ KA.synchronize(::JLArrays.JLBackend) = nothing
 
 _gpu_flat(c::ST.Coefficients.ScatteringCoefficients1D) = ST.Coefficients.flatten1d(c)
 _gpu_flat(c::ST.Coefficients.ScatteringCoefficients2D) = ST.Coefficients.flatten2d(c)
+_gpu_flat(r::NamedTuple) = _gpu_flat(r.coefficients)
+
+_gpu_batch(r::AbstractMatrix) = Array(r)
+_gpu_batch(r::NamedTuple) = Array(r.coefficients)
 
 Test.@testset "Device transforms with scalar indexing disabled (JLArray)" begin
     task_local_storage(:ScalarIndexing, GPUArraysCore.ScalarDisallowed) do
@@ -73,8 +77,8 @@ Test.@testset "Device transforms with scalar indexing disabled (JLArray)" begin
                             filters = computed, maxiter = 200, rtol = 1e-8)
                 host = ST.ScatteredPlanar.build(Float64, x, y, ms, J; options...)
                 dev = ST.ScatteredPlanar.build(Float64, x, y, ms, J, gpu; options...)
-                Test.@test Array(ST.scattering_batch(dev, JLArrays.JLArray(X); execution = gpu)) ≈
-                           ST.scattering_batch(host, X) rtol = 1e-6
+                Test.@test _gpu_batch(ST.scattering_batch(dev, JLArrays.JLArray(X); execution = gpu)) ≈
+                           _gpu_batch(ST.scattering_batch(host, X)) rtol = 1e-6
                 foreach(ST.close_transform!, (host, dev))
             end
         end
@@ -90,8 +94,8 @@ Test.@testset "Device transforms with scalar indexing disabled (JLArray)" begin
                 dev = build(JLArrays.JLArray(θ), JLArrays.JLArray(φ), lmax, J;
                             nufft)
                 Test.@test _gpu_flat(dev(JLArrays.JLArray(X[:, 1]))) ≈ _gpu_flat(host(X[:, 1])) rtol = 1e-6
-                Test.@test Array(ST.scattering_batch(dev, JLArrays.JLArray(X); execution = gpu)) ≈
-                           ST.scattering_batch(host, X) rtol = 1e-6
+                Test.@test _gpu_batch(ST.scattering_batch(dev, JLArrays.JLArray(X); execution = gpu)) ≈
+                           _gpu_batch(ST.scattering_batch(host, X)) rtol = 1e-6
                 if build === ST.spherical_monogenic_scattering
                     got = ST.spherical_monogenic_components(dev, JLArrays.JLArray(X[:, 1]), 1)
                     ref = ST.spherical_monogenic_components(host, X[:, 1], 1)

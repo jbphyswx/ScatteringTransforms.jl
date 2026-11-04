@@ -32,11 +32,18 @@ function ST._scattering_batch(b::CB.AbstractThreadedBackend,
     return ST._scattering_batch!(out, b, st, X)
 end
 
-function _run_columns!(out, ws, X, cols)
+function ST._scattering_batch(b::CB.AbstractThreadedBackend, st::ST._SampledTransform, X::AbstractArray)
+    T = ST._flat_eltype(ST._coefficient_eltype(st), X)
+    return ST._sampled_batch(b, st, X, Matrix{T}(undef, ST.flat_rows(st), size(X)[end]))
+end
+
+# Columns `cols` of `X` through the task's transform `ws`, and their fits' outcomes into `fit`.
+function _run_columns!(out, fit, ws, X, cols)
     coeffs = ST.batch_coeffs(ws, real(eltype(out)), eltype(out))
     for b in cols
-        c = ST._single_scattering!(coeffs, ws, selectdim(X, ndims(X), b))
-        ST._flatten_into!(view(out, :, b), c)
+        r = ST._single_scattering!(coeffs, ws, selectdim(X, ndims(X), b))
+        ST._flatten_into!(view(out, :, b), ST._coefficients(r))
+        ST._store_fit!(fit, b, r)
     end
     return nothing
 end
@@ -50,21 +57,21 @@ function ST._scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend
         _farm(st) do
             OMT.@tasks for t in 1:n
                 cols = (div((t - 1) * B, n) + 1):div(t * B, n)
-                _run_columns!(out, workspaces[t], X, cols)
+                _run_columns!(out, nothing, workspaces[t], X, cols)
             end
         end
     end
     return out
 end
 
-function _run_planar_groups!(out, ws, X, groups, W, B)
+function _run_planar_groups!(out, fit, ws, X, groups, W, B)
     for g in groups
-        ST._planar_group!(out, ws, X, ((g - 1) * W + 1):min(g * W, B))
+        ST._planar_group!(out, fit, ws, X, ((g - 1) * W + 1):min(g * W, B))
     end
     return nothing
 end
 
-function ST._scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend,
+function ST._scattering_batch!(out::AbstractMatrix, fit, ::CB.AbstractThreadedBackend,
                                st::ST.ScatteredPlanar.ScatteredPlanarScatteringTransform, X::AbstractMatrix)
     B, W = size(X, 2), ST.Plans.batch_width(st.plan)
     ngroups = cld(B, W)
@@ -74,17 +81,17 @@ function ST._scattering_batch!(out::AbstractMatrix, ::CB.AbstractThreadedBackend
         with_serial_blas() do
             OMT.@tasks for t in 1:n
                 groups = (div((t - 1) * ngroups, n) + 1):div(t * ngroups, n)
-                _run_planar_groups!(out, workspaces[t], X, groups, W, B)
+                _run_planar_groups!(out, fit, workspaces[t], X, groups, W, B)
             end
         end
     end
     return out
 end
 
-function ST._scattering_batch!(out::AbstractMatrix, b::CB.AbstractThreadedBackend,
+function ST._scattering_batch!(out::AbstractMatrix, fit, b::CB.AbstractThreadedBackend,
                                st::ST.SphericalCore.SphericalScatteringTransform, X::AbstractArray)
     size(X)[end] == 0 && return out
-    ST._spherical_batches(st.plan, X) || return _spherical_perfield!(out, b, st, X)
+    ST._spherical_batches(st.plan, X) || return _spherical_perfield!(out, fit, b, st, X)
     B = size(X)[end]
     n = min(B, Threads.nthreads())
     width = cld(B, n)
@@ -93,14 +100,19 @@ function ST._scattering_batch!(out::AbstractMatrix, b::CB.AbstractThreadedBacken
         _spherical_farm() do
             OMT.@tasks for t in 1:n
                 cols = ((t - 1) * width + 1):min(t * width, B)
-                isempty(cols) || ST._apply_cached_batch!(view(out, :, cols), entries[t], _columns(X, cols))
+                isempty(cols) || ST._apply_cached_batch!(view(out, :, cols), ST._fit_view(fit, cols), entries[t],
+                                                         _columns(X, cols))
             end
         end
     end
     return out
 end
 
-function _spherical_perfield!(out, b, st, X)
+ST._scattering_batch!(out::AbstractMatrix, fit, b::CB.AbstractThreadedBackend,
+                      st::ST.SphericalCore.SphericalMonogenicScatteringTransform, X::AbstractArray) =
+    _spherical_perfield!(out, fit, b, st, X)
+
+function _spherical_perfield!(out, fit, b, st, X)
     B = size(X)[end]
     B == 0 && return out
     n = min(B, Threads.nthreads())
@@ -108,7 +120,7 @@ function _spherical_perfield!(out, b, st, X)
         _spherical_farm() do
             OMT.@tasks for t in 1:n
                 cols = (div((t - 1) * B, n) + 1):div(t * B, n)
-                _run_columns!(out, workspaces[t], X, cols)
+                _run_columns!(out, fit, workspaces[t], X, cols)
             end
         end
     end

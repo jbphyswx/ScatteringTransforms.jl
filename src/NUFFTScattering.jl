@@ -150,6 +150,16 @@ plan_analysis(p::NUFFTScatteringPlan) =
     (analysis = p.analysis, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp,
      tol = p.tol, nthreads = p.nthreads)
 
+# Real samples are solved on the half grid, complex ones on the full grid, each in its own workspace.
+_fit_type(p::NUFFTScatteringPlan{T}) where {T} = _analysis_fit(p.analysis, T)
+_plan_fit(p::NUFFTScatteringPlan, ::AbstractArray{<:Real}, b::Integer) = _ws_fit(_solve_workspace(p.rsolve), b)
+_plan_fit(p::NUFFTScatteringPlan, ::AbstractArray{<:Complex}, b::Integer) =
+    _ws_fit(_complex_workspace(p.csolve, p.cplan), b)
+_solve_workspace(::Nothing) = nothing
+_solve_workspace(s::Tuple) = s[2]
+_complex_workspace(::Nothing, cplan) = nothing
+_complex_workspace(cache::Base.RefValue, cplan) = _complex_solver!(cache, cplan)[2]
+
 # The FlowTransformBindings plans hold the scratch every execution writes through, so a task builds its
 # own over the same points, at one thread unless one was asked for.
 task_local_plan(p::NUFFTScatteringPlan{T}) where {T} =

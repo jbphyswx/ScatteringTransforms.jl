@@ -151,6 +151,63 @@ execution.
 """
 batch_width(::Any) = 1
 
+# ---------------------------------------------------------------------------
+# A least-squares analysis reports each field's fit as a `FlowTransformBindings.SolverResult`, read from
+# the plan's LSMR workspace after the analysis. An analysis that fits nothing reports nothing.
+# ---------------------------------------------------------------------------
+
+# The outcome type of an analysis policy over element type `T`.
+_analysis_fit(::LeastSquares, ::Type{T}) where {T} = FTB.SolverResult{T}
+_analysis_fit(::WeightedAdjoint, ::Type{T}) where {T} = Nothing
+
+# `FTB.SolverResult{T}` for a plan whose analysis is a least-squares fit, `Nothing` otherwise.
+_fit_type(::Any) = Nothing
+
+# Field `b`'s outcome in the last analysis of the samples `x` through `plan`, or `nothing`.
+_plan_fit(::Any, x, b::Integer) = nothing
+
+_ws_fit(::Nothing, b::Integer) = nothing
+_ws_fit(ws::FTB.LSMRWorkspace, b::Integer) = FTB.SolverResult(ws, b)
+
+# The least converged of two outcomes: converged only if both are, the larger iteration count and residual.
+_worse_fit(::Nothing, ::Nothing) = nothing
+_worse_fit(a::FTB.SolverResult, ::Nothing) = a
+_worse_fit(::Nothing, b::FTB.SolverResult) = b
+_worse_fit(a::FTB.SolverResult{T}, b::FTB.SolverResult{T}) where {T} =
+    FTB.SolverResult{T}(a.converged & b.converged, max(a.iterations, b.iterations), max(a.residual, b.residual))
+
+# One outcome per field of `B`, or `nothing` for an analysis that fits nothing.
+_fit_buffer(::Type{Nothing}, B::Integer) = nothing
+_fit_buffer(::Type{R}, B::Integer) where {R<:FTB.SolverResult} = Vector{R}(undef, B)
+
+# `fit[cols[k]]` from field `k` of the last analysis of `x` through `plan`; `_merge_fits!` keeps the worse of
+# that and what `fit` holds.
+_store_fits!(::Nothing, plan, x, cols) = nothing
+function _store_fits!(fit::AbstractVector, plan, x, cols)
+    for (k, c) in enumerate(cols)
+        fit[c] = _plan_fit(plan, x, k)
+    end
+    return nothing
+end
+_merge_fits!(::Nothing, plan, x) = nothing
+function _merge_fits!(fit::AbstractVector, plan, x)
+    for b in eachindex(fit)
+        fit[b] = _worse_fit(fit[b], _plan_fit(plan, x, b))
+    end
+    return nothing
+end
+
+# The outcomes of the `n` fields of the last analysis of `x` through `plan`.
+_fit_vector(plan, x, n::Integer) = (fit = _fit_buffer(_fit_type(plan), n); _store_fits!(fit, plan, x, 1:n); fit)
+
+# A result with the fit's outcome beside it, `(; coefficients, fit)`; the result itself where nothing was fitted.
+_with_fit(c, ::Nothing) = c
+_with_fit(c, fit::Union{FTB.SolverResult, AbstractVector{<:FTB.SolverResult}}) = (; coefficients = c, fit)
+
+# A NamedTuple of results with the outcome merged in as its `fit`.
+_with_fits(nt::NamedTuple, ::Nothing) = nt
+_with_fits(nt::NamedTuple, fit) = merge(nt, (; fit))
+
 """
     task_local_plan(plan) -> plan
 
@@ -674,6 +731,9 @@ plan_points(p::DirectNUFFTPlan) = (p.sx, p.sy)
 plan_analysis(p::DirectNUFFTPlan) =
     (analysis = p.analysis, maxiter = p.maxiter, rtol = p.rtol, damp = p.damp, tol = nothing,
      nthreads = 0)
+
+_fit_type(p::DirectNUFFTPlan{T}) where {T} = _analysis_fit(p.analysis, T)
+_plan_fit(p::DirectNUFFTPlan, x, b::Integer) = _ws_fit(p.ls, b)
 
 # Type-1 (points → modes): X = Ex · (c ⊙ Ey), all preallocated.
 function _nudft_type1!(X::AbstractMatrix, tab::_NUDFTTables, c::AbstractVector)

@@ -128,6 +128,8 @@ ST.SphericalCore.plan_spin(p::NUSHTSphericalPlan) = p.spin
 ST.SphericalCore.plan_points(p::NUSHTSphericalPlan) = (p.theta, p.phi)
 ST.SphericalCore.plan_weights(p::NUSHTSphericalPlan) = p.weights
 ST.SphericalCore.plan_solver(p::NUSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter, analysis = p.analysis)
+ST.Plans._fit_type(p::NUSHTSphericalPlan) = ST.Plans._analysis_fit(p.analysis, eltype(p.theta))
+ST.Plans._plan_fit(p::NUSHTSphericalPlan, x, b::Integer) = ST.Plans._ws_fit(p.ws, b)
 ST.Plans.spectral_backend(::NUSHTSphericalPlan) = SB.NUFSHTSpectralBackend()
 ST.Plans.available(::SB.NUFSHTSpectralBackend) = true
 
@@ -320,6 +322,7 @@ function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogen
     T = eltype(p.theta)
     p0, p1 = p.spin
     C = ST.SphericalCore.sphere_coeffs(p, field)
+    fit = ST.Plans._plan_fit(p, field, 1)
     bfn = ST.SphericalCore.band_multiplier(st.sigma2[j], st.sigma2[j + 1])
     NUFSHT.apply_transfer!(C, _FnTransfer(bfn), lmax)
     sf = NUFSHT.allocate_coefficients(p0)
@@ -337,7 +340,7 @@ function ST.spherical_monogenic_components(st::ST.SphericalCore.SphericalMonogen
     amplitude = sqrt.(bandpass .^ 2 .+ rnorm .^ 2)
     phase = atan.(rnorm, bandpass)                # atan(‖riesz‖, bandpass)
     orientation = atan.(imag.(UR), real.(UR))     # tangent-vector direction on S²
-    return (; bandpass, riesz, amplitude, phase, orientation)
+    return ST.Plans._with_fits((; bandpass, riesz, amplitude, phase, orientation), fit)
 end
 
 end # module ScatteringTransformsNUFSHTExt

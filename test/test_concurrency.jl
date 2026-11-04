@@ -25,6 +25,9 @@ ScatteringTransforms.Plans.batch_width(p::LifecyclePlan) =
     ScatteringTransforms.Plans.batch_width(p.inner)
 ScatteringTransforms.Plans.plan_analysis(p::LifecyclePlan) =
     ScatteringTransforms.Plans.plan_analysis(p.inner)
+ScatteringTransforms.Plans._fit_type(p::LifecyclePlan) = ScatteringTransforms.Plans._fit_type(p.inner)
+ScatteringTransforms.Plans._plan_fit(p::LifecyclePlan, x, b::Integer) =
+    ScatteringTransforms.Plans._plan_fit(p.inner, x, b)
 ScatteringTransforms.Plans.task_local_plan(p::LifecyclePlan) =
     _derived(p, ScatteringTransforms.Plans.task_local_plan(p.inner))
 ScatteringTransforms.Plans.close_plan!(p::LifecyclePlan) =
@@ -102,7 +105,8 @@ Test.@testset "Batch plans are reused and closed with the transform" begin
             stc = with_lifecycle(st)
             serial = ScatteringTransforms.scattering_batch(st, F)
             for backend in (CBk.SerialBackend(), CBk.ThreadedBackend())
-                Test.@test ScatteringTransforms.scattering_batch(stc, F; execution = backend) ≈ serial rtol = 1e-8
+                Test.@test ScatteringTransforms.scattering_batch(stc, F; execution = backend).coefficients ≈
+                           serial.coefficients rtol = 1e-8
             end
             if build === ScatteringTransforms.spherical_scattering
                 retained = length(stc.workspaces.batches)
@@ -137,7 +141,7 @@ Test.@testset "Concurrent plan construction" begin
         function transform_once(t)
             st = ScatteringTransforms.spherical_scattering(θs[t], φs[t], lmax, J)
             try
-                return st(fields[t])
+                return st(fields[t]).coefficients
             finally
                 ScatteringTransforms.close_transform!(st)
             end
@@ -170,7 +174,7 @@ Test.@testset "Concurrent plan construction" begin
         Test.@test ScatteringTransforms.Plans.batch_width(st.plan) == st.plan.plan.B == 1
         serial = ScatteringTransforms.scattering_batch(st, X; execution = ComputationalBackends.SerialBackend())
         threaded = ScatteringTransforms.scattering_batch(st, X; execution = ComputationalBackends.ThreadedBackend())
-        Test.@test threaded ≈ serial rtol = 1e-8
+        Test.@test threaded.coefficients ≈ serial.coefficients rtol = 1e-8
         # The plan handed to a task is never the shared one, whatever width is asked for.
         for k in (1, B)
             p = ScatteringTransforms.SphericalCore.task_local_batch_plan(st.plan, k)

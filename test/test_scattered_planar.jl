@@ -19,7 +19,7 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         for analysis in (P.WeightedAdjoint(), P.LeastSquares())
             sca = ScatteringTransforms.scattered_planar_scattering(n1, n2, (Ny, Nx), J;
                 L=L, max_order=2, period=(Ny, Nx), analysis=analysis)
-            c = sca(vec(f))
+            c = ScatteringTransforms._coefficients(sca(vec(f)))
             Test.@test ScatteringTransforms.Coefficients.flatten2d(c) ≈ ref rtol=1e-6
         end
     end
@@ -55,7 +55,7 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
             st_g = Test.@test_logs (:warn, r"underdetermined") match_mode=:any (
                 ScatteringTransforms.scattered_planar_scattering(T, xg, yg, ms_g, 3;
                     L = 4, max_order = 2, period = (T(ms_g[1]), T(ms_g[2])), analysis = P.LeastSquares()))
-            c = st_g(fg)
+            c = st_g(fg).coefficients
             Test.@test all(isfinite, ScatteringTransforms.Coefficients.first_order(c))
             Test.@test all(isfinite, ScatteringTransforms.Coefficients.second_order(c))
         end
@@ -89,7 +89,7 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
             st = ScatteringTransforms.scattered_planar_scattering(x, y, msw, Jw; period = Pw, L = Lw,
                 transform = spec, analysis = P.LeastSquares(), maxiter = 2000, rtol = 1e-12, tol = 1e-12,
                 nthreads = 1)
-            c = st(wave.(x, y))
+            c = st(wave.(x, y)).coefficients
             Test.@test C.first_order(c) ≈ S1wave rtol = 1e-6
             Test.@test maximum(abs, C.second_order(c)) < 1e-6 * maximum(S1wave)
         end
@@ -108,7 +108,7 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
                                      topology = (FGG.Periodic(), FGG.Periodic()), period = Pw)
         st = ScatteringTransforms.scattered_planar_scattering(nodes, msw, Jw; L = Lw, transform = DS,
                                                               analysis = P.LeastSquares(), maxiter = 2000, rtol = 1e-12)
-        Test.@test C.first_order(st(wave.(x, y))) ≈ S1wave rtol = 1e-6
+        Test.@test C.first_order(st(wave.(x, y)).coefficients) ≈ S1wave rtol = 1e-6
 
         # Its cell measure is the default quadrature of the mean.
         area = 0.5 .+ rand(Mw)
@@ -140,7 +140,7 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         b = [g(px[k], py[k]) for k in 1:M]
         sc = ScatteringTransforms.scattered_planar_scattering(px, py, (Ny, Nx), J;
             L=L, max_order=2, period=(2π, 2π), analysis=P.LeastSquares())
-        r = sc(b)
+        r = sc(b).coefficients
         # `S0` is the mean of the fitted field, `g`'s own mean.
         Test.@test ScatteringTransforms.Coefficients.zeroth_order(r) ≈ 1.0 rtol=1e-6
         Test.@test all(ScatteringTransforms.Coefficients.first_order(r) .>= 0)
@@ -150,6 +150,16 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
         n = J * L
         Test.@test all(S2[j1, j2] == 0 for j1 in 1:n for j2 in 1:j1)
         Test.@test any(S2[j1, j2] > 0 for j1 in 1:n for j2 in (j1 + 1):n)
+
+        # A capped fit reports that it stopped short: the direct sum's solve, and the NUFFT plan's real
+        # and complex solves, which keep separate workspaces.
+        for (spec, samples) in ((SpectralBackends.DirectSumSpectralBackend(), b), (FTB.FINUFFTBackend(), b),
+                                (FTB.FINUFFTBackend(), complex.(b, 0.5 .* b)))
+            capped = ScatteringTransforms.scattered_planar_scattering(px, py, (Ny, Nx), J;
+                L=L, max_order=2, period=(2π, 2π), analysis=P.LeastSquares(), maxiter = 2, transform = spec)
+            fit = capped(samples).fit
+            Test.@test !fit.converged && fit.iterations == 2
+        end
     end
 
     Test.@testset "threaded batch, on every NUFFT backend" begin
@@ -214,8 +224,10 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
             wide = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (12, 12), 3;
                                                               ntrans = B, opts...)
             Test.@test ScatteringTransforms.Plans.batch_width(wide.plan) == B
-            Test.@test ScatteringTransforms.scattering_batch(wide, Xb) ≈
-                       ScatteringTransforms.scattering_batch(single, Xb) rtol = 1e-12
+            w, s = ScatteringTransforms.scattering_batch(wide, Xb), ScatteringTransforms.scattering_batch(single, Xb)
+            Test.@test ScatteringTransforms._coefficients(w) ≈ ScatteringTransforms._coefficients(s) rtol = 1e-12
+            # A `B`-wide solve reports each field's outcome as its single-field solve does, padding excluded.
+            analysis isa P.LeastSquares && Test.@test w.fit == s.fit
         end
     end
 
@@ -373,21 +385,21 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
             single = ScatteringTransforms.scattered_planar_scattering(xs, ys, (16, 16), 3;
                 L = 4, max_order = 2, period = (2π, 2π), analysis = P.LeastSquares(), transform = spec, conv...)
             serial = ScatteringTransforms.scattering_batch(
-                single, X; execution = ComputationalBackends.SerialBackend())
+                single, X; execution = ComputationalBackends.SerialBackend()).coefficients
             Test.@test ScatteringTransforms.scattering_batch(
-                single, X; execution = ComputationalBackends.ThreadedBackend()) ≈ serial rtol = 1e-8
+                single, X; execution = ComputationalBackends.ThreadedBackend()).coefficients ≈ serial rtol = 1e-8
 
             batched = ScatteringTransforms.ScatteredPlanar.build(Float64, xs, ys, (16, 16), 3;
                 L = 4, max_order = 2, period = (2π, 2π), analysis = P.LeastSquares(), transform = spec,
                 ntrans = B2, conv...)
             Test.@test ScatteringTransforms.Plans.batch_width(batched.plan) == B2
             Test.@test ScatteringTransforms.scattering_batch(
-                batched, X; execution = ComputationalBackends.SerialBackend()) ≈ serial rtol = 1e-8
+                batched, X; execution = ComputationalBackends.SerialBackend()).coefficients ≈ serial rtol = 1e-8
             # A per-task rebuild keeps the width.
             Test.@test ScatteringTransforms.Plans.batch_width(
                 ScatteringTransforms.Plans.task_local_plan(batched.plan)) == B2
             Test.@test ScatteringTransforms.scattering_batch(
-                batched, X; execution = ComputationalBackends.ThreadedBackend()) ≈ serial rtol = 1e-8
+                batched, X; execution = ComputationalBackends.ThreadedBackend()).coefficients ≈ serial rtol = 1e-8
         end
     end
 
@@ -413,8 +425,8 @@ Test.@testset "Scattered / nonuniform planar scattering (NUFFT)" begin
             Test.@test a1.tol == a0.tol
             # Against the value passed: the default is zero.
             Test.@test a1.damp == a0.damp == 0.25
-            Test.@test ScatteringTransforms.Coefficients.flatten2d(rb(fs)) ≈
-                       ScatteringTransforms.Coefficients.flatten2d(st(fs))
+            Test.@test ScatteringTransforms.Coefficients.flatten2d(rb(fs).coefficients) ≈
+                       ScatteringTransforms.Coefficients.flatten2d(st(fs).coefficients)
         end
     end
 

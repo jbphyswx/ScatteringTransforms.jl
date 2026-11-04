@@ -288,21 +288,30 @@ function _require_backend(gpu, st)
     return nothing
 end
 
-const _DeviceResidentTransform = Union{ST.ScatteredPlanar.ScatteredPlanarScatteringTransform,
-    ST.SphericalCore.SphericalScatteringTransform, ST.SphericalCore.SphericalMonogenicScatteringTransform,
-    ST.Monogenic.MonogenicScatteringTransform}
+_device_out(gpu, st, X) =
+    KA.allocate(gpu.backend, ST._flat_eltype(ST._coefficient_eltype(st), X), (ST.flat_rows(st), size(X)[end]))
 
-function ST._scattering_batch(gpu::CB.GPUBackend, st::_DeviceResidentTransform, X::AbstractArray)
+function ST._scattering_batch(gpu::CB.GPUBackend, st::ST.Monogenic.MonogenicScatteringTransform, X::AbstractArray)
     _require_backend(gpu, st)
-    T = ST._flat_eltype(ST._coefficient_eltype(st), X)
-    out = KA.allocate(gpu.backend, T, (ST.flat_rows(st), size(X)[end]))
-    return ST._scattering_batch!(out, gpu, st, X)
+    return ST._scattering_batch!(_device_out(gpu, st, X), gpu, st, X)
 end
 
-function ST._scattering_batch!(out::AbstractMatrix, gpu::CB.GPUBackend, st::_DeviceResidentTransform,
+function ST._scattering_batch!(out::AbstractMatrix, gpu::CB.GPUBackend, st::ST.Monogenic.MonogenicScatteringTransform,
                                X::AbstractArray)
     _require_backend(gpu, st)
     return ST._scattering_batch!(out, CB.SerialBackend(), st, X)
+end
+
+function ST._scattering_batch(gpu::CB.GPUBackend, st::ST._SampledTransform, X::AbstractArray)
+    _require_backend(gpu, st)
+    return ST._sampled_batch(gpu, st, X, _device_out(gpu, st, X))
+end
+
+# The fit outcomes are host values whichever memory the coefficients live in.
+function ST._scattering_batch!(out::AbstractMatrix, fit, gpu::CB.GPUBackend, st::ST._SampledTransform,
+                               X::AbstractArray)
+    _require_backend(gpu, st)
+    return ST._scattering_batch!(out, fit, CB.SerialBackend(), st, X)
 end
 
 _flen1d(st, ::Type{T}) where {T} = ST.Coefficients.flatten_length(

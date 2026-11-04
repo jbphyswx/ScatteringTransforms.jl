@@ -102,7 +102,7 @@ Test.@testset "Structured (SHT) and scattered (NUFSHT) spherical scattering agre
     for gfun in ((θ, φ) -> cos(θ)^2 - 1/3 + 0.5sin(θ) * cos(φ),   # smooth, content well below lmax
                  (θ, φ) -> cos(4θ) + 0.5sin(3θ) * cos(2φ))
         rstr = sst([gfun(θ, φ) for θ in Θ, φ in Φ])
-        rsca = scst([gfun(θ[k], φ[k]) for k in 1:M])
+        rsca = scst([gfun(θ[k], φ[k]) for k in 1:M]).coefficients
         Test.@test rsca.S0 ≈ rstr.S0 atol = 1e-3
         Test.@test maximum(abs.(rsca.S1 .- rstr.S1)) / maximum(abs.(rstr.S1)) < 0.02
         Test.@test maximum(abs.(rsca.S2 .- rstr.S2)) / (maximum(abs.(rstr.S2)) + eps()) < 0.10
@@ -123,7 +123,7 @@ Test.@testset "Dependency-free direct SH backend agrees with NUFSHT (scattered S
         sdir = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = SpectralBackends.DirectSumSpectralBackend())
         snu  = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = SpectralBackends.NUFSHTSpectralBackend())
         Test.@test sdir.plan isa SC.DirectSHTSphericalPlan
-        rdir, rnu = sdir(f), snu(f)
+        rdir, rnu = sdir(f).coefficients, snu(f).coefficients
         Test.@test rdir.S0 ≈ rnu.S0 atol = 1e-6
         Test.@test maximum(abs.(rdir.S1 .- rnu.S1)) / maximum(abs.(rnu.S1)) < 0.01
         Test.@test maximum(abs.(rdir.S2 .- rnu.S2)) / (maximum(abs.(rnu.S2)) + eps()) < 0.05
@@ -236,8 +236,9 @@ Test.@testset "Scattered spherical means take the given quadrature weights" begi
     end
 end
 
-Test.@testset "An analysis stopped at maxiter returns its best iterate" begin
-    # LSMR's residual falls monotonically, so a truncated solve is an answer on both scattered backends.
+Test.@testset "An analysis stopped at maxiter returns its best iterate and reports it" begin
+    # LSMR's residual falls monotonically, so a truncated solve is an answer on both scattered backends,
+    # and its outcome says it stopped short.
     lmax, J, M = 8, 3, 400
     gr = (sqrt(5) - 1) / 2
     θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
@@ -246,8 +247,9 @@ Test.@testset "An analysis stopped at maxiter returns its best iterate" begin
     for spec in (SpectralBackends.DirectSumSpectralBackend(), SpectralBackends.NUFSHTSpectralBackend())
         st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; transform = spec, maxiter = 2)
         r = st(f)
-        Test.@test all(isfinite, r.S1)
-        Test.@test all(isfinite, r.S2)
+        Test.@test all(isfinite, r.coefficients.S1)
+        Test.@test all(isfinite, r.coefficients.S2)
+        Test.@test !r.fit.converged && r.fit.iterations == 2
         ScatteringTransforms.close_transform!(st)
     end
 end
@@ -264,11 +266,26 @@ Test.@testset "Dependency-free structured SHT agrees with FastSphericalHarmonics
         sdir = ScatteringTransforms.structured_spherical_scattering(lmax, J; transform = SpectralBackends.DirectSumSpectralBackend())
         sfsh = ScatteringTransforms.structured_spherical_scattering(lmax, J; transform = SpectralBackends.FSHTSpectralBackend())
         Test.@test sdir.plan isa SC.DirectSHTSphericalPlan
-        rdir, rfsh = sdir(f), sfsh(f)
+        rdir, rfsh = sdir(f).coefficients, sfsh(f)
         Test.@test rdir.S0 ≈ rfsh.S0 atol = 1e-8
         Test.@test maximum(abs.(rdir.S1 .- rfsh.S1)) / maximum(abs.(rfsh.S1)) < 0.01
         Test.@test maximum(abs.(rdir.S2 .- rfsh.S2)) / (maximum(abs.(rfsh.S2)) + eps()) < 0.05
     end
+end
+
+# The in-core structured plan has no grid, so its cascade fits each first-order modulus as well as the
+# field. A modulus is broadband and takes more iterations than a field of degree 2, so the second order's
+# outcome, the least converged of every fit, shows more iterations than the first order's, the field's fit
+# alone.
+Test.@testset "The in-core structured sphere reports the least converged of its fits" begin
+    lmax, J = 16, 3
+    Θ, Φ = ScatteringTransforms.structured_sphere_points(lmax)
+    f = [cos(θ)^2 - 1/3 + 0.5sin(θ) * cos(φ) for θ in Θ, φ in Φ]
+    DS = SpectralBackends.DirectSumSpectralBackend()
+    field_fit = ScatteringTransforms.structured_spherical_scattering(lmax, J; max_order = 1, transform = DS)(f).fit
+    all_fits = ScatteringTransforms.structured_spherical_scattering(lmax, J; max_order = 2, transform = DS)(f).fit
+    Test.@test field_fit.converged && all_fits.converged
+    Test.@test all_fits.iterations > field_fit.iterations
 end
 
 # Both structured backends compute the spherical mean as a quadrature over the same node set, so each

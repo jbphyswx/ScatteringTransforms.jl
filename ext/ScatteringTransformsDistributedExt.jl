@@ -54,9 +54,17 @@ function _worker_for!(st, pid)
     return worker
 end
 
-function _send_columns!(out, worker::WorkerTransform, inner, block, cols)
+function _send_columns!(out, fit, worker::WorkerTransform, inner, block, cols)
     part = Distributed.remotecall_fetch(_remote_batch, worker.pid, worker.handle, inner, block)
-    copyto!(view(out, :, cols), part)
+    _put_part!(out, fit, part, cols)
+    return nothing
+end
+
+# A worker's columns, and with a fit their outcomes.
+_put_part!(out, ::Nothing, part::AbstractMatrix, cols) = (copyto!(view(out, :, cols), part); nothing)
+function _put_part!(out, fit::AbstractVector, part::NamedTuple, cols)
+    copyto!(view(out, :, cols), part.coefficients)
+    copyto!(view(fit, cols), part.fit)
     return nothing
 end
 
@@ -64,7 +72,8 @@ function _distributed_batch(b::CB.AbstractDistributedBackend, st, X)
     ncols = size(X)[end]
     T = ST._flat_eltype(ST._coefficient_eltype(st), X)
     out = Matrix{T}(undef, ST.flat_rows(st), ncols)
-    ncols == 0 && return out
+    fit = ST._fit_buffer(st, ncols)
+    ncols == 0 && return ST.Plans._with_fit(out, fit)
     pids = Distributed.workers()
     n = min(ncols, length(pids))
     inner = CB.local_backend(b)
@@ -73,10 +82,10 @@ function _distributed_batch(b::CB.AbstractDistributedBackend, st, X)
             cols = (div((t - 1) * ncols, n) + 1):div(t * ncols, n)
             worker = _worker_for!(st, pids[t])
             block = copy(selectdim(X, ndims(X), cols))
-            @async _send_columns!(out, worker, inner, block, cols)
+            @async _send_columns!(out, fit, worker, inner, block, cols)
         end
     end
-    return out
+    return ST.Plans._with_fit(out, fit)
 end
 
 ST._scattering_batch(b::CB.AbstractDistributedBackend,

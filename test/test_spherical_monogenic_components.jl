@@ -26,6 +26,7 @@ Test.@testset "Spherical monogenic components (spin-1 orientation/phase on S²)"
 
     field = Float64[real(NUFSHT.sYlm(0, ℓ0, 0, θ[k], φ[k])) for k in 1:M]     # real harmonic Y_{ℓ0,0}
     comp = ScatteringTransforms.spherical_monogenic_components(st, field, j)
+    Test.@test comp.fit.converged
 
     # Closed forms: band-pass = b_j(ℓ0)·Y_{ℓ0,0}; Riesz vector = b_j(ℓ0)·₁Y_{ℓ0,0}.
     Test.@test comp.bandpass ≈ bl .* field rtol = 1e-6
@@ -130,7 +131,7 @@ Test.@testset "Riesz energy |∇_S g|² equals the finite-difference gradient on
     # `g` is band limited, so the fit at the points and the adjoint on the grid recover the same field.
     J = 3
     st = ScatteringTransforms.spherical_monogenic_scattering(θs, φs, lmax, J; rtol = 1e-9)
-    S1 = st(g.(θs, φs)).S1
+    S1 = st(g.(θs, φs)).coefficients.S1
     θq, φq, wq = SC.gauss_legendre_grid(SC.grid_band(st.grid), Float64)
     stq = ScatteringTransforms.spherical_monogenic_scattering(θq, φq, lmax, J; weights = wq,
                                                              analysis = ScatteringTransforms.Plans.WeightedAdjoint())

@@ -170,10 +170,12 @@ batch_coeffs(st::ScatteringCore.ScatteringTransform{3}, ::Type{T}, ::Type{S0T} =
     _batch_coeffs2d(st, T, S0T, st.filter_bank.J, st.filter_bank.n_orient)
 
 """
-    scattering_batch!(out, st, X; execution = SerialBackend(), workspace = nothing) -> out
+    scattering_batch!(out, st, X; execution = SerialBackend(), workspace = nothing) -> out or (; coefficients, fit)
 
 In-place counterpart of [`scattering_batch`](@ref): write the flattened coefficients of each slice of
-`X` into the preallocated `(flatten_length, B)` matrix `out`.
+`X` into the preallocated `(flatten_length, B)` matrix `out`. A transform whose analysis of its samples
+is a least-squares fit returns `(; coefficients = out, fit)`, `fit[b]` field `b`'s
+`FlowTransformBindings.SolverResult` as its single call reports it.
 
 `execution` is where the batch runs: `SerialBackend` in this task, `ThreadedBackend` and
 `GPUBackend` through their extensions (OhMyThreads; KernelAbstractions, for the gridded transforms),
@@ -289,6 +291,37 @@ _single_scattering!(c, st::SphericalCore.SphericalScatteringTransform, x) =
 _single_scattering!(c, st::SphericalCore.SphericalMonogenicScatteringTransform, x) =
     SphericalCore.spherical_monogenic_scattering!(c.S1, c.S2, st, st.ws, x)
 
+# The transforms whose analysis of their samples may be a least-squares fit, and whose batches carry one fit
+# outcome per field: `nothing` where the analysis fits nothing, a vector filled by the batch otherwise.
+const _SampledTransform = Union{ScatteredPlanar.ScatteredPlanarScatteringTransform,
+                                SphericalCore.SphericalScatteringTransform,
+                                SphericalCore.SphericalMonogenicScatteringTransform}
+
+_fit_buffer(st, B::Integer) = nothing
+_fit_buffer(st::_SampledTransform, B::Integer) = Plans._fit_buffer(Plans._fit_type(st.plan), B)
+
+# One field's coefficient container, and its fit's outcome into `fit[b]`.
+_coefficients(r) = r
+_coefficients(r::NamedTuple{(:coefficients, :fit)}) = r.coefficients
+_store_fit!(::Nothing, b, r) = nothing
+_store_fit!(fit::AbstractVector, b, r) = (fit[b] = r.fit; nothing)
+_fit_view(::Nothing, cols) = nothing
+_fit_view(fit::AbstractVector, cols) = view(fit, cols)
+
+function scattering_batch!(out::AbstractMatrix, st::_SampledTransform, X::AbstractArray;
+                           execution::CB.AbstractExecutionBackend = CB.SerialBackend())
+    fit = _fit_buffer(st, size(X)[end])
+    _scattering_batch!(out, fit, execution, st, X)
+    return Plans._with_fit(out, fit)
+end
+
+# The allocating batch of a sampled transform on `b`, whose drivers write `out` and `fit` column by column.
+function _sampled_batch(b, st::_SampledTransform, X::AbstractArray, out::AbstractMatrix)
+    fit = _fit_buffer(st, size(X)[end])
+    _scattering_batch!(out, fit, b, st, X)
+    return Plans._with_fit(out, fit)
+end
+
 scattering_batch(st::Monogenic.MonogenicScatteringTransform, X::AbstractArray;
                  execution::CB.AbstractExecutionBackend = CB.SerialBackend()) =
     _scattering_batch(execution, st, X)
@@ -316,12 +349,13 @@ _flatten_into!(col, c::Coefficients.ScatteringCoefficients2D) = Coefficients.fla
 
 """
     scattering_batch(st::ScatteredPlanar.ScatteredPlanarScatteringTransform, X; execution = SerialBackend())
-        -> Matrix
+        -> Matrix or (; coefficients, fit)
 
 Transform every slice of `X` against one transform, returning a `(flatten_length, B)` matrix. `X` is
 `(M, B)`, where `M` is the plan's point count. A transform built with `ntrans = W > 1` runs the
 columns `W` at a time, through one execution per cascade step for each group, the last group padded
-with zero columns. `execution` is as in [`scattering_batch!`](@ref).
+with zero columns. Under `analysis = Plans.LeastSquares()` the matrix comes with `fit`, one
+`FlowTransformBindings.SolverResult` per field. `execution` is as in [`scattering_batch!`](@ref).
 """
 scattering_batch(st::ScatteredPlanar.ScatteredPlanarScatteringTransform, X::AbstractMatrix;
                  execution::CB.AbstractExecutionBackend = CB.SerialBackend()) =
@@ -330,15 +364,15 @@ scattering_batch(st::ScatteredPlanar.ScatteredPlanarScatteringTransform, X::Abst
 function _scattering_batch(b::CB.AbstractSerialBackend, st::ScatteredPlanar.ScatteredPlanarScatteringTransform,
                            X::AbstractMatrix)
     T = real(eltype(st.filter_bank.averaging))
-    return _scattering_batch!(Matrix{_flat_eltype(T, X)}(undef, flat_rows(st), size(X, 2)), b, st, X)
+    return _sampled_batch(b, st, X, Matrix{_flat_eltype(T, X)}(undef, flat_rows(st), size(X, 2)))
 end
 
-function _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
+function _scattering_batch!(out::AbstractMatrix, fit, ::CB.AbstractSerialBackend,
                             st::ScatteredPlanar.ScatteredPlanarScatteringTransform, X::AbstractMatrix)
     B = size(X, 2)
     W = Plans.batch_width(st.plan)
     for g in 1:cld(B, W)
-        _planar_group!(out, st, X, ((g - 1) * W + 1):min(g * W, B))
+        _planar_group!(out, fit, st, X, ((g - 1) * W + 1):min(g * W, B))
     end
     return out
 end
@@ -349,27 +383,31 @@ _planar_flat(st, out::AbstractMatrix) = st.flat
 _copy_planar_flat!(out::AbstractMatrix{<:Real}, flat) = (out .= real.(flat); out)
 _copy_planar_flat!(out::AbstractMatrix{<:Complex}, flat) = (copyto!(out, flat); out)
 
-# Columns `cols` of `X`, at most `W` of them, written into the same columns of `out`.
-function _planar_group!(out::AbstractMatrix, st::ScatteredPlanar.ScatteredPlanarScatteringTransform,
+# Columns `cols` of `X`, at most `W` of them, written into the same columns of `out`, and their fits'
+# outcomes into the same entries of `fit`.
+function _planar_group!(out::AbstractMatrix, fit, st::ScatteredPlanar.ScatteredPlanarScatteringTransform,
                         X::AbstractMatrix, cols::UnitRange{Int})
     n = length(cols)
     pad = ScatteredPlanar._samples(st, X)
     n < size(pad, 2) && fill!(pad, zero(eltype(pad)))
     copyto!(view(pad, :, 1:n), view(X, :, cols))
     spectrum = ScatteredPlanar._analyse!(st, pad)
+    Plans._store_fits!(fit, st.plan, pad, cols)
     Batched.batch_spectral_cascade!(st.flat, st.batch, spectrum)
     _copy_planar_flat!(view(out, :, cols), view(_planar_flat(st, out), :, 1:n))
     return out
 end
 
 """
-    scattering_batch(st::SphericalCore.SphericalScatteringTransform, X; execution = SerialBackend()) -> Matrix
+    scattering_batch(st::SphericalCore.SphericalScatteringTransform, X; execution = SerialBackend())
+        -> Matrix or (; coefficients, fit)
     scattering_batch(st::SphericalCore.SphericalMonogenicScatteringTransform, X; execution = SerialBackend())
-        -> Matrix
+        -> Matrix or (; coefficients, fit)
 
 Transform a stack of `B` fields sampled by the same spherical plan — `X` of size
-`(field_size…, B)`, so `(M, B)` for a scattered point set and `(nθ, nφ, B)` on a structured grid.
-`execution` is as in [`scattering_batch!`](@ref).
+`(field_size…, B)`, so `(M, B)` for a scattered point set and `(nθ, nφ, B)` on a structured grid. A plan
+whose analysis is a least-squares fit gives the matrix with `fit`, one `FlowTransformBindings.SolverResult`
+per field. `execution` is as in [`scattering_batch!`](@ref).
 
 Rows follow [`Coefficients.flat_length`](@ref). Scales are finest-first and second-order
 pairs satisfy `j2 > j1`, with row `flat_row_s2(j1, j2, J)`.
@@ -384,16 +422,16 @@ scattering_batch(st::SphericalCore.SphericalMonogenicScatteringTransform, X::Abs
 
 _scattering_batch(b::CB.AbstractSerialBackend, st::SphericalCore.SphericalScatteringTransform{T},
                   X::AbstractArray) where {T} =
-    _scattering_batch!(Matrix{T}(undef, flat_rows(st), size(X)[end]), b, st, X)
+    _sampled_batch(b, st, X, Matrix{T}(undef, flat_rows(st), size(X)[end]))
 
 _scattering_batch(b::CB.AbstractSerialBackend, st::SphericalCore.SphericalMonogenicScatteringTransform{T},
                   X::AbstractArray) where {T} =
-    _scattering_batch!(Matrix{T}(undef, flat_rows(st), size(X)[end]), b, st, X)
+    _sampled_batch(b, st, X, Matrix{T}(undef, flat_rows(st), size(X)[end]))
 
 for (TT, WS, fun) in (
         (:SphericalScatteringTransform, :SphericalWorkspace, :spherical_scattering!),
         (:SphericalMonogenicScatteringTransform, :SphericalMonogenicWorkspace, :spherical_monogenic_scattering!))
-    @eval function _spherical_batch_perfield!(out::AbstractMatrix, st::SphericalCore.$TT{T},
+    @eval function _spherical_batch_perfield!(out::AbstractMatrix, fit, st::SphericalCore.$TT{T},
                                               X::AbstractArray) where {T}
         D = ndims(X)
         # An empty block (more MPI ranks than columns) has no field to size the workspace from.
@@ -404,7 +442,8 @@ for (TT, WS, fun) in (
         flat = Vector{eltype(out)}(undef, size(out, 1))
         @inbounds for b in 1:size(X, D)
             r = SphericalCore.$fun(S1, S2, st, ws, selectdim(X, D, b))
-            Coefficients.flatten1d!(flat, r)
+            Coefficients.flatten1d!(flat, _coefficients(r))
+            _store_fit!(fit, b, r)
             copyto!(view(out, :, b), flat)
         end
         return out
@@ -413,9 +452,9 @@ end
 
 # The monogenic cascade has no batched form: its amplitude needs the Riesz gradient, which is built
 # from per-field spin-0 transforms.
-_scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
+_scattering_batch!(out::AbstractMatrix, fit, ::CB.AbstractSerialBackend,
                    st::SphericalCore.SphericalMonogenicScatteringTransform, X::AbstractArray) =
-    _spherical_batch_perfield!(out, st, X)
+    _spherical_batch_perfield!(out, fit, st, X)
 
 # A widened plan takes a scattered `(M, B)` stack with `B > 1`; a structured grid's fields are
 # matrices.
@@ -424,15 +463,15 @@ _spherical_batches(plan, X::AbstractArray) =
 
 # Scattered-point backends that support `batch_plan` run one transform per cascade step for the
 # whole stack. Structured and in-core plans take the per-field loop.
-function _scattering_batch!(out::AbstractMatrix, ::CB.AbstractSerialBackend,
+function _scattering_batch!(out::AbstractMatrix, fit, ::CB.AbstractSerialBackend,
                             st::SphericalCore.SphericalScatteringTransform{T}, X::AbstractArray) where {T}
     B = size(X)[end]
     B == 0 && return out
-    _spherical_batches(st.plan, X) || return _spherical_batch_perfield!(out, st, X)
+    _spherical_batches(st.plan, X) || return _spherical_batch_perfield!(out, fit, st, X)
 
     ScatteringCore.with_batch_workspaces(() -> SphericalBatchWorkspace(st, B), st,
                                          B, CB.SerialBackend(), 1) do entries
-        _apply_cached_batch!(out, first(entries), X)
+        _apply_cached_batch!(out, fit, first(entries), X)
     end
     return out
 end
@@ -460,14 +499,21 @@ end
 
 _apply_cached_batch!(out, entry::ScatteringCore.CachedBatch, X) =
     _apply_batch!(out, entry.workspace, X)
+_apply_cached_batch!(out, fit, entry::ScatteringCore.CachedBatch, X) =
+    _apply_batch!(out, fit, entry.workspace, X)
 _apply_batch!(out, ws::Batched.BatchWorkspace, X) = Batched.batch_cascade!(out, ws, X)
 
-function _apply_batch!(out, ws::SphericalBatchWorkspace, X)
+# The first `n` fields' fit outcomes of a batch result into `fit`.
+_copy_fits!(::Nothing, r, n) = nothing
+_copy_fits!(fit::AbstractVector, r, n) = (copyto!(fit, firstindex(fit), r.fit, 1, n); nothing)
+
+function _apply_batch!(out, fit, ws::SphericalBatchWorkspace, X)
     st = ws.transform
     n = size(out, 2)
     n < size(ws.input, 2) && fill!(ws.input, zero(eltype(ws.input)))
     copyto!(view(ws.input, :, 1:n), X)
     r = SphericalCore.spherical_scattering_batch!(ws.S1, ws.S2, st, st.ws, ws.input)
+    _copy_fits!(fit, r, n)
     fill!(ws.flat, zero(eltype(ws.flat)))
     view(ws.flat, 1, :) .= r.S0
     view(ws.flat, 2:(st.J + 1), :) .= r.S1
@@ -621,6 +667,11 @@ _scattering_batch(b::CB.AbstractExecutionBackend, st, X) =
 _scattering_batch!(out, b::CB.AbstractAutoBackend, st, X; kwargs...) =
     _scattering_batch!(out, Execution.resolve_backend(b), st, X; kwargs...)
 _scattering_batch!(out, b::CB.AbstractExecutionBackend, st, X; kwargs...) =
+    (Execution.check_available(b); throw(ArgumentError(
+        "scattering_batch! has no method for backend $(typeof(b)) on a $(typeof(st)).")))
+_scattering_batch!(out, fit, b::CB.AbstractAutoBackend, st::_SampledTransform, X) =
+    _scattering_batch!(out, fit, Execution.resolve_backend(b), st, X)
+_scattering_batch!(out, fit, b::CB.AbstractExecutionBackend, st::_SampledTransform, X) =
     (Execution.check_available(b); throw(ArgumentError(
         "scattering_batch! has no method for backend $(typeof(b)) on a $(typeof(st)).")))
 

@@ -44,12 +44,13 @@ Test.@testset "JET type stability (hot path)" begin
         JET.@test_opt target_modules = (ST,) sphere(zeros(64))
         spherical_batch = ST.SphericalBatchWorkspace(sphere, 2)
         JET.@test_opt target_modules = (ST,) ST._apply_batch!(zeros(ST.flat_rows(sphere), 2),
-                                                            spherical_batch, zeros(64, 2))
+                                                            ST._fit_buffer(sphere, 2), spherical_batch, zeros(64, 2))
         structured = ST.structured_spherical_scattering(3, 2; transform = SB.DirectSumSpectralBackend())
         JET.@test_opt target_modules = (ST,) structured(zeros(4, 7))
         structured_batch = ST.SphericalBatchWorkspace(structured, 2)
         JET.@test_opt target_modules = (ST,) ST._apply_batch!(zeros(ST.flat_rows(structured), 2),
-                                                            structured_batch, zeros(4, 7, 2))
+                                                            ST._fit_buffer(structured, 2), structured_batch,
+                                                            zeros(4, 7, 2))
 
         # Filter frequency responses (built once per bank).
         JET.@test_opt ST.Filters.frequency_response(ST.Filters.Morlet1D(64, 0; Q=1))

@@ -159,7 +159,8 @@ The caller gives the domain's size, `period`, which sets every mode's wavelength
 grid that carries it. On a uniform grid it reproduces the gridded FFT transform to transform accuracy.
 `analysis = ST.Plans.LeastSquares()` recovers the
 band-limited coefficients for irregular sampling by LSMR least squares — minimum-norm where the
-samples do not determine the modes, with `damp` for explicit Tikhonov regularisation. The default is
+samples do not determine the modes, with `damp` for explicit Tikhonov regularisation — and returns
+`(; coefficients, fit)`, `fit` the fit's `FlowTransformBindings.SolverResult`. The default is
 an in-core exact direct NUDFT (no dependencies); `using NonuniformFFTs` or `using FINUFFT` enables the
 nonuniform FFT, and with both loaded `transform = FlowTransformBindings.NonuniformFFTsBackend()` or
 `FlowTransformBindings.FINUFFTBackend()` names one.
@@ -179,8 +180,11 @@ coefficient is that grid's mean of a modulus of the field the analysis recovers:
 
 Spherical results use `ST.Coefficients.ScatteringCoefficients1D`, with scale 1 finest and
 `S2[j1, j2]` populated for `j2 > j1`. The scattered constructors also accept a spherical
-FlowGeometries grid. Their default `LeastSquares()` input fit returns its best iterate at an
-iteration or condition limit; diagnostics stay in the fit workspace.
+FlowGeometries grid. Under their default `LeastSquares()`, and on the in-core structured sphere, the
+analysis is a fit and a call returns `(; coefficients, fit)`: `fit` is the
+`FlowTransformBindings.SolverResult` (`converged`, `iterations`, `residual`) of the least converged of
+the call's fits, and a fit stopped at its iteration or condition limit keeps its best iterate with
+`converged == false`. A batch returns one per field.
 
 ![Spherical scattering](docs/src/assets/spherical_scattering.png)
 ![Structured spherical scattering](docs/src/assets/structured_spherical.png)

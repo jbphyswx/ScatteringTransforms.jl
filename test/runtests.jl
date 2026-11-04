@@ -377,7 +377,7 @@ Test.@testset "Spherical scattering (NUFSHT, smooth difference-of-Gaussians band
     φ = [2π * mod(k * gr, 1) for k in 1:M]
     st = ScatteringTransforms.spherical_scattering(θ, φ, lmax, J; rtol = 1e-10)
     field = [cos(4 * θ[k]) + 0.6 * cos(3 * φ[k]) * sin(θ[k])^3 - 0.4 * cos(2 * θ[k]) for k in 1:M]
-    res = st(field)
+    res = st(field).coefficients
 
     # The azimuthal term integrates to zero; ⟨cos(4θ)⟩ − 0.4⟨cos(2θ)⟩ = 1/15.
     Test.@test res.S0 ≈ 1 / 15
@@ -397,7 +397,7 @@ Test.@testset "Spherical monogenic scattering (Riesz amplitude)" begin
     θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
     φ = [2π * mod(k * gr, 1) for k in 1:M]
     st = ScatteringTransforms.spherical_monogenic_scattering(θ, φ, lmax, J)
-    res = st([cos(4 * θ[k]) + 0.5 * sin(3 * θ[k]) * cos(2 * φ[k]) for k in 1:M])  # band-limited
+    res = st([cos(4 * θ[k]) + 0.5 * sin(3 * θ[k]) * cos(2 * φ[k]) for k in 1:M]).coefficients  # band-limited
     Test.@test length(res.S1) == J
     Test.@test all(res.S1 .>= 0)              # monogenic amplitude is non-negative
     Test.@test size(res.S2) == (J, J)
@@ -408,7 +408,7 @@ Test.@testset "Spherical monogenic scattering (Riesz amplitude)" begin
     α = 0.7
     f = cos.(θ) .^ 2 .- 1/3 .+ 0.5 .* sin.(θ) .* cos.(φ)
     fα = cos.(θ) .^ 2 .- 1/3 .+ 0.5 .* sin.(θ) .* cos.(φ .+ α)
-    r0 = st(f); rα = st(fα)
+    r0 = st(f).coefficients; rα = st(fα).coefficients
     Test.@test maximum(abs.(r0.S1 .- rα.S1)) / maximum(abs.(r0.S1)) < 0.05
 
     # Pointwise orientation/phase on S² (spin-1 Riesz vector) is validated in
@@ -473,6 +473,13 @@ Test.@testset "Periodized cascade: bit-exact at oversampling ≥ J, lossy below"
     Test.@test 0 < err(0, C.first_order, S1e) < 1e-2
 end
 
+function _fit_sphere()
+    M = 300
+    θ = [acos(1 - 2 * (k - 0.5) / M) for k in 1:M]
+    φ = [2π * mod(k * (sqrt(5) - 1) / 2, 1) for k in 1:M]
+    return ScatteringTransforms.spherical_scattering(θ, φ, 6, 2; transform = SpectralBackends.DirectSumSpectralBackend())
+end
+
 Test.@testset "Distributed batch (single process) matches serial" begin
     # DistributedBackend distributes batch columns across workers; each worker rebuilds the
     # transform from a spec (plans aren't serializable) and runs the inner backend. With no
@@ -488,6 +495,17 @@ Test.@testset "Distributed batch (single process) matches serial" begin
     X2 = randn(24, 24, 5)
     Test.@test ScatteringTransforms.scattering_batch(st2, X2; execution = ComputationalBackends.DistributedBackend()) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
+
+    sph = _fit_sphere()
+    Xs = randn(300, 3)
+    got = ScatteringTransforms.scattering_batch(sph, Xs; execution = ComputationalBackends.DistributedBackend())
+    want = ScatteringTransforms.scattering_batch(sph, Xs)
+    Test.@test got.coefficients ≈ want.coefficients rtol = 1e-8
+    # The worker's rebuilt transform fits each field to round-off of the serial fit.
+    stopped(f) = (f.converged, f.iterations)
+    Test.@test stopped.(got.fit) == stopped.(want.fit)
+    Test.@test getfield.(got.fit, :residual) ≈ getfield.(want.fit, :residual) rtol = 1e-8
+    ScatteringTransforms.close_transform!(sph)
 end
 
 Test.@testset "MPI batch (single rank) matches serial" begin
@@ -504,6 +522,14 @@ Test.@testset "MPI batch (single rank) matches serial" begin
     X2 = randn(24, 24, 5)
     Test.@test ScatteringTransforms.scattering_batch(st2, X2; execution = ComputationalBackends.MPIBackend()) ≈
                ScatteringTransforms.scattering_batch(st2, X2)
+
+    sph = _fit_sphere()
+    Xs = randn(300, 3)
+    got = ScatteringTransforms.scattering_batch(sph, Xs; execution = ComputationalBackends.MPIBackend())
+    want = ScatteringTransforms.scattering_batch(sph, Xs)
+    Test.@test got.coefficients ≈ want.coefficients rtol = 1e-8
+    Test.@test got.fit == want.fit
+    ScatteringTransforms.close_transform!(sph)
 end
 
 Test.@testset "Spectral plans: in-core direct sum matches FFTW fast path" begin

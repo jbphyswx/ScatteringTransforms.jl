@@ -124,7 +124,8 @@ or `using FINUFFT` enables the nonuniform FFT, and with both loaded
 names one.
 
 `analysis = ST.Plans.WeightedAdjoint()` is the planar default. Choose `ST.Plans.LeastSquares()`
-for a spectral fit, with `rtol` controlling its relative normal residual. `tol` sets NUFFT accuracy
+for a spectral fit, with `rtol` controlling its relative normal residual; the transform then returns
+`(; coefficients, fit)`, `fit` the fit's `FlowTransformBindings.SolverResult`. `tol` sets NUFFT accuracy
 and `nthreads` sets the library thread count.
 
 ![Scattered planar scattering](assets/scattered_planar.png)
@@ -137,8 +138,10 @@ monogenic Riesz energy `|∇_S g|²` is synthesised exactly from scalar transfor
 `spherical_monogenic_components` synthesizes the spin-1 Riesz vector for pointwise orientation/phase.
 
 Spherical coefficients follow the finest-first convention: scale 1 is finest and second-order
-pairs satisfy `j2 > j1`. The result is a `ScatteringCoefficients1D`. The scattered constructors
-accept spherical FlowGeometries grids and default to `analysis = ST.Plans.LeastSquares()`.
+pairs satisfy `j2 > j1`. The coefficients are a `ScatteringCoefficients1D`. The scattered constructors
+accept spherical FlowGeometries grids and default to `analysis = ST.Plans.LeastSquares()`; a fitting
+analysis, theirs or the in-core structured sphere's, returns `(; coefficients, fit)`, `fit` the
+`FlowTransformBindings.SolverResult` of the call's least converged fit.
 
 ![Spherical scattering](assets/spherical_scattering.png)
 ![Structured spherical scattering](assets/structured_spherical.png)

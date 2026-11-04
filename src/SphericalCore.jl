@@ -466,12 +466,12 @@ both on the samples the cascade runs on (the transform's grid, where it has one)
 containers, `C` for the input field and `C1` for the first-order field being re-analysed. Two
 suffice, since the cascade finishes every child of a scale before starting the next. `bband`, `bu1`,
 `bC` and `bC1` are the same per scale at its narrowed band limit, and empty when the transform has no
-`bands`.
+`bands`. `fits` holds a batch's per-field fit outcomes, `nothing` for a plan whose analysis fits nothing.
 
 Build one with `SphericalWorkspace(st, field)` and reuse it across calls; a task that transforms
 concurrently needs its own, with a [`task_local`](@ref) transform.
 """
-struct SphericalWorkspace{A, C, AV, CV, V}
+struct SphericalWorkspace{A, C, AV, CV, V, F}
     band::A
     u1::A
     C::C
@@ -482,34 +482,40 @@ struct SphericalWorkspace{A, C, AV, CV, V}
     bC1::CV
     S0::V
     means::V
+    fits::F
 end
 
 function SphericalWorkspace(st, field::AbstractArray)
     C() = sphere_coeffs_buffer(st.plan)
     F() = _band_buffer(st, field)
-    means = similar(field, real(eltype(field)), Plans.batch_width(st.plan))
+    B = Plans.batch_width(st.plan)
+    means = similar(field, real(eltype(field)), B)
+    fits = Plans._fit_buffer(Plans._fit_type(st.plan), B)
     if st.bands === nothing
         e = similar(field, 0)
         ec = [C()][1:0]
-        return SphericalWorkspace(F(), F(), C(), C(), typeof(e)[], typeof(e)[], ec, ec, similar(means), means)
+        return SphericalWorkspace(F(), F(), C(), C(), typeof(e)[], typeof(e)[], ec, ec, similar(means), means, fits)
     end
     bband = [sphere_field_buffer(p) for p in st.bands]
     bu1 = [sphere_field_buffer(p) for p in st.bands]
     bC = [sphere_coeffs_buffer(p) for p in st.bands]
     bC1 = [sphere_coeffs_buffer(p) for p in st.bands]
-    return SphericalWorkspace(F(), F(), C(), C(), bband, bu1, bC, bC1, similar(means), means)
+    return SphericalWorkspace(F(), F(), C(), C(), bband, bu1, bC, bC1, similar(means), means, fits)
 end
 
 Base.show(io::IO, ws::SphericalWorkspace) =
     print(io, "SphericalWorkspace(fields of size ", size(ws.band), ", ", length(ws.bband), " band buffers)")
 
 """
-    (st::SphericalScatteringTransform)(field) -> ScatteringCoefficients1D
+    (st::SphericalScatteringTransform)(field) -> ScatteringCoefficients1D or (; coefficients, fit)
 
 Apply the spherical scattering transform to a scalar `field` sampled by the plan.
 `S1[j] = ⟨|field ⋆ ψ_j|⟩`, `S2[j1,j2] = ⟨||field ⋆ ψ_{j1}| ⋆ ψ_{j2}|⟩` for strictly coarser `j2 > j1`.
 With a `grid`, the means are its quadrature of the field the analysis recovers, and `S0` that field's
-mean. The transform retains its workspace; each call allocates coefficient storage.
+mean. A plan whose analysis is a least-squares fit returns `(; coefficients, fit)`, `fit` the
+`FlowTransformBindings.SolverResult` of the least converged of the call's fits: the field's, and without
+a `grid` each first-order field's as well. The transform retains its workspace; each call allocates
+coefficient storage.
 """
 function (st::SphericalScatteringTransform{T})(field::AbstractArray) where {T}
     S2 = st.max_order >= 2 ? zeros(T, st.J, st.J) : Matrix{T}(undef, 0, 0)
@@ -517,10 +523,11 @@ function (st::SphericalScatteringTransform{T})(field::AbstractArray) where {T}
 end
 
 """
-    spherical_scattering!(S1, S2, st, ws, field) -> ScatteringCoefficients1D
+    spherical_scattering!(S1, S2, st, ws, field) -> ScatteringCoefficients1D or (; coefficients, fit)
 
 In-place spherical scattering into pre-allocated `S1`/`S2` using the workspace `ws`
-(see [`SphericalWorkspace`](@ref)). The returned container uses the supplied arrays.
+(see [`SphericalWorkspace`](@ref)). The returned container uses the supplied arrays; a fitting plan
+returns it with its fit's outcome, as the callable does.
 
 Grouped by first-order scale so only one first-order field and one coefficient vector are live at a
 time: scale `j1` is band-passed, averaged into `S1[j1]`, analysed once, and then consumed by every
@@ -532,8 +539,9 @@ function spherical_scattering!(S1::AbstractVector, S2::AbstractMatrix,
     J = st.J
     isempty(S2) || fill!(S2, zero(eltype(S2)))
     sphere_coeffs!(ws.C, st.plan, field)                  # analyse the field once
+    fit = Plans._plan_fit(st.plan, field, 1)
     S0 = _field_mean(st, ws.C, field)
-    st.bands === nothing || return _banded_cascade!(S1, S2, st, ws, S0)
+    st.bands === nothing || return _banded_cascade!(S1, S2, st, ws, S0, fit)
     g = _cascade_plan(st)
     for j1 in 1:J
         sphere_apply!(ws.band, g, ws.C, band_multiplier(st.sigma2[j1], st.sigma2[j1 + 1]))
@@ -541,20 +549,21 @@ function spherical_scattering!(S1::AbstractVector, S2::AbstractMatrix,
         S1[j1] = sphere_mean(g, ws.u1)
         (st.max_order >= 2 && j1 < J) || continue
         sphere_coeffs!(ws.C1, g, ws.u1)                   # analyse U1[j1] once, reuse across children
+        fit = Plans._worse_fit(fit, Plans._plan_fit(g, ws.u1, 1))
         for j2 in (j1 + 1):J
             sphere_apply!(ws.band, g, ws.C1, band_multiplier(st.sigma2[j2], st.sigma2[j2 + 1]))
             @. ws.band = abs(ws.band)
             S2[j1, j2] = sphere_mean(g, ws.band)
         end
     end
-    return Coefficients.ScatteringCoefficients1D(S1, S2; S0)
+    return Plans._with_fit(Coefficients.ScatteringCoefficients1D(S1, S2; S0), fit)
 end
 
 # The same cascade with every band synthesised at its own band limit. `ws.C` already holds the
-# field's coefficients at the full band limit.
+# field's coefficients at the full band limit, and `fit` the outcome of their analysis.
 #
 # Each child uses its scale's buffers while the parent's modulus stays in `bu1[j1]`.
-function _banded_cascade!(S1, S2, st::SphericalScatteringTransform, ws::SphericalWorkspace, S0)
+function _banded_cascade!(S1, S2, st::SphericalScatteringTransform, ws::SphericalWorkspace, S0, fit)
     bands = st.bands
     for j1 in 1:st.J
         p1 = bands[j1]
@@ -565,6 +574,7 @@ function _banded_cascade!(S1, S2, st::SphericalScatteringTransform, ws::Spherica
         S1[j1] = sphere_mean(p1, ws.bu1[j1])
         (st.max_order >= 2 && j1 < st.J) || continue
         sphere_coeffs!(ws.bC1[j1], p1, ws.bu1[j1])
+        fit = Plans._worse_fit(fit, Plans._plan_fit(p1, ws.bu1[j1], 1))
         for j2 in (j1 + 1):st.J
             p2 = bands[j2]
             h2 = band_multiplier(st.sigma2[j2], st.sigma2[j2 + 1])
@@ -574,15 +584,16 @@ function _banded_cascade!(S1, S2, st::SphericalScatteringTransform, ws::Spherica
             S2[j1, j2] = sphere_mean(p2, ws.bband[j2])
         end
     end
-    return Coefficients.ScatteringCoefficients1D(S1, S2; S0)
+    return Plans._with_fit(Coefficients.ScatteringCoefficients1D(S1, S2; S0), fit)
 end
 
 """
-    spherical_scattering_batch!(S1, S2, st, ws, X) -> (; S0, S1, S2)
+    spherical_scattering_batch!(S1, S2, st, ws, X) -> (; S0, S1, S2[, fit])
 
 Cascade over a stack of `B` fields sampled at the same points: `X` is `(M, B)`, `S1` is `(J, B)` and
 `S2` is `(J, J, B)`. Every transform covers all `B` fields in one call; `st.plan`, and its grid, must
-have batch width `B` ([`batch_transform`](@ref)).
+have batch width `B` ([`batch_transform`](@ref)). A fitting plan adds `fit`, each field's
+`FlowTransformBindings.SolverResult` as the callable reports it, in `ws`'s own buffer.
 """
 function spherical_scattering_batch!(S1::AbstractMatrix, S2::AbstractArray,
                                      st::SphericalScatteringTransform, ws::SphericalWorkspace,
@@ -590,6 +601,7 @@ function spherical_scattering_batch!(S1::AbstractMatrix, S2::AbstractArray,
     J = st.J
     isempty(S2) || fill!(S2, zero(eltype(S2)))
     sphere_coeffs!(ws.C, st.plan, X)
+    Plans._store_fits!(ws.fits, st.plan, X, Base.OneTo(Plans.batch_width(st.plan)))
     S0 = _field_means!(ws.S0, st, ws.C, X)
     g = _cascade_plan(st)
     for j1 in 1:J
@@ -599,6 +611,7 @@ function spherical_scattering_batch!(S1::AbstractMatrix, S2::AbstractArray,
         view(S1, j1, :) .= ws.means
         (st.max_order >= 2 && j1 < J) || continue
         sphere_coeffs!(ws.C1, g, ws.u1)
+        Plans._merge_fits!(ws.fits, g, ws.u1)
         for j2 in (j1 + 1):J
             sphere_apply!(ws.band, g, ws.C1, band_multiplier(st.sigma2[j2], st.sigma2[j2 + 1]))
             @. ws.band = abs(ws.band)
@@ -606,7 +619,7 @@ function spherical_scattering_batch!(S1::AbstractMatrix, S2::AbstractArray,
             view(S2, j1, j2, :) .= ws.means
         end
     end
-    return (S0 = S0, S1 = S1, S2 = S2)
+    return Plans._with_fits((S0 = S0, S1 = S1, S2 = S2), ws.fits)
 end
 
 
@@ -704,10 +717,11 @@ Base.show(io::IO, ws::SphericalMonogenicWorkspace) =
     print(io, "SphericalMonogenicWorkspace(fields of size ", size(ws.u1), ")")
 
 """
-    (st::SphericalMonogenicScatteringTransform)(field) -> ScatteringCoefficients1D
+    (st::SphericalMonogenicScatteringTransform)(field) -> ScatteringCoefficients1D or (; coefficients, fit)
 
 Apply the spherical monogenic scattering transform. `S1[j] = ⟨A_j⟩`,
-`S2[j1,j2] = ⟨A_{j2}[A_{j1}]⟩` for strictly coarser `j2 > j1`.
+`S2[j1,j2] = ⟨A_{j2}[A_{j1}]⟩` for strictly coarser `j2 > j1`. A fitting plan returns the fit's outcome
+beside the coefficients, as [`SphericalScatteringTransform`](@ref)'s callable does.
 The transform retains its workspace; each call allocates coefficient storage.
 """
 function (st::SphericalMonogenicScatteringTransform{T})(field::AbstractArray) where {T}
@@ -716,7 +730,7 @@ function (st::SphericalMonogenicScatteringTransform{T})(field::AbstractArray) wh
 end
 
 """
-    spherical_monogenic_scattering!(S1, S2, st, ws, field) -> ScatteringCoefficients1D
+    spherical_monogenic_scattering!(S1, S2, st, ws, field) -> ScatteringCoefficients1D or (; coefficients, fit)
 
 In-place spherical monogenic scattering, the monogenic counterpart of
 [`spherical_scattering!`](@ref), grouped by first-order scale with one amplitude field live at a
@@ -728,6 +742,7 @@ function spherical_monogenic_scattering!(S1::AbstractVector, S2::AbstractMatrix,
     J = st.J
     isempty(S2) || fill!(S2, zero(eltype(S2)))
     sphere_coeffs!(ws.C, st.plan, field)                  # analyse the field once
+    fit = Plans._plan_fit(st.plan, field, 1)
     S0 = _field_mean(st, ws.C, field)
     g = _cascade_plan(st)
     for j1 in 1:J
@@ -735,12 +750,13 @@ function spherical_monogenic_scattering!(S1::AbstractVector, S2::AbstractMatrix,
         S1[j1] = sphere_mean(g, ws.u1)
         (st.max_order >= 2 && j1 < J) || continue
         sphere_coeffs!(ws.C1, g, ws.u1)                   # analyse U1[j1] once, reuse across children
+        fit = Plans._worse_fit(fit, Plans._plan_fit(g, ws.u1, 1))
         for j2 in (j1 + 1):J
             monogenic_amplitude!(ws.amp, st, ws.C1, j2, ws.scratch)
             S2[j1, j2] = sphere_mean(g, ws.amp)
         end
     end
-    return Coefficients.ScatteringCoefficients1D(S1, S2; S0)
+    return Plans._with_fit(Coefficients.ScatteringCoefficients1D(S1, S2; S0), fit)
 end
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1058,8 @@ plan_weights(p::DirectSHTSphericalPlan) = p.weights
 plan_solver(p::DirectSHTSphericalPlan) = (rtol = p.rtol, maxiter = p.maxiter, analysis = p.analysis)
 Plans.spectral_backend(::DirectSHTSphericalPlan) = SB.DirectSumSpectralBackend()
 Plans.batch_width(p::DirectSHTSphericalPlan) = p.B
+Plans._fit_type(p::DirectSHTSphericalPlan{T}) where {T} = Plans._analysis_fit(p.analysis, T)
+Plans._plan_fit(p::DirectSHTSphericalPlan, x, b::Integer) = Plans._ws_fit(p.ls, b)
 
 Plans.task_local_plan(p::DirectSHTSphericalPlan) =
     _direct_sht_plan(p.theta, p.phi, p.weights, p.rtol, p.maxiter, p.analysis, p.sampling, p.tab, p.lmax, p.B)
@@ -1305,8 +1323,7 @@ make_structured_plan(::SB.AbstractAutoSpectralBackend, lmax, ::Type{T}; kwargs..
 #   ½[ √((ℓ+m)(ℓ−m+1))·P̄_ℓ^{m−1} − √((ℓ−m)(ℓ+m+1))·P̄_ℓ^{m+1} ],
 # the identity for `∂_θ P_ℓ^m` without the Condon–Shortley phase, which `P̄` carries, so it gives the
 # negated derivative. `P̄_ℓ^{−1} = −P̄_ℓ^{1}` (the normalised form of
-# `P_ℓ^{−m} = (−1)^m (ℓ−m)!/(ℓ+m)!·P_ℓ^m`) collapses the `m = 0` case to `−√(ℓ(ℓ+1))·P̄_ℓ^1`. The
-# identity is linear in `P̄`, so `_assoc_legendre!`'s arbitrary overall scale cancels.
+# `P_ℓ^{−m} = (−1)^m (ℓ−m)!/(ℓ+m)!·P_ℓ^m`) collapses the `m = 0` case to `−√(ℓ(ℓ+1))·P̄_ℓ^1`.
 @inline function _dtheta_pbar(P::AbstractMatrix{T}, ℓ::Int, m::Int) where {T}
     up = (m + 1 > ℓ) ? zero(T) : sqrt(T((ℓ - m) * (ℓ + m + 1))) * P[ℓ + 1, m + 2]
     dn = m == 0 ? -sqrt(T(ℓ * (ℓ + 1))) * (ℓ >= 1 ? P[ℓ + 1, 2] : zero(T)) :
@@ -1393,6 +1410,7 @@ function direct_monogenic_components(st::SphericalMonogenicScatteringTransform{<
     plan = st.plan
     σ²hi, σ²lo = st.sigma2[j], st.sigma2[j + 1]
     a = sphere_coeffs(plan, field)                                  # spin-0 SH coefficients
+    fit = Plans._plan_fit(plan, field, 1)
     U0 = similar(field)
     sphere_apply!(U0, plan, a, band_multiplier(σ²hi, σ²lo))         # band-pass U⁰ (real)
     # Coefficients of g = (−Δ_S)^{-1/2} U⁰, then its surface gradient `(∂_θ g, ∂_φ g / sinθ)` at each
@@ -1403,7 +1421,7 @@ function direct_monogenic_components(st::SphericalMonogenicScatteringTransform{<
     amplitude = sqrt.(U0 .^ 2 .+ rnorm .^ 2)
     phase = atan.(rnorm, U0)
     orientation = atan.(uφ, uθ)
-    return (; bandpass = U0, riesz = (uθ, uφ), amplitude, phase, orientation)
+    return Plans._with_fits((; bandpass = U0, riesz = (uθ, uφ), amplitude, phase, orientation), fit)
 end
 
 function _direct_riesz_components!(uθ, uφ, plan, C, h, ::_SHTRings)

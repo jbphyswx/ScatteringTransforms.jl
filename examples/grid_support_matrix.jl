@@ -50,8 +50,10 @@ println("\n3. Scattered spherical scattering (NUFSHT)")
 M = 800; gr = (sqrt(5)-1)/2
 θ = [acos(1 - 2*(k-0.5)/M) for k in 1:M]; φ = [2π*mod(k*gr, 1) for k in 1:M]
 scst = ST.spherical_scattering(θ, φ, lmax, Js)
-rsc = scst(randn(M))
-println("   S1 = ", round.(rsc.S1, digits=4))
+fitted = scst(randn(M))                       # the least-squares analysis reports its fit
+rsc = fitted.coefficients
+println("   S1 = ", round.(rsc.S1, digits=4), " | fit converged = ", fitted.fit.converged,
+        " in ", fitted.fit.iterations, " iterations")
 
 # ---------------------------------------------------------------------------
 # Pointwise spherical monogenic orientation/phase (spin-1 Riesz vector).

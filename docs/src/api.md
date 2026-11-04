@@ -252,8 +252,10 @@ ScatteringTransforms.ScatteringCore.task_workspace
 `WeightedAdjoint()`; the scattered-sphere default is `LeastSquares()`.
 
 `rtol` controls the fit's relative normal residual. A fit that reaches its iteration or condition
-limit returns its best iterate. Fit diagnostics remain in its LSMR workspace; coefficient containers
-hold the scattering coefficients. For scattered planar transforms, `tol` controls NUFFT accuracy and
+limit returns its best iterate. A transform whose analysis is a fit returns `(; coefficients, fit)`:
+`fit` is the `FlowTransformBindings.SolverResult` (`converged`, `iterations`, `residual`) of the least
+converged fit the call ran, and a batch's `fit` holds one per field. A transform that fits nothing
+returns its coefficients alone. For scattered planar transforms, `tol` controls NUFFT accuracy and
 `nthreads` controls the NUFFT library's threads.
 
 ```@docs

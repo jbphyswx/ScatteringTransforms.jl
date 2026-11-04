@@ -247,14 +247,19 @@ Test.@testset "Every surface has a batch entry point, matching its per-field res
         Test.@test view(outp, :, b) ≈ ScatteringTransforms.Coefficients.flatten2d(sp(Xp[:, b]))
     end
 
+    # A batch reports each field's own fit: a zero field is solved by `x = 0` in no iterations.
     lmax, J, B = 8, 3, 4
-    ss = ScatteringTransforms.structured_spherical_scattering(lmax, J)
+    ss = ScatteringTransforms.structured_spherical_scattering(lmax, J;
+                                                              transform = SpectralBackends.DirectSumSpectralBackend())
     Θ, Φ = ScatteringTransforms.SphericalCore.structured_grid(lmax, Float64)
     Xg = randn(length(Θ), length(Φ), B)
+    Xg[:, :, 2] .= 0
     outg = ScatteringTransforms.scattering_batch(ss, Xg)
     for b in 1:B
-        Test.@test view(outg, :, b) ≈ ScatteringTransforms.Coefficients.flatten1d(ss(Xg[:, :, b]))
+        Test.@test view(outg.coefficients, :, b) ≈
+                   ScatteringTransforms.Coefficients.flatten1d(ss(Xg[:, :, b]).coefficients)
     end
+    Test.@test outg.fit[2].iterations == 0 && outg.fit[1].iterations > 0
 
     # Analysis is an iterative solve; at `rtol = 1e-12` a batched stack and the fields solved one at a
     # time agree to round-off.
@@ -263,7 +268,8 @@ Test.@testset "Every surface has a batch entry point, matching its per-field res
     Xc = randn(150, B)
     outc = ScatteringTransforms.scattering_batch(sc, Xc)
     for b in 1:B
-        Test.@test view(outc, :, b) ≈ ScatteringTransforms.Coefficients.flatten1d(sc(Xc[:, b])) rtol=1e-6
+        Test.@test view(outc.coefficients, :, b) ≈
+                   ScatteringTransforms.Coefficients.flatten1d(sc(Xc[:, b]).coefficients) rtol=1e-6
     end
 
     # A task gets its own workspace and its own copy of the plan's analysis scratch. The subsampled
@@ -275,8 +281,11 @@ Test.@testset "Every surface has a batch entry point, matching its per-field res
     Test.@test ScatteringTransforms.scattering_batch(sub, Xs; execution = TB) == outs
     Test.@test ScatteringTransforms.scattering_batch(sp, Xp; execution = TB) ≈
                ScatteringTransforms.scattering_batch(sp, Xp) rtol=1e-12
-    Test.@test ScatteringTransforms.scattering_batch(ss, Xg; execution = TB) ≈
-               ScatteringTransforms.scattering_batch(ss, Xg) rtol=1e-12
-    Test.@test ScatteringTransforms.scattering_batch(sc, Xc; execution = TB) ≈
-               ScatteringTransforms.scattering_batch(sc, Xc) rtol=1e-12
+    threaded, serial = ScatteringTransforms.scattering_batch(ss, Xg; execution = TB),
+                       ScatteringTransforms.scattering_batch(ss, Xg)
+    Test.@test threaded.coefficients ≈ serial.coefficients rtol=1e-12
+    # The threaded batch writes each task's fits into its own columns.
+    Test.@test threaded.fit == serial.fit
+    Test.@test ScatteringTransforms.scattering_batch(sc, Xc; execution = TB).coefficients ≈
+               ScatteringTransforms.scattering_batch(sc, Xc).coefficients rtol=1e-12
 end
